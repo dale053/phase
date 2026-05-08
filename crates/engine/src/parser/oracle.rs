@@ -30,9 +30,9 @@ use super::oracle_class::parse_class_oracle_text;
 use super::oracle_classifier::{
     has_roll_die_pattern, has_trigger_prefix, is_ability_activate_cost_static,
     is_cant_win_lose_compound, is_compound_turn_limit, is_defiler_cost_pattern,
-    is_flashback_equal_mana_cost, is_granted_static_line, is_instead_replacement_line,
-    is_opening_hand_begin_game, is_replacement_pattern, is_static_pattern, is_vehicle_tier_line,
-    lower_starts_with, should_defer_spell_to_effect,
+    is_enters_tapped_cant_untap_compound, is_flashback_equal_mana_cost, is_granted_static_line,
+    is_instead_replacement_line, is_opening_hand_begin_game, is_replacement_pattern,
+    is_static_pattern, is_vehicle_tier_line, lower_starts_with, should_defer_spell_to_effect,
 };
 use super::oracle_condition::parse_restriction_condition;
 use super::oracle_cost::{parse_oracle_cost, try_parse_cost_reduction};
@@ -1629,6 +1629,30 @@ pub(crate) fn parse_oracle_ir(
             {
                 result.statics.push(static_def);
                 i += if consumes_next_line { 2 } else { 1 };
+                continue;
+            }
+        }
+
+        // Priority 6d: Compound "[~] enters tapped and doesn't untap during your
+        // untap step." carries TWO independent rules in one sentence — an
+        // ETB-tapped replacement (CR 614.1c) and a CantUntap static (CR 502.3).
+        // The "doesn't untap" substring makes Priority 7's `is_static_pattern`
+        // fire and consume the line, dropping the ETB-tapped half. Decompose so
+        // both parsers run.
+        // Corpus: Traxos, Scourge of Kroog; Grimgrin, Corpse-Born; Leviathan.
+        if is_enters_tapped_cant_untap_compound(&lower) {
+            let mut consumed = false;
+            if let Some(rep_def) = parse_replacement_line(&line, card_name) {
+                result.replacements.push(rep_def);
+                consumed = true;
+            }
+            let defs = parse_static_line_with_graveyard_keyword_continuation(&static_line);
+            if !defs.is_empty() {
+                result.statics.extend(defs);
+                consumed = true;
+            }
+            if consumed {
+                i += 1;
                 continue;
             }
         }
@@ -10820,6 +10844,8 @@ mod tests {
 #[cfg(test)]
 mod pipeline_snapshot_tests {
     use super::*;
+    use crate::types::replacements::ReplacementEvent;
+    use crate::types::statics::StaticMode;
 
     fn pipeline_parse(
         oracle_text: &str,
@@ -10896,5 +10922,43 @@ mod pipeline_snapshot_tests {
             &[],
         );
         insta::assert_json_snapshot!(result);
+    }
+
+    /// CR 614.1c + CR 502.3: Same-line compound "[~] enters tapped and doesn't
+    /// untap during your untap step." must emit BOTH an ETB-tapped replacement
+    /// (CR 614.1c) and a CantUntap static (CR 502.3). Regression guard against
+    /// the prior bug where the static-pattern classifier consumed the line and
+    /// silently dropped the replacement half. Corpus: Traxos, Scourge of Kroog;
+    /// Grimgrin, Corpse-Born; Leviathan.
+    #[test]
+    fn pipeline_etb_tapped_and_cant_untap_compound_emits_both() {
+        let result = pipeline_parse(
+            "Trample\nTraxos enters tapped and doesn't untap during your untap step.\nWhenever you cast a historic spell, untap Traxos.",
+            "Traxos, Scourge of Kroog",
+            &["Artifact", "Creature"],
+            &["Construct"],
+        );
+        assert_eq!(
+            result.replacements.len(),
+            1,
+            "expected one ETB-tapped replacement, got {:?}",
+            result.replacements
+        );
+        assert!(
+            matches!(result.replacements[0].event, ReplacementEvent::Moved),
+            "replacement event must be Moved (ETB), got {:?}",
+            result.replacements[0].event
+        );
+        assert_eq!(
+            result.statics.len(),
+            1,
+            "expected one CantUntap static, got {:?}",
+            result.statics
+        );
+        assert_eq!(
+            result.statics[0].mode,
+            StaticMode::CantUntap,
+            "static mode must be CantUntap"
+        );
     }
 }
