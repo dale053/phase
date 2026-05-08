@@ -205,6 +205,7 @@ fn parse_total_mana_value_constraint(
 fn scan_distinct_names_clause(lower: &str) -> bool {
     scan_preceded(lower, "with ", parse_distinct_names_marker).is_some()
         || scan_preceded(lower, "that have ", parse_distinct_names_marker).is_some()
+        || scan_preceded(lower, "that each have ", parse_distinct_names_marker).is_some()
 }
 
 /// CR 701.23a + CR 107.1: Split a search filter tail on conjunction boundaries
@@ -226,6 +227,10 @@ fn parse_search_filter_with_extras(
     // pollute the filter split.
     let filter_region = search_filter_region(tail);
 
+    if let Some(filters) = parse_each_basic_land_type_search_filters(filter_region) {
+        return filters;
+    }
+
     // Split on `" and a "` / `" and an "` / `" and basic "` at filter-region
     // boundaries only. The "and basic" branch preserves the supertype prefix so
     // the downstream filter parser sees e.g. `"basic plains card"` intact.
@@ -240,6 +245,28 @@ fn parse_search_filter_with_extras(
         .map(|segment| parse_search_filter(segment, ctx))
         .collect();
     (primary, extras)
+}
+
+fn parse_each_basic_land_type_search_filters(
+    filter_region: &str,
+) -> Option<(TargetFilter, Vec<TargetFilter>)> {
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("land card of each basic land type"),
+        tag("land cards of each basic land type"),
+    ))
+    .parse(filter_region.trim())
+    .ok()?;
+    rest.is_empty().then(|| {
+        let mut filters = ["Plains", "Island", "Swamp", "Mountain", "Forest"]
+            .into_iter()
+            .map(land_subtype_filter);
+        let primary = filters.next().expect("basic land type list is non-empty");
+        (primary, filters.collect())
+    })
+}
+
+fn land_subtype_filter(subtype: &str) -> TargetFilter {
+    TargetFilter::Typed(TypedFilter::land().subtype(subtype.to_string()))
 }
 
 fn search_filter_region(text: &str) -> &str {
@@ -484,7 +511,7 @@ fn parse_seek_from_top_limit(filter_text: &str) -> (&str, Option<usize>) {
 /// Parse the card type filter from search text like "basic land card, ..."
 /// or "creature card with ..." into a TargetFilter.
 pub(super) fn parse_search_filter(text: &str, ctx: &mut ParseContext) -> TargetFilter {
-    let type_text = text.trim();
+    let type_text = search_filter_region(text).trim();
 
     if let Some(filter) = parse_search_filter_disjunction(type_text, ctx) {
         return filter;
@@ -1439,6 +1466,10 @@ fn parse_search_filter_suffixes(
             ),
             nom::sequence::preceded(
                 tag::<_, _, OracleError<'_>>("that have "),
+                parse_distinct_names_marker,
+            ),
+            nom::sequence::preceded(
+                tag::<_, _, OracleError<'_>>("that each have "),
                 parse_distinct_names_marker,
             ),
         ))
@@ -2737,6 +2768,34 @@ mod tests {
         assert_eq!(details.multi_destination, Zone::Graveyard);
     }
 
+    /// CR 701.23a + CR 205.3i: "a land card of each basic land type" is a
+    /// multi-filter search: one land card with each of the five basic land
+    /// subtypes. It reuses the existing chained `SearchLibrary` lowering path
+    /// used by "a Forest card and a Plains card" instead of adding a special
+    /// resolver.
+    #[test]
+    fn search_land_card_of_each_basic_land_type_extracts_five_filters() {
+        let details = parse_search_library_details(
+            "search your library for a land card of each basic land type, put those cards onto the battlefield, then shuffle",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(details.extra_filters.len(), 4);
+        for (filter, subtype) in [&details.filter]
+            .into_iter()
+            .chain(details.extra_filters.iter())
+            .zip(["Plains", "Island", "Swamp", "Mountain", "Forest"])
+        {
+            match filter {
+                TargetFilter::Typed(typed) => {
+                    assert!(typed.type_filters.contains(&TypeFilter::Land));
+                    assert_eq!(typed.get_subtype(), Some(subtype));
+                }
+                other => panic!("expected typed land filter for {subtype}, got {other:?}"),
+            }
+        }
+        assert_eq!(details.multi_destination, Zone::Battlefield);
+    }
+
     /// Regression: single-filter search ("a creature card") still lowers to
     /// `extra_filters = []` and does not spuriously match the dual-search path.
     #[test]
@@ -2782,6 +2841,20 @@ mod tests {
     fn search_that_have_different_names_emits_distinct_names_constraint() {
         let details = parse_search_library_details(
             "search your library for up to five land cards that have different names, exile them, then shuffle",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(
+            details.selection_constraint,
+            SearchSelectionConstraint::DistinctNames
+        );
+        assert!(details.up_to);
+        assert_eq!(details.count, QuantityExpr::Fixed { value: 5 });
+    }
+
+    #[test]
+    fn search_that_each_have_different_names_emits_distinct_names_constraint() {
+        let details = parse_search_library_details(
+            "search your library for up to five dragon cards that each have different names, reveal them, put them into your hand, then shuffle",
             &mut ParseContext::default(),
         );
         assert_eq!(
