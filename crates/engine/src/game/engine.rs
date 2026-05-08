@@ -1321,6 +1321,38 @@ fn apply_action(
             use_bestow,
             &mut events,
         )?,
+        // CR 110.4: Player chose which permanent type slot to consume for a
+        // multi-type graveyard cast via OncePerTurnPerPermanentType (Muldrotha).
+        (
+            WaitingFor::ChoosePermanentTypeSlot {
+                player,
+                object_id,
+                card_id,
+                source,
+                ..
+            },
+            GameAction::ChoosePermanentTypeSlot { slot },
+        ) => {
+            let is_land_play = slot == crate::types::card_type::CoreType::Land;
+            if is_land_play {
+                state.pending_permanent_type_slot = Some((*source, slot));
+                handle_play_land(state, *object_id, *card_id, &mut events)?
+            } else {
+                casting::handle_permanent_type_slot_choice(
+                    state,
+                    *player,
+                    *object_id,
+                    *card_id,
+                    *source,
+                    slot,
+                    &mut events,
+                )?
+            }
+        }
+        // CR 110.4: Cancel during slot choice — return to priority.
+        (WaitingFor::ChoosePermanentTypeSlot { player, .. }, GameAction::CancelCast) => {
+            WaitingFor::Priority { player: *player }
+        }
         (WaitingFor::ModeChoice { player, .. }, GameAction::SelectModes { indices }) => {
             casting::handle_select_modes(state, *player, indices, &mut events)?
         }
@@ -3157,25 +3189,60 @@ pub(super) fn begin_pending_trigger_target_selection(
     }))
 }
 
-/// CR 604.2: If a land was played from the graveyard via a once-per-turn permission source,
-/// record the source as used to prevent a second play/cast from the same source this turn.
-fn record_graveyard_play_permission(state: &mut GameState, source: Option<ObjectId>) {
-    if let Some(source_id) = source {
-        // CR 604.2: Only OncePerTurn permissions need tracking; Unlimited sources skip.
-        if let Some(obj) = state.objects.get(&source_id) {
-            let is_once_per_turn =
-                super::functioning_abilities::active_static_definitions(state, obj).any(|s| {
-                    matches!(
-                        s.mode,
-                        StaticMode::GraveyardCastPermission {
-                            frequency: crate::types::statics::CastFrequency::OncePerTurn,
-                            ..
-                        }
-                    )
-                });
-            if is_once_per_turn {
-                state.graveyard_cast_permissions_used.insert(source_id);
+/// CR 604.2 + CR 110.4: If a land was played from the graveyard via a
+/// frequency-bounded permission source, record the appropriate per-turn slot
+/// as used to prevent a second play/cast from the same source/slot this turn.
+///
+/// - `OncePerTurn` (Crucible-of-Worlds-class): record the source in
+///   `graveyard_cast_permissions_used`.
+/// - `OncePerTurnPerPermanentType` (Muldrotha-class): record the
+///   `(source, slot_type)` pair in `graveyard_cast_permissions_used_per_type`.
+///   The slot is picked here (not stashed beforehand) because lands take the
+///   non-stack play-land path; the picker reads the live used-set so concurrent
+///   frequency-bounded permissions are handled correctly.
+/// - `Unlimited` (Crucible-of-Worlds-with-no-rider): no tracking.
+fn record_graveyard_play_permission(
+    state: &mut GameState,
+    source: Option<ObjectId>,
+    played_object: ObjectId,
+) {
+    let Some(source_id) = source else {
+        return;
+    };
+    let Some(obj) = state.objects.get(&source_id) else {
+        return;
+    };
+    let frequency =
+        super::functioning_abilities::active_static_definitions(state, obj).find_map(|s| {
+            match s.mode {
+                StaticMode::GraveyardCastPermission { frequency, .. } => Some(frequency),
+                _ => None,
             }
+        });
+    match frequency {
+        Some(crate::types::statics::CastFrequency::OncePerTurn) => {
+            state.graveyard_cast_permissions_used.insert(source_id);
+        }
+        Some(crate::types::statics::CastFrequency::OncePerTurnPerPermanentType) => {
+            // CR 110.4: Use the player-chosen slot if one was stashed by the
+            // ChoosePermanentTypeSlot dispatch (multi-type card). Otherwise
+            // auto-pick (single-type card).
+            let slot = state
+                .pending_permanent_type_slot
+                .take()
+                .filter(|(src, _)| *src == source_id)
+                .map(|(_, ct)| ct)
+                .or_else(|| {
+                    super::casting::pick_per_permanent_type_slot(state, source_id, played_object)
+                });
+            if let Some(slot) = slot {
+                state
+                    .graveyard_cast_permissions_used_per_type
+                    .insert((source_id, slot));
+            }
+        }
+        Some(crate::types::statics::CastFrequency::Unlimited) | None => {
+            // Unlimited (Crucible of Worlds) or no permission: no tracking.
         }
     }
 }
@@ -3246,6 +3313,42 @@ fn handle_play_land(
         return Err(EngineError::InvalidAction(
             "Card not found or card_id mismatch".to_string(),
         ));
+    }
+
+    // CR 110.4: For multi-type graveyard lands via OncePerTurnPerPermanentType,
+    // prompt the player to choose which permanent type slot to consume. Skip
+    // if a slot was already chosen (pending_permanent_type_slot is set).
+    if in_graveyard_with_permission && state.pending_permanent_type_slot.is_none() {
+        if let Some(source) = gy_permission_source {
+            if let Some(src_obj) = state.objects.get(&source) {
+                let is_per_type = super::functioning_abilities::active_static_definitions(
+                    state, src_obj,
+                )
+                .any(|s| {
+                    matches!(
+                        s.mode,
+                        StaticMode::GraveyardCastPermission {
+                            frequency:
+                                crate::types::statics::CastFrequency::OncePerTurnPerPermanentType,
+                            ..
+                        }
+                    )
+                });
+                if is_per_type {
+                    let slots =
+                        super::casting::available_permanent_type_slots(state, source, object_id);
+                    if slots.len() > 1 {
+                        return Ok(WaitingFor::ChoosePermanentTypeSlot {
+                            player,
+                            object_id,
+                            card_id,
+                            source,
+                            available_slots: slots,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     // CR 712.12: MDFC land face selection
@@ -3374,7 +3477,7 @@ fn handle_play_land(
                     events,
                 ) {
                     state.lands_played_this_turn += 1;
-                    record_graveyard_play_permission(state, gy_permission_source);
+                    record_graveyard_play_permission(state, gy_permission_source, object_id);
                     if let Some(p) = state.players.iter_mut().find(|p| p.id == player) {
                         p.lands_played_this_turn += 1;
                     }
@@ -3400,7 +3503,7 @@ fn handle_play_land(
             // effect is pending.
             state.lands_played_this_turn += 1;
             // CR 604.2: Record once-per-turn graveyard play permission usage.
-            record_graveyard_play_permission(state, gy_permission_source);
+            record_graveyard_play_permission(state, gy_permission_source, object_id);
             if let Some(p) = state.players.iter_mut().find(|p| p.id == player) {
                 p.lands_played_this_turn += 1;
             }
@@ -3421,7 +3524,7 @@ fn handle_play_land(
     // Increment land counter
     state.lands_played_this_turn += 1;
     // CR 604.2: Record once-per-turn graveyard play permission usage.
-    record_graveyard_play_permission(state, gy_permission_source);
+    record_graveyard_play_permission(state, gy_permission_source, object_id);
     let player_data = state
         .players
         .iter_mut()

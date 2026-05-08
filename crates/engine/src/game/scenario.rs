@@ -1072,6 +1072,7 @@ impl GameRunner {
             WaitingFor::EvokeCostChoice { .. } => "EvokeCostChoice",
             WaitingFor::OverloadCostChoice { .. } => "OverloadCostChoice",
             WaitingFor::BestowCostChoice { .. } => "BestowCostChoice",
+            WaitingFor::ChoosePermanentTypeSlot { .. } => "ChoosePermanentTypeSlot",
             WaitingFor::MultiTargetSelection { .. } => "MultiTargetSelection",
             WaitingFor::AbilityModeChoice { .. } => "AbilityModeChoice",
             WaitingFor::OptionalEffectChoice { .. } => "OptionalEffectChoice",

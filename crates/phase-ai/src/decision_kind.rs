@@ -89,6 +89,7 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::EvokeCostChoice { .. }
         | WaitingFor::OverloadCostChoice { .. }
         | WaitingFor::BestowCostChoice { .. }
+        | WaitingFor::ChoosePermanentTypeSlot { .. }
         | WaitingFor::ChooseRingBearer { .. }
         | WaitingFor::ChooseDungeon { .. }
         | WaitingFor::ChooseDungeonRoom { .. }

@@ -57,6 +57,7 @@ import { CombatTaxModal } from "../components/modal/CombatTaxModal.tsx";
 import { DialogHost } from "../components/modal/DialogHost.tsx";
 import { EvokeCostModal } from "../components/modal/EvokeCostModal.tsx";
 import { BestowCostModal } from "../components/modal/BestowCostModal.tsx";
+import { PermanentTypeSlotModal } from "../components/modal/PermanentTypeSlotModal.tsx";
 import { StackDisplay } from "../components/stack/StackDisplay.tsx";
 import { TargetingOverlay } from "../components/targeting/TargetingOverlay.tsx";
 import { PlayerHud } from "../components/hud/PlayerHud.tsx";
@@ -1158,6 +1159,7 @@ function GamePageContent({
         <CombatTaxModal />
         <EvokeCostModal />
         <BestowCostModal />
+        <PermanentTypeSlotModal />
         <ModeChoiceModal />
         <ChooseOneOfBranchModal />
         <AdventureCastModal />

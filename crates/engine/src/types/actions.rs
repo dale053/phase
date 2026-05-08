@@ -191,6 +191,11 @@ pub enum GameAction {
     ChooseBestowCost {
         use_bestow: bool,
     },
+    /// CR 110.4: Choose which permanent type slot to consume for a multi-type
+    /// graveyard cast/play via OncePerTurnPerPermanentType (Muldrotha).
+    ChoosePermanentTypeSlot {
+        slot: super::card_type::CoreType,
+    },
     /// CR 702.49: Activate a Ninjutsu-family keyword from hand or command zone during combat.
     ActivateNinjutsu {
         /// The card object with Ninjutsu in hand or command zone.
@@ -649,6 +654,7 @@ impl GameAction {
             | GameAction::ChooseEvokeCost { .. }
             | GameAction::ChooseOverloadCost { .. }
             | GameAction::ChooseBestowCost { .. }
+            | GameAction::ChoosePermanentTypeSlot { .. }
             | GameAction::DecideOptionalEffect { .. }
             | GameAction::DecideOptionalEffectAndRemember { .. }
             | GameAction::PayUnlessCost { .. }

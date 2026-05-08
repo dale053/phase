@@ -392,6 +392,11 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         WaitingFor::BestowCostChoice { .. } => {
             Some(GameAction::ChooseBestowCost { use_bestow: false })
         }
+        WaitingFor::ChoosePermanentTypeSlot {
+            available_slots, ..
+        } => available_slots
+            .first()
+            .map(|slot| GameAction::ChoosePermanentTypeSlot { slot: *slot }),
 
         // Choose play/draw and sideboard: between-games defaults.
         WaitingFor::BetweenGamesChoosePlayDraw { .. } => {

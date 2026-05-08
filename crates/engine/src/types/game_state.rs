@@ -1375,6 +1375,17 @@ pub enum WaitingFor {
         /// The Bestow keyword's alternative mana cost (for display in the choice modal).
         bestow_cost: ManaCost,
     },
+    /// CR 110.4: Player chooses which permanent type slot to consume when
+    /// casting/playing a multi-type card from the graveyard via a
+    /// `OncePerTurnPerPermanentType` permission source (Muldrotha).
+    /// Only presented when the card has more than one available slot.
+    ChoosePermanentTypeSlot {
+        player: PlayerId,
+        object_id: ObjectId,
+        card_id: CardId,
+        source: ObjectId,
+        available_slots: Vec<super::card_type::CoreType>,
+    },
     /// CR 601.2c: Player chooses any number of legal targets from a set.
     /// Used for "exile any number of" and similar variable-count targeting.
     MultiTargetSelection {
@@ -2042,6 +2053,7 @@ impl WaitingFor {
             | WaitingFor::EvokeCostChoice { player, .. }
             | WaitingFor::OverloadCostChoice { player, .. }
             | WaitingFor::BestowCostChoice { player, .. }
+            | WaitingFor::ChoosePermanentTypeSlot { player, .. }
             | WaitingFor::ChooseRingBearer { player, .. }
             | WaitingFor::ChooseDungeon { player, .. }
             | WaitingFor::ChooseDungeonRoom { player, .. }
@@ -2288,8 +2300,16 @@ pub enum CastingVariant {
         source: ObjectId,
         /// CR 601.2a: When `OncePerTurn`, casting consumes this source's slot in
         /// `graveyard_cast_permissions_used`. `Unlimited` permissions (Conduit)
-        /// skip tracking entirely.
+        /// skip tracking entirely. When `OncePerTurnPerPermanentType` (Muldrotha),
+        /// casting consumes the `(source, slot_type)` entry in
+        /// `graveyard_cast_permissions_used_per_type` — see `slot_type`.
         frequency: super::statics::CastFrequency,
+        /// CR 110.4: Permanent type slot consumed when `frequency` is
+        /// `OncePerTurnPerPermanentType`. Always one of the six CR 110.4
+        /// permanent types. `None` for `Unlimited` and `OncePerTurn`
+        /// frequencies (those track by source only).
+        #[serde(default)]
+        slot_type: Option<super::card_type::CoreType>,
     },
     /// CR 601.2b + CR 118.9a: Cast from hand via a `CastFromHandFree` static
     /// permission source (Zaffai). Stores the granting permanent's ObjectId for
@@ -2732,6 +2752,23 @@ pub struct GameState {
     /// CR 400.7: Zone change creates new ObjectId, naturally resetting.
     #[serde(default)]
     pub graveyard_cast_permissions_used: HashSet<ObjectId>,
+    /// CR 110.4 + CR 601.2a: Tracks which permanent-type slots a
+    /// `OncePerTurnPerPermanentType` graveyard-cast permission source has
+    /// already consumed this turn. Keyed by `(source_id, slot_core_type)`
+    /// where `slot_core_type` is the permanent type the cast/play was credited
+    /// to (one of the six CR 110.4 permanent types). Muldrotha, the Gravetide
+    /// is the canonical user: each permanent type acts as an independent
+    /// per-turn slot, so a single source may credit one cast per permanent
+    /// type per turn.
+    /// CR 400.7: Zone change creates a new source `ObjectId`, naturally
+    /// resetting all slots.
+    #[serde(default)]
+    pub graveyard_cast_permissions_used_per_type: HashSet<(ObjectId, super::card_type::CoreType)>,
+    /// CR 110.4: Transient slot stashed by the ChoosePermanentTypeSlot dispatch
+    /// for the land-play path. Consumed by `record_graveyard_play_permission` on
+    /// re-entry into `handle_play_land`. `None` when no slot choice is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_permanent_type_slot: Option<(ObjectId, super::card_type::CoreType)>,
     /// CR 601.2b: Tracks which `CastFromHandFree` once-per-turn permission sources
     /// have been used this turn (Zaffai and the Tempests). Keyed by the granting
     /// permanent's ObjectId. Unlimited sources (Omniscience) never populate this.
@@ -3230,6 +3267,8 @@ impl GameState {
             activated_abilities_this_game: HashMap::new(),
             ability_resolutions_this_turn: HashMap::new(),
             graveyard_cast_permissions_used: HashSet::new(),
+            graveyard_cast_permissions_used_per_type: HashSet::new(),
+            pending_permanent_type_slot: None,
             hand_cast_free_permissions_used: HashSet::new(),
             first_card_drawn_this_turn: HashMap::new(),
             cards_drawn_this_turn: HashMap::new(),
@@ -3437,6 +3476,9 @@ impl PartialEq for GameState {
             && self.activated_abilities_this_game == other.activated_abilities_this_game
             && self.ability_resolutions_this_turn == other.ability_resolutions_this_turn
             && self.graveyard_cast_permissions_used == other.graveyard_cast_permissions_used
+            && self.graveyard_cast_permissions_used_per_type
+                == other.graveyard_cast_permissions_used_per_type
+            && self.pending_permanent_type_slot == other.pending_permanent_type_slot
             && self.hand_cast_free_permissions_used == other.hand_cast_free_permissions_used
             && self.first_card_drawn_this_turn == other.first_card_drawn_this_turn
             && self.cards_drawn_this_turn == other.cards_drawn_this_turn

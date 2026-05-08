@@ -1249,6 +1249,20 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
                 Some(*player),
             ),
         ],
+        WaitingFor::ChoosePermanentTypeSlot {
+            player,
+            available_slots,
+            ..
+        } => available_slots
+            .iter()
+            .map(|slot| {
+                candidate(
+                    GameAction::ChoosePermanentTypeSlot { slot: *slot },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
         WaitingFor::OverloadCostChoice { player, .. } => vec![
             candidate(
                 GameAction::ChooseOverloadCost { use_overload: true },
