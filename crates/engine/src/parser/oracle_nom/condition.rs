@@ -1232,6 +1232,7 @@ fn parse_youve_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
         parse_cast_spell_count_this_turn,
         |input| parse_another_spell_cast_this_turn(input, 2),
+        parse_cast_one_spell_this_turn,
         value(
             make_quantity_ge(QuantityRef::CrimesCommittedThisTurn, 1),
             tag("committed a crime this turn"),
@@ -1838,29 +1839,35 @@ fn parse_you_cast_spell_this_turn(input: &str) -> OracleResult<'_, StaticConditi
             ),
         ));
     }
-    // "a [type] spell this turn" / "an [type] spell this turn"
+    parse_one_spell_this_turn_after_cast(rest)
+}
+
+fn parse_cast_one_spell_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("cast ").parse(input)?;
+    parse_one_spell_this_turn_after_cast(rest)
+}
+
+fn parse_one_spell_this_turn_after_cast(input: &str) -> OracleResult<'_, StaticCondition> {
+    let rest = input;
     let (rest, _) = parse_article(rest)?;
-    if let Some(spell_pos) = rest.find(" spell this turn") {
-        let type_text = &rest[..spell_pos];
-        let (filter, leftover) = parse_type_phrase(type_text);
-        if leftover.trim().is_empty() && filter != TargetFilter::Any {
-            let remaining = &rest[spell_pos + " spell this turn".len()..];
-            return Ok((
-                remaining,
-                make_quantity_ge(
-                    QuantityRef::SpellsCastThisTurn {
-                        scope: CountScope::Controller,
-                        filter: Some(filter),
-                    },
-                    1,
-                ),
-            ));
-        }
-    }
-    Err(nom::Err::Error(nom::error::Error::new(
-        input,
-        nom::error::ErrorKind::Fail,
-    )))
+    let (rest, type_text) = take_until(" spell this turn").parse(rest)?;
+    let (rest, _) = tag(" spell this turn").parse(rest)?;
+    let Some(filter) = parse_spell_history_filter(type_text) else {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    };
+    Ok((
+        rest,
+        make_quantity_ge(
+            QuantityRef::SpellsCastThisTurn {
+                scope: CountScope::Controller,
+                filter: Some(filter),
+            },
+            1,
+        ),
+    ))
 }
 
 fn parse_died_under_your_control_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
@@ -2006,6 +2013,16 @@ fn parse_another_spell_this_turn(input: &str, minimum: u32) -> OracleResult<'_, 
 
 pub(crate) fn parse_spell_history_filter(type_text: &str) -> Option<TargetFilter> {
     let type_text = strip_spell_history_noun(type_text);
+    if let Ok((rest, filter)) = value(
+        TargetFilter::Typed(TypedFilter::card().properties(vec![FilterProp::Historic])),
+        tag::<_, _, OracleError<'_>>("historic"),
+    )
+    .parse(type_text)
+    {
+        if rest.trim().is_empty() {
+            return Some(filter);
+        }
+    }
     let (filter, leftover) = parse_type_phrase(type_text);
     if leftover.trim().is_empty() && filter != TargetFilter::Any {
         return Some(filter);
@@ -2079,6 +2096,21 @@ fn parse_counter_added_this_turn(input: &str) -> OracleResult<'_, StaticConditio
 /// CR 603.4: These gate triggers on the absence of an event this turn.
 /// Composed as `QuantityComparison(ref EQ 0)` rather than `Not(ref >= 1)`.
 fn parse_you_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("you haven't ").parse(input) {
+        return value(
+            make_quantity_comparison(
+                QuantityRef::SpellsCastThisTurn {
+                    scope: CountScope::Controller,
+                    filter: None,
+                },
+                Comparator::EQ,
+                0,
+            ),
+            tag("cast a spell this turn"),
+        )
+        .parse(rest);
+    }
+
     let (rest, _) = tag("you didn't ").parse(input)?;
     alt((
         value(
@@ -4336,6 +4368,46 @@ mod tests {
             ),
             other => panic!("expected filtered SpellsCastThisTurn GE 3, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn youve_cast_historic_spell_this_turn_counts_controller_spells() {
+        let (rest, c) = parse_inner_condition("you've cast a historic spell this turn").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::SpellsCastThisTurn {
+                                scope: CountScope::Controller,
+                                filter: Some(TargetFilter::Typed(TypedFilter { properties, .. })),
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } => assert!(properties.contains(&FilterProp::Historic)),
+            other => panic!("expected historic SpellsCastThisTurn GE 1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn you_havent_cast_spell_this_turn_counts_zero_controller_spells() {
+        let (rest, c) = parse_inner_condition("you haven't cast a spell this turn").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::SpellsCastThisTurn {
+                        scope: CountScope::Controller,
+                        filter: None,
+                    },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 0 },
+            }
+        );
     }
 
     #[test]
