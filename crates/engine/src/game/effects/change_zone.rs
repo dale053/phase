@@ -587,11 +587,12 @@ pub fn resolve_all(
     // `InAnyZone`, scan their union; otherwise fall back to the explicit `origin`
     // (or `Battlefield`). Single-zone filters (`InZone` alone) preserve legacy
     // behavior — only the multi-zone shape opts into the union scan.
-    let (origin_zones, dest_zone, target_filter) = match &ability.effect {
+    let (origin_zones, dest_zone, target_filter, enter_tapped) = match &ability.effect {
         Effect::ChangeZoneAll {
             origin,
             destination,
             target,
+            enter_tapped,
         } => {
             let extracted = target.extract_zones();
             let scan_zones = if extracted.len() > 1 {
@@ -599,7 +600,7 @@ pub fn resolve_all(
             } else {
                 vec![origin.unwrap_or(Zone::Battlefield)]
             };
-            (scan_zones, *destination, target.clone())
+            (scan_zones, *destination, target.clone(), *enter_tapped)
         }
         _ => return Err(EffectError::MissingParam("ChangeZoneAll".to_string())),
     };
@@ -727,7 +728,8 @@ pub fn resolve_all(
             .get(&obj_id)
             .map(|o| o.zone)
             .unwrap_or(origin_zone);
-        // Mass zone moves don't use enter_transformed, enter_tapped, or controller_override
+        // Mass zone moves don't use enter_transformed or controller_override;
+        // enter_tapped is carried for "return ... tapped" effects.
         match execute_zone_move(
             state,
             obj_id,
@@ -736,7 +738,7 @@ pub fn resolve_all(
             ability.source_id,
             ability.duration.as_ref(),
             false,
-            false,
+            enter_tapped,
             None,
             &[],
             events,
@@ -1206,6 +1208,7 @@ mod tests {
                 origin: Some(Zone::Battlefield),
                 destination: Zone::Hand,
                 target: TargetFilter::None,
+                enter_tapped: false,
             },
             vec![],
             ObjectId(100),
@@ -1252,6 +1255,7 @@ mod tests {
                 origin: Some(Zone::Graveyard),
                 destination: Zone::Exile,
                 target: TargetFilter::Player,
+                enter_tapped: false,
             },
             vec![TargetRef::Player(PlayerId(1))],
             ObjectId(500),
@@ -1323,6 +1327,7 @@ mod tests {
                 origin: Some(Zone::Graveyard),
                 destination: Zone::Exile,
                 target: TargetFilter::Player,
+                enter_tapped: false,
             },
             vec![TargetRef::Player(PlayerId(1))],
             ObjectId(500),
@@ -1353,6 +1358,7 @@ mod tests {
                 origin: Some(Zone::Graveyard),
                 destination: Zone::Exile,
                 target: TargetFilter::Player,
+                enter_tapped: false,
             },
             vec![TargetRef::Player(PlayerId(1))],
             ObjectId(500),
@@ -1422,6 +1428,7 @@ mod tests {
                     controller: Some(crate::types::ability::ControllerRef::Opponent),
                     properties: vec![],
                 }),
+                enter_tapped: false,
             },
             vec![],
             source_id,
@@ -1521,6 +1528,7 @@ mod tests {
                 origin: Some(Zone::Exile),
                 destination: Zone::Graveyard,
                 target: TargetFilter::ExiledBySource,
+                enter_tapped: false,
             },
             vec![],
             source_id,
@@ -1872,6 +1880,7 @@ mod tests {
                         }],
                         ..Default::default()
                     }),
+                    enter_tapped: false,
                 },
                 vec![],
                 ObjectId(200),
@@ -2271,6 +2280,7 @@ mod tests {
                 origin: Some(Zone::Hand),
                 destination: Zone::Library,
                 target: TargetFilter::Controller,
+                enter_tapped: false,
             },
             vec![],
             ObjectId(500),
@@ -2364,6 +2374,7 @@ mod tests {
                         FilterProp::SameNameAsParentTarget,
                     ]),
                 ),
+                enter_tapped: false,
             },
             // Parent target supplies the "that name" referent.
             vec![TargetRef::Object(seed)],
@@ -2506,6 +2517,7 @@ mod tests {
                         },
                         FilterProp::SameNameAsParentTarget,
                     ])),
+                    enter_tapped: false,
                 },
                 vec![TargetRef::Object(seed)],
                 ObjectId(100),
@@ -2702,6 +2714,7 @@ mod tests {
                 target: TargetFilter::TrackedSet {
                     id: TrackedSetId(0),
                 },
+                enter_tapped: false,
             },
             vec![],
             ObjectId(100),

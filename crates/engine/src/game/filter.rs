@@ -1450,6 +1450,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::SharesQuality { .. }
         | FilterProp::WasDealtDamageThisTurn
         | FilterProp::EnteredThisTurn
+        | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
@@ -2063,6 +2064,13 @@ fn matches_filter_prop(
         FilterProp::WasDealtDamageThisTurn => obj.damage_marked > 0,
         // CR 400.7: Object entered the battlefield this turn.
         FilterProp::EnteredThisTurn => obj.entered_battlefield_turn == Some(state.turn_number),
+        FilterProp::ZoneChangedThisTurn { from, to } => {
+            state.zone_changes_this_turn.iter().any(|record| {
+                record.object_id == object_id
+                    && from.is_none_or(|zone| record.from_zone == Some(zone))
+                    && to.is_none_or(|zone| record.to_zone == zone)
+            })
+        }
         // CR 508.1a: Creature was declared as an attacker this turn.
         FilterProp::AttackedThisTurn => state.creatures_attacked_this_turn.contains(&object_id),
         // CR 509.1a: Creature was declared as a blocker this turn.
@@ -2338,6 +2346,7 @@ fn zone_change_record_matches_property(
         | FilterProp::SharesQuality { .. }
         | FilterProp::WasDealtDamageThisTurn
         | FilterProp::EnteredThisTurn
+        | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::TargetsOnly { .. }
         | FilterProp::Targets { .. }
         // CR 107.3 + CR 202.1: X-in-cost is a spell-cast-time predicate; it has no
@@ -5912,6 +5921,65 @@ mod tests {
             id,
             &make_subtype_filter("Illusion"),
             id
+        ));
+    }
+
+    /// CR 400.7 + CR 700.4: A live object can be selected by same-turn zone
+    /// history phrases like "cards in your graveyard that were put there from
+    /// the battlefield this turn".
+    #[test]
+    fn zone_changed_this_turn_matches_live_object_history() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Source");
+        let card = create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Salvage Target".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&card)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Artifact);
+        state
+            .zone_changes_this_turn
+            .push(ZoneChangeRecord::test_minimal(
+                card,
+                Some(Zone::Battlefield),
+                Zone::Graveyard,
+            ));
+
+        let filter = TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Artifact)
+                .controller(ControllerRef::You)
+                .properties(vec![
+                    FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    },
+                    FilterProp::ZoneChangedThisTurn {
+                        from: Some(Zone::Battlefield),
+                        to: Some(Zone::Graveyard),
+                    },
+                ]),
+        );
+        assert!(matches_target_filter(&state, card, &filter, source));
+
+        let wrong_destination =
+            TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact).properties(vec![
+                FilterProp::ZoneChangedThisTurn {
+                    from: Some(Zone::Battlefield),
+                    to: Some(Zone::Exile),
+                },
+            ]));
+        assert!(!matches_target_filter(
+            &state,
+            card,
+            &wrong_destination,
+            source
         ));
     }
 

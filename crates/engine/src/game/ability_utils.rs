@@ -3727,6 +3727,7 @@ mod tests {
                 origin: Some(Zone::Graveyard),
                 destination: Zone::Exile,
                 target: TargetFilter::Player,
+                enter_tapped: false,
             },
             vec![],
             ObjectId(900),

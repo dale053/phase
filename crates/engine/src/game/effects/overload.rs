@@ -127,6 +127,7 @@ fn transform_effect_in_place(effect: &mut Effect) {
             origin,
             destination,
             target,
+            enter_tapped: false,
         },
         // Effects without an all-matching counterpart (e.g. `Counter` for
         // Counterflux) are preserved as-is. No overload corpus card has a
@@ -269,6 +270,7 @@ mod tests {
                 origin,
                 destination,
                 ref target,
+                ..
             } => {
                 assert!(origin.is_none());
                 assert_eq!(destination, Zone::Exile);

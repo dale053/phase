@@ -1603,6 +1603,16 @@ pub enum FilterProp {
     /// CR 400.7: Object entered the battlefield during this turn.
     /// Checks `entered_battlefield_turn == Some(current_turn)`.
     EnteredThisTurn,
+    /// CR 400.7 + CR 700.4: The object moved between matching zones during
+    /// this turn. Parameterized for phrases like "cards in your graveyard that
+    /// were put there from the battlefield this turn"; `None` on either side
+    /// means that side is unconstrained.
+    ZoneChangedThisTurn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<Zone>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<Zone>,
+    },
     /// CR 508.1a: Creature was declared as an attacker this turn.
     /// Checks `creatures_attacked_this_turn` tracking set on GameState.
     AttackedThisTurn,
@@ -3834,6 +3844,10 @@ pub enum Effect {
         destination: Zone,
         #[serde(default = "default_target_filter_none")]
         target: TargetFilter,
+        /// CR 110.5b: When true, objects enter the battlefield tapped during
+        /// a mass zone move.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        enter_tapped: bool,
     },
     /// CR 701.20e + CR 608.2c: Look at top N cards (shown only to the looking player),
     /// select some to keep per the effect's instructions, rest go elsewhere.
@@ -9146,6 +9160,10 @@ mod tests {
             },
             FilterProp::InZone {
                 zone: Zone::Graveyard,
+            },
+            FilterProp::ZoneChangedThisTurn {
+                from: Some(Zone::Battlefield),
+                to: Some(Zone::Graveyard),
             },
             FilterProp::Owned {
                 controller: ControllerRef::Opponent,

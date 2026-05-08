@@ -1283,6 +1283,7 @@ fn try_parse_airbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
             origin: Some(Zone::Battlefield),
             destination: Zone::Exile,
             target: mass_target,
+            enter_tapped: false,
         }
     } else {
         Effect::ChangeZone {
@@ -4587,32 +4588,86 @@ fn try_parse_verb_and_target<'a>(
     // Return: determine destination separately, use parse_target remainder for compound detection
     if let Some((_, rest)) = nom_on_lower(text, lower, |i| value((), tag("return ")).parse(i)) {
         let rest_lower = &lower[lower.len() - rest.len()..];
-        let (_, dest) = strip_return_destination_ext(rest);
-        let (target, rem) = parse_target_with_ctx(rest, ctx);
+        let (trailing_target_text, trailing_dest) = strip_return_destination_ext(rest);
+        let (leading_target_text, leading_dest) = strip_leading_return_destination_ext(rest);
+        let (target_text, dest) = if leading_dest.is_some() {
+            (leading_target_text, leading_dest)
+        } else {
+            (trailing_target_text, trailing_dest)
+        };
+        let (is_mass, target_text) = if let Some((_, stripped)) =
+            nom_on_lower(target_text, &target_text.to_ascii_lowercase(), |i| {
+                value((), alt((tag("all "), tag("each ")))).parse(i)
+            }) {
+            (true, stripped)
+        } else {
+            (false, target_text)
+        };
+        let (target, rem) = parse_target_with_ctx(target_text, ctx);
         let origin = infer_origin_zone(rest_lower);
         return match dest {
-            Some(d) if d.zone == Zone::Battlefield => Some((
-                TargetedImperativeAst::ReturnToBattlefield {
-                    target,
-                    origin,
-                    enter_transformed: d.transformed,
-                    under_your_control: d.under_your_control,
-                    enter_tapped: d.enter_tapped,
-                    enter_with_counters: d.enter_with_counters,
-                },
-                rem,
-            )),
-            Some(d) if d.zone == Zone::Hand => {
-                Some((TargetedImperativeAst::Return { target }, rem))
+            Some(d) if d.zone == Zone::Battlefield => {
+                if is_mass && d.enter_with_counters.is_empty() {
+                    Some((
+                        TargetedImperativeAst::ReturnAllToZone {
+                            target,
+                            origin,
+                            destination: Zone::Battlefield,
+                            enter_tapped: d.enter_tapped,
+                        },
+                        rem,
+                    ))
+                } else {
+                    Some((
+                        TargetedImperativeAst::ReturnToBattlefield {
+                            target,
+                            origin,
+                            enter_transformed: d.transformed,
+                            under_your_control: d.under_your_control,
+                            enter_tapped: d.enter_tapped,
+                            enter_with_counters: d.enter_with_counters,
+                        },
+                        rem,
+                    ))
+                }
             }
-            Some(d) => Some((
-                TargetedImperativeAst::ReturnToZone {
-                    target,
-                    origin,
-                    destination: d.zone,
-                },
-                rem,
-            )),
+            Some(d) if d.zone == Zone::Hand => {
+                if is_mass && origin.is_some() {
+                    Some((
+                        TargetedImperativeAst::ReturnAllToZone {
+                            target,
+                            origin,
+                            destination: Zone::Hand,
+                            enter_tapped: false,
+                        },
+                        rem,
+                    ))
+                } else {
+                    Some((TargetedImperativeAst::Return { target }, rem))
+                }
+            }
+            Some(d) => {
+                if is_mass {
+                    Some((
+                        TargetedImperativeAst::ReturnAllToZone {
+                            target,
+                            origin,
+                            destination: d.zone,
+                            enter_tapped: false,
+                        },
+                        rem,
+                    ))
+                } else {
+                    Some((
+                        TargetedImperativeAst::ReturnToZone {
+                            target,
+                            origin,
+                            destination: d.zone,
+                        },
+                        rem,
+                    ))
+                }
+            }
             None => Some((TargetedImperativeAst::Return { target }, rem)),
         };
     }
@@ -13602,6 +13657,7 @@ mod tests {
                     origin: Some(Zone::Graveyard),
                     destination: Zone::Exile,
                     target: TargetFilter::Player,
+                    enter_tapped: false,
                 }
             ),
             "exile target player's graveyard should be ChangeZoneAll with origin=Graveyard, target=Player, got {e:?}"
@@ -13661,6 +13717,7 @@ mod tests {
                     origin: Some(Zone::Exile),
                     destination: Zone::Graveyard,
                     target: TargetFilter::ExiledBySource,
+                    enter_tapped: false,
                 }
             ),
             "should produce ChangeZoneAll from Exile to Graveyard with ExiledBySource, got {e:?}"
@@ -14181,42 +14238,42 @@ mod tests {
     /// CR 400.7: "Return all <filter> to the battlefield" (Open the Vaults,
     /// Replenish, Splendid Reclamation, etc.) must NOT promote to `BounceAll`
     /// — the destination is the battlefield, not hand. Routes through
-    /// `ReturnToBattlefield` ⇒ `Effect::ChangeZone { destination: Battlefield }`.
+    /// `ReturnAllToZone` ⇒ `Effect::ChangeZoneAll { destination: Battlefield }`.
     /// Pins the destination-routing boundary on the unified return arm.
     #[test]
-    fn effect_return_all_to_battlefield_stays_change_zone() {
+    fn effect_return_all_to_battlefield_uses_change_zone_all() {
         let e = parse_effect(
             "Return all artifact and enchantment cards from all graveyards to the battlefield under their owners' control",
         );
         assert!(
             matches!(
                 e,
-                Effect::ChangeZone {
+                Effect::ChangeZoneAll {
                     destination: Zone::Battlefield,
                     ..
                 }
             ),
-            "return-all-to-battlefield must lower to ChangeZone, not BounceAll, got {e:?}"
+            "return-all-to-battlefield must lower to ChangeZoneAll, got {e:?}"
         );
     }
 
     /// Praetor's Counsel: "Return all cards from your graveyard to your hand"
     /// — origin is graveyard, destination is hand. The `BounceAll` resolver
-    /// only scans the battlefield, so this MUST remain a `ChangeZone` with
-    /// `origin: Graveyard, destination: Hand`. Regression guard.
+    /// only scans the battlefield, so this MUST route through `ChangeZoneAll`
+    /// rather than `BounceAll`. Regression guard.
     #[test]
-    fn effect_return_all_from_graveyard_to_hand_stays_change_zone() {
+    fn effect_return_all_from_graveyard_to_hand_uses_change_zone_all() {
         let e = parse_effect("Return all cards from your graveyard to your hand");
         assert!(
             matches!(
                 e,
-                Effect::ChangeZone {
+                Effect::ChangeZoneAll {
                     origin: Some(Zone::Graveyard),
                     destination: Zone::Hand,
                     ..
                 }
             ),
-            "return-all from graveyard→hand must lower to ChangeZone, not BounceAll, got {e:?}"
+            "return-all from graveyard→hand must lower to ChangeZoneAll, got {e:?}"
         );
     }
 
@@ -14407,7 +14464,8 @@ mod tests {
         let e = parse_effect("Return to the battlefield all cards they own exiled with it");
         assert!(matches!(
             e,
-            Effect::ChangeZone {
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Exile),
                 destination: Zone::Battlefield,
                 target: TargetFilter::ExiledBySource,
                 ..
@@ -15039,6 +15097,7 @@ mod tests {
                 origin: Some(Zone::Hand),
                 destination: Zone::Library,
                 target: TargetFilter::Controller,
+                enter_tapped: false,
             }
         ));
 
@@ -15052,6 +15111,7 @@ mod tests {
                 origin: Some(Zone::Graveyard),
                 destination: Zone::Library,
                 target: TargetFilter::Controller,
+                enter_tapped: false,
             }
         ));
 

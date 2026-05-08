@@ -21,6 +21,8 @@ use crate::parser::oracle_nom::primitives as nom_primitives;
 use crate::parser::oracle_static::{
     parse_continuous_modifications, parse_quoted_ability_modifications,
 };
+#[cfg(test)]
+use crate::types::ability::FilterProp;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, CategoryChooserScope, ChoiceType, Chooser,
     ContinuousModification, ControllerRef, Duration, Effect, GainLifePlayer, LibraryPosition,
@@ -920,11 +922,10 @@ pub(super) fn parse_targeted_action_ast(
     // by destination + origin. Mass-bounce ("return all creatures to their
     // owners' hands") promotes to `ReturnAll` ⇒ `Effect::BounceAll`.
     // Battlefield-targeted return-all ("return all artifact and enchantment
-    // cards from all graveyards to the battlefield") falls through to the
-    // single-target `ReturnToBattlefield` AST — promoting it to a mass
-    // variant requires an `Effect::ChangeZoneAll` field-shape extension that
-    // is out of scope here. Mirrors the `tap all`/`tap each` precheck arms
-    // above plus the bare `tag("return ")` arm's destination routing.
+    // cards from all graveyards to the battlefield") routes to ChangeZoneAll
+    // so the resolver scans the full object set. Mirrors the `tap all`/`tap
+    // each` precheck arms above plus the bare `tag("return ")` arm's
+    // destination routing.
     // The combinator captures the plurality directly: `true` = mass quantifier
     // (`all`/`each`), `false` = single-target. Avoids post-hoc string
     // equality on the consumed head (parser-combinator gate).
@@ -938,31 +939,47 @@ pub(super) fn parse_targeted_action_ast(
         let rest_lower = &lower[lower.len() - rest.len()..];
         let (trailing_target_text, trailing_dest) = super::strip_return_destination_ext(rest);
         let (leading_target_text, leading_dest) = super::strip_leading_return_destination_ext(rest);
-        let (target_text, dest) = if trailing_dest.is_some() {
-            (trailing_target_text, trailing_dest)
-        } else {
+        let (target_text, dest) = if leading_dest.is_some() {
             (leading_target_text, leading_dest)
+        } else {
+            (trailing_target_text, trailing_dest)
+        };
+        let (is_mass, target_text) = if let Some((_, rest)) =
+            nom_on_lower(target_text, &target_text.to_ascii_lowercase(), |input| {
+                value((), alt((tag("all "), tag("each ")))).parse(input)
+            }) {
+            (true, rest)
+        } else {
+            (is_mass, target_text)
         };
         let (target, _rem) = parse_target_with_ctx(target_text, ctx);
         let origin = super::infer_origin_zone(rest_lower);
         #[cfg(debug_assertions)]
         assert_no_compound_remainder(_rem, text);
 
-        // CR 400.7: Battlefield destination ⇒ ChangeZone (single-target until
-        // a separate ChangeZoneAll-shape extension lands). Non-hand non-
-        // battlefield destinations route through ReturnToZone unchanged. Only
-        // pure mass-bounce (battlefield⇒hand, no graveyard/library origin)
-        // promotes to `ReturnAll` ⇒ `Effect::BounceAll`.
+        // CR 400.7: Single-object battlefield destinations use ChangeZone;
+        // mass destinations use ChangeZoneAll. Only pure mass-bounce
+        // (battlefield⇒hand, no graveyard/library origin) promotes to
+        // `ReturnAll` ⇒ `Effect::BounceAll`.
         return match dest {
             Some(d) if d.zone == Zone::Battlefield => {
-                Some(TargetedImperativeAst::ReturnToBattlefield {
-                    target,
-                    origin,
-                    enter_transformed: d.transformed,
-                    under_your_control: d.under_your_control,
-                    enter_tapped: d.enter_tapped,
-                    enter_with_counters: d.enter_with_counters,
-                })
+                if is_mass && d.enter_with_counters.is_empty() {
+                    Some(TargetedImperativeAst::ReturnAllToZone {
+                        target,
+                        origin,
+                        destination: Zone::Battlefield,
+                        enter_tapped: d.enter_tapped,
+                    })
+                } else {
+                    Some(TargetedImperativeAst::ReturnToBattlefield {
+                        target,
+                        origin,
+                        enter_transformed: d.transformed,
+                        under_your_control: d.under_your_control,
+                        enter_tapped: d.enter_tapped,
+                        enter_with_counters: d.enter_with_counters,
+                    })
+                }
             }
             Some(d) if d.zone == Zone::Hand => {
                 // Mass return only when the source zone is implicit (battlefield):
@@ -972,20 +989,32 @@ pub(super) fn parse_targeted_action_ast(
                 if is_mass && origin.is_none() {
                     Some(TargetedImperativeAst::ReturnAll { target })
                 } else if is_mass {
-                    Some(TargetedImperativeAst::ReturnToZone {
+                    Some(TargetedImperativeAst::ReturnAllToZone {
                         target,
                         origin,
                         destination: Zone::Hand,
+                        enter_tapped: false,
                     })
                 } else {
                     Some(TargetedImperativeAst::Return { target })
                 }
             }
-            Some(d) => Some(TargetedImperativeAst::ReturnToZone {
-                target,
-                origin,
-                destination: d.zone,
-            }),
+            Some(d) => {
+                if is_mass {
+                    Some(TargetedImperativeAst::ReturnAllToZone {
+                        target,
+                        origin,
+                        destination: d.zone,
+                        enter_tapped: false,
+                    })
+                } else {
+                    Some(TargetedImperativeAst::ReturnToZone {
+                        target,
+                        origin,
+                        destination: d.zone,
+                    })
+                }
+            }
             // No explicit destination phrase. "Return all <filter>" with no
             // "to ..." tail still defaults to owner's hand for the
             // mass-bounce class. Single-target "return <X>" likewise defaults
@@ -1155,6 +1184,24 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
             up_to: false,
             enter_with_counters: vec![],
         },
+        TargetedImperativeAst::ReturnAllToZone {
+            target,
+            origin,
+            destination,
+            enter_tapped,
+        } => {
+            let origin = if matches!(target, TargetFilter::ExiledBySource) {
+                Some(Zone::Exile)
+            } else {
+                origin
+            };
+            Effect::ChangeZoneAll {
+                origin,
+                destination,
+                target,
+                enter_tapped,
+            }
+        }
         TargetedImperativeAst::Fight { target } => Effect::Fight {
             target,
             subject: TargetFilter::SelfRef,
@@ -1503,6 +1550,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
                 },
                 crate::types::ability::FilterProp::SameNameAsParentTarget,
             ])),
+            enter_tapped: false,
         },
     }
 }
@@ -2482,6 +2530,7 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
                     origin: Some(Zone::Exile),
                     destination,
                     target,
+                    enter_tapped,
                 }
             } else {
                 Effect::ChangeZone {
@@ -3084,6 +3133,7 @@ fn change_zone_all_to_library_effect(origin: Zone) -> Effect {
         origin: Some(origin),
         destination: Zone::Library,
         target: TargetFilter::Controller,
+        enter_tapped: false,
     }
 }
 
@@ -4934,6 +4984,7 @@ pub(super) fn lower_zone_counter_ast(ast: ZoneCounterImperativeAst) -> Effect {
                     origin,
                     destination: Zone::Exile,
                     target,
+                    enter_tapped: false,
                 }
             } else {
                 Effect::ChangeZone {
@@ -5589,6 +5640,45 @@ mod tests {
             "Expected GainControl, got {effect:?}"
         );
         let _ = (text, lower);
+    }
+
+    #[test]
+    fn parse_mass_return_to_battlefield_after_leading_destination() {
+        let text = "Return to the battlefield all artifact and creature cards in your graveyard that were put there from the battlefield this turn";
+        let lower = text.to_lowercase();
+        let ast = parse_targeted_action_ast(text, &lower, &mut ParseContext::default())
+            .expect("mass return should parse");
+        let effect = lower_targeted_action_ast(ast);
+        match effect {
+            Effect::ChangeZoneAll {
+                origin,
+                destination,
+                target: TargetFilter::Or { filters },
+                enter_tapped,
+            } => {
+                assert_eq!(origin, None);
+                assert_eq!(destination, Zone::Battlefield);
+                assert!(!enter_tapped);
+                assert_eq!(filters.len(), 2);
+                for filter in filters {
+                    let TargetFilter::Typed(typed) = filter else {
+                        panic!("expected typed OR leg, got {filter:?}");
+                    };
+                    assert_eq!(typed.controller, Some(ControllerRef::You));
+                    assert!(typed.properties.contains(&FilterProp::InZone {
+                        zone: Zone::Graveyard
+                    }));
+                    assert!(typed.properties.iter().any(|prop| matches!(
+                        prop,
+                        FilterProp::ZoneChangedThisTurn {
+                            from: Some(Zone::Battlefield),
+                            to: Some(Zone::Graveyard),
+                        }
+                    )));
+                }
+            }
+            other => panic!("Expected ChangeZoneAll return to battlefield, got {other:?}"),
+        }
     }
 
     #[test]
@@ -6796,6 +6886,7 @@ mod tests {
                 origin: Some(Zone::Hand),
                 destination: Zone::Library,
                 target: TargetFilter::Controller,
+                ..
             }
         ));
 
@@ -6809,6 +6900,7 @@ mod tests {
                 origin: Some(Zone::Graveyard),
                 destination: Zone::Library,
                 target: TargetFilter::Controller,
+                ..
             }
         ));
 
@@ -6873,6 +6965,7 @@ mod tests {
                 origin,
                 destination,
                 target,
+                ..
             } => {
                 assert!(
                     origin.is_none(),

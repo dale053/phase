@@ -180,6 +180,7 @@ fn bind_tracked_set_to_effect(effect: &mut Effect, real_id: TrackedSetId) {
                 origin: Some(Zone::Exile),
                 destination: *destination,
                 target: TargetFilter::TrackedSet { id: real_id },
+                enter_tapped: false,
             };
         }
         _ => {}
@@ -247,6 +248,7 @@ mod tests {
                 origin: Some(Zone::Exile),
                 destination: Zone::Battlefield,
                 target: TargetFilter::Any,
+                enter_tapped: false,
             },
         );
         let ability = ResolvedAbility::new(
@@ -328,6 +330,7 @@ mod tests {
                 origin,
                 destination,
                 target,
+                ..
             } => {
                 assert_eq!(*origin, Some(Zone::Exile));
                 assert_eq!(*destination, Zone::Battlefield);

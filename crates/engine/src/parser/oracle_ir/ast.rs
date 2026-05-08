@@ -569,6 +569,15 @@ pub(crate) enum TargetedImperativeAst {
         origin: Option<Zone>,
         destination: Zone,
     },
+    /// CR 400.7 + CR 608.2c: Mass return to a non-default zone. Lowers to
+    /// `ChangeZoneAll` so the resolver scans every matching object instead of
+    /// requiring player target slots.
+    ReturnAllToZone {
+        target: TargetFilter,
+        origin: Option<Zone>,
+        destination: Zone,
+        enter_tapped: bool,
+    },
     Fight {
         target: TargetFilter,
     },

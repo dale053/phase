@@ -475,6 +475,11 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             }
             FilterProp::WasDealtDamageThisTurn => parts.push("dealt damage this turn".into()),
             FilterProp::EnteredThisTurn => parts.push("entered this turn".into()),
+            FilterProp::ZoneChangedThisTurn { from, to } => parts.push(format!(
+                "zone changed this turn from {} to {}",
+                from.map_or("any".into(), |zone| format!("{zone:?}")),
+                to.map_or("any".into(), |zone| format!("{zone:?}"))
+            )),
             FilterProp::AttackedThisTurn => parts.push("attacked this turn".into()),
             FilterProp::BlockedThisTurn => parts.push("blocked this turn".into()),
             FilterProp::AttackedOrBlockedThisTurn => {
@@ -1454,6 +1459,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             origin,
             destination,
             target,
+            ..
         } => {
             if let Some(o) = origin {
                 d.push(("from".into(), fmt_zone(o)));

@@ -323,6 +323,8 @@ pub fn parse_target_with_ctx<'a>(text: &'a str, ctx: &mut ParseContext) -> (Targ
         tag("all cards exiled with it"),
         tag("all cards they own exiled with ~"),
         tag("all cards they own exiled with it"),
+        tag("cards they own exiled with ~"),
+        tag("cards they own exiled with it"),
         tag("cards exiled with ~"),
         tag("cards exiled with it"),
     ))
@@ -633,6 +635,8 @@ pub fn parse_target_with_ctx<'a>(text: &'a str, ctx: &mut ParseContext) -> (Targ
         tag("all cards exiled with it"),
         tag("all cards they own exiled with ~"),
         tag("all cards they own exiled with it"),
+        tag("cards they own exiled with ~"),
+        tag("cards they own exiled with it"),
         tag("cards exiled with ~"),
         tag("cards exiled with it"),
     ))
@@ -1351,6 +1355,13 @@ pub fn parse_type_phrase_with_ctx<'a>(
         if controller.is_none() {
             controller = zone_ctrl;
         }
+    }
+
+    if let Some((prop, consumed)) =
+        parse_zone_changed_this_turn_suffix(&lower[pos..], zone_for_scope(&properties))
+    {
+        properties.push(prop);
+        pos += consumed;
     }
 
     // Check "of the chosen type" suffix (Cavern of Souls, Metallic Mimic, etc.)
@@ -2888,6 +2899,52 @@ fn parse_cost_paid_object_reference(
     ))
     .parse(rest)?;
     Ok((rest, TargetFilter::CostPaidObject))
+}
+
+fn parse_zone_changed_this_turn_suffix(
+    input: &str,
+    to: Option<Zone>,
+) -> Option<(FilterProp, usize)> {
+    let trimmed = input.trim_start();
+    let offset = input.len() - trimmed.len();
+    let (rest, from) = (
+        tag::<_, _, OracleError<'_>>("that "),
+        alt((tag("were "), tag("was "))),
+        alt((tag("put "), tag("placed "), tag("moved "))),
+        tag("there from "),
+        alt((
+            value(Zone::Battlefield, tag("the battlefield")),
+            value(Zone::Graveyard, tag("a graveyard")),
+            value(Zone::Graveyard, tag("your graveyard")),
+            value(Zone::Graveyard, tag("graveyard")),
+            value(Zone::Exile, tag("exile")),
+            value(Zone::Hand, tag("a hand")),
+            value(Zone::Hand, tag("your hand")),
+            value(Zone::Hand, tag("hand")),
+            value(Zone::Library, tag("a library")),
+            value(Zone::Library, tag("your library")),
+            value(Zone::Library, tag("library")),
+        )),
+        opt(tag(" this turn")),
+    )
+        .map(|(_, _, _, _, from, _)| from)
+        .parse(trimmed)
+        .ok()?;
+    Some((
+        FilterProp::ZoneChangedThisTurn {
+            from: Some(from),
+            to,
+        },
+        offset + trimmed.len() - rest.len(),
+    ))
+}
+
+fn zone_for_scope(props: &[FilterProp]) -> Option<Zone> {
+    props.iter().find_map(|prop| match prop {
+        FilterProp::InZone { zone } => Some(*zone),
+        FilterProp::InAnyZone { zones } if zones.len() == 1 => zones.first().copied(),
+        _ => None,
+    })
 }
 
 pub(crate) fn parse_shared_quality_clause(
@@ -5125,6 +5182,13 @@ mod tests {
     }
 
     #[test]
+    fn cards_they_own_exiled_with_it_produces_exiled_by_source() {
+        let (f, rest) = parse_target("cards they own exiled with it");
+        assert_eq!(f, TargetFilter::ExiledBySource);
+        assert_eq!(rest, "");
+    }
+
+    #[test]
     fn exiled_cards_with_named_counters_produces_exile_counter_filter() {
         let (f, rest) = parse_target("exiled cards with aegis counters on them");
         assert_eq!(rest, "");
@@ -6513,6 +6577,37 @@ mod tests {
                 .any(|p| matches!(p, FilterProp::EnteredThisTurn)));
         } else {
             panic!("expected Typed filter, got {filter:?}");
+        }
+        assert!(
+            rest.trim().is_empty(),
+            "expected empty remainder, got: {rest:?}"
+        );
+    }
+
+    #[test]
+    fn type_phrase_cards_put_there_from_battlefield_this_turn() {
+        let (filter, rest) = parse_type_phrase(
+            "artifact and creature cards in your graveyard that were put there from the battlefield this turn",
+        );
+        let TargetFilter::Or { filters } = filter else {
+            panic!("expected OR filter, got {filter:?}");
+        };
+        assert_eq!(filters.len(), 2);
+        for filter in filters {
+            let TargetFilter::Typed(tf) = filter else {
+                panic!("expected typed leg, got {filter:?}");
+            };
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+            assert!(tf.properties.contains(&FilterProp::InZone {
+                zone: Zone::Graveyard
+            }));
+            assert!(tf.properties.iter().any(|prop| matches!(
+                prop,
+                FilterProp::ZoneChangedThisTurn {
+                    from: Some(Zone::Battlefield),
+                    to: Some(Zone::Graveyard),
+                }
+            )));
         }
         assert!(
             rest.trim().is_empty(),
