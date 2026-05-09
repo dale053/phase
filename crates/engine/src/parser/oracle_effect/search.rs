@@ -618,7 +618,10 @@ fn parse_search_filter_disjunction(text: &str, ctx: &mut ParseContext) -> Option
 
     let filters: Vec<TargetFilter> = segments
         .into_iter()
-        .map(|s| parse_search_filter(s, ctx))
+        .flat_map(|s| match parse_search_filter(s, ctx) {
+            TargetFilter::Or { filters } => filters,
+            filter => vec![filter],
+        })
         .filter(search_filter_has_meaningful_content)
         .collect();
     (filters.len() >= 2).then(|| normalize_search_filter(TargetFilter::Or { filters }))
@@ -641,6 +644,7 @@ fn split_filter_disjunctions(filter_region: &str) -> Vec<&str> {
         OrBasic,
         AndOrA,
         AndOrAn,
+        AndOrBare,
         BareOr,
     }
 
@@ -652,6 +656,7 @@ fn split_filter_disjunctions(filter_region: &str) -> Vec<&str> {
             alt((
                 value(Disjunction::AndOrA, tag(" and/or a ")),
                 value(Disjunction::AndOrAn, tag(" and/or an ")),
+                value(Disjunction::AndOrBare, tag(" and/or ")),
             )),
         );
         let parsed = if let Ok(found) = and_or_scan.parse(remaining) {
@@ -684,12 +689,21 @@ fn split_filter_disjunctions(filter_region: &str) -> Vec<&str> {
             break;
         }
 
+        if matches!(disjunction, Disjunction::AndOrBare) && before.as_bytes().contains(&b',') {
+            if segments.is_empty() {
+                return vec![filter_region.trim()];
+            }
+            segments.push(remaining.trim());
+            break;
+        }
+
         segments.push(before.trim());
         remaining = match disjunction {
             Disjunction::OrA
             | Disjunction::OrAn
             | Disjunction::AndOrA
             | Disjunction::AndOrAn
+            | Disjunction::AndOrBare
             | Disjunction::BareOr => rest,
             Disjunction::OrBasic => {
                 let start = filter_region.len() - rest.len() - "basic ".len();
@@ -2316,6 +2330,36 @@ mod tests {
         };
         assert!(equipment.type_filters.contains(&TypeFilter::Artifact));
         assert_eq!(equipment.get_subtype(), Some("Equipment"));
+    }
+
+    #[test]
+    fn parse_search_filter_handles_bare_and_or_subtype_variant() {
+        let mut ctx = ParseContext::default();
+        let filter = parse_search_filter(
+            "basic land cards and/or town cards with different names",
+            &mut ctx,
+        );
+        assert!(ctx.diagnostics.is_empty());
+        let TargetFilter::Or { filters } = filter else {
+            panic!("expected Or filter, got {filter:?}");
+        };
+        assert_eq!(filters.len(), 2);
+
+        let TargetFilter::Typed(basic_land) = &filters[0] else {
+            panic!("expected typed basic land branch, got {:?}", filters[0]);
+        };
+        assert!(basic_land.type_filters.contains(&TypeFilter::Land));
+        assert!(basic_land.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::HasSupertype {
+                value: Supertype::Basic
+            }
+        )));
+
+        let TargetFilter::Typed(town) = &filters[1] else {
+            panic!("expected typed Town branch, got {:?}", filters[1]);
+        };
+        assert_eq!(town.get_subtype(), Some("Town"));
     }
 
     #[test]
