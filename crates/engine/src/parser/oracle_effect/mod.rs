@@ -7031,6 +7031,9 @@ fn parse_choose_filter_from_sentence(lower: &str, ctx: &mut ParseContext) -> Tar
     };
     // The word immediately before "card from" is the type descriptor
     let word = before_card.trim().rsplit(' ').next().unwrap_or("");
+    if word.is_empty() || matches!(word, "a" | "an") {
+        return TargetFilter::Any;
+    }
     if let Some(negated) = word.strip_prefix("non") {
         if let Some(TargetFilter::Typed(tf)) = type_str_to_target_filter(negated) {
             if let Some(primary) = tf.get_primary_type().cloned() {
@@ -19153,6 +19156,67 @@ mod tests {
             t,
             TypeFilter::Non(inner) if matches!(inner.as_ref(), TypeFilter::Land)
         )));
+    }
+
+    #[test]
+    fn seek_land_and_nonland_cards_splits_filters() {
+        let details = parse_seek_details(
+            "seek a land card and a nonland card",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(details.count, QuantityExpr::Fixed { value: 1 });
+        assert_eq!(details.extra_filters.len(), 1);
+        let TargetFilter::Typed(primary) = &details.filter else {
+            panic!("Expected Typed primary filter, got {:?}", details.filter);
+        };
+        assert!(primary.type_filters.contains(&TypeFilter::Land));
+        let TargetFilter::Typed(extra) = &details.extra_filters[0] else {
+            panic!(
+                "Expected Typed extra filter, got {:?}",
+                details.extra_filters[0]
+            );
+        };
+        assert!(extra.type_filters.iter().any(|t| matches!(
+            t,
+            TypeFilter::Non(inner) if matches!(inner.as_ref(), TypeFilter::Land)
+        )));
+    }
+
+    #[test]
+    fn seek_land_and_nonland_cards_lowers_to_chain() {
+        let def = parse_effect_chain("Seek a land card and a nonland card.", AbilityKind::Spell);
+        let Effect::Seek { filter, .. } = &*def.effect else {
+            panic!("Expected primary Seek, got {:?}", def.effect);
+        };
+        let TargetFilter::Typed(primary) = filter else {
+            panic!("Expected Typed primary filter, got {filter:?}");
+        };
+        assert!(primary.type_filters.contains(&TypeFilter::Land));
+
+        let extra = def.sub_ability.expect("expected extra seek");
+        let Effect::Seek { filter, .. } = &*extra.effect else {
+            panic!("Expected extra Seek, got {:?}", extra.effect);
+        };
+        let TargetFilter::Typed(extra_filter) = filter else {
+            panic!("Expected Typed extra filter, got {filter:?}");
+        };
+        assert!(extra_filter.type_filters.iter().any(|t| matches!(
+            t,
+            TypeFilter::Non(inner) if matches!(inner.as_ref(), TypeFilter::Land)
+        )));
+    }
+
+    #[test]
+    fn choose_from_sentence_bare_card_from_it_is_any_card() {
+        let mut ctx = ParseContext::default();
+        let filter =
+            parse_choose_filter_from_sentence("that player exiles a card from it", &mut ctx);
+        assert_eq!(filter, TargetFilter::Any);
+        assert!(
+            ctx.diagnostics.is_empty(),
+            "bare card choice should not emit target fallback diagnostics: {:?}",
+            ctx.diagnostics
+        );
     }
 
     #[test]

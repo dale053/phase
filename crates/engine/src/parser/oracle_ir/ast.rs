@@ -117,6 +117,9 @@ pub(crate) struct SeekDetails {
     pub(crate) from_top: Option<usize>,
     pub(crate) destination: Zone,
     pub(crate) enter_tapped: bool,
+    /// Alchemy digital-only analogue to search multi-filters: "seek a X card
+    /// and a Y card" performs one independent seek per filter.
+    pub(crate) extra_filters: Vec<TargetFilter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -666,6 +669,9 @@ pub(crate) enum SearchCreationImperativeAst {
         from_top: Option<usize>,
         destination: Zone,
         enter_tapped: bool,
+        /// Alchemy digital-only analogue to search multi-filters: "seek a X card
+        /// and a Y card" performs one independent seek per filter.
+        extra_filters: Vec<TargetFilter>,
     },
     /// CR 400.7 + CR 701.23 + CR 701.24: "Search [possessive] graveyard, hand,
     /// and library for any number of cards with that name and exile them."

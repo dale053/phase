@@ -1314,6 +1314,7 @@ pub(super) fn parse_search_and_creation_ast(
             from_top: details.from_top,
             destination: details.destination,
             enter_tapped: details.enter_tapped,
+            extra_filters: details.extra_filters,
         });
     }
     // CR 400.7 + CR 701.23 + CR 701.24: "search [possessive] graveyard, hand,
@@ -1528,6 +1529,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             from_top,
             destination,
             enter_tapped,
+            extra_filters: _,
         } => Effect::Seek {
             filter,
             count,
@@ -3086,6 +3088,41 @@ pub(super) fn lower_multi_filter_search_library(
         reveal,
         target_player,
         selection_constraint,
+    });
+    clause.sub_ability = tail;
+    clause
+}
+
+pub(super) fn lower_multi_filter_seek(
+    primary_filter: TargetFilter,
+    count: QuantityExpr,
+    from_top: Option<usize>,
+    destination: Zone,
+    enter_tapped: bool,
+    extra_filters: Vec<TargetFilter>,
+) -> ParsedEffectClause {
+    let mut tail: Option<Box<AbilityDefinition>> = None;
+    for extra_filter in extra_filters.into_iter().rev() {
+        let mut seek_def = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Seek {
+                filter: extra_filter,
+                count: count.clone(),
+                from_top,
+                destination,
+                enter_tapped,
+            },
+        );
+        seek_def.sub_ability = tail;
+        tail = Some(Box::new(seek_def));
+    }
+
+    let mut clause = parsed_clause(Effect::Seek {
+        filter: primary_filter,
+        count,
+        from_top,
+        destination,
+        enter_tapped,
     });
     clause.sub_ability = tail;
     clause
@@ -4726,6 +4763,23 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
             extra_filters,
             multi_destination,
             multi_enter_tapped,
+        ),
+        ImperativeFamilyAst::Structured(ImperativeAst::SearchCreation(
+            SearchCreationImperativeAst::Seek {
+                filter,
+                count,
+                from_top,
+                destination,
+                enter_tapped,
+                extra_filters,
+            },
+        )) if !extra_filters.is_empty() => lower_multi_filter_seek(
+            filter,
+            count,
+            from_top,
+            destination,
+            enter_tapped,
+            extra_filters,
         ),
         ImperativeFamilyAst::Shuffle(ast) => lower_shuffle_ast(ast),
         // CR 701.41a: Support N → PutCounter with multi-target "up to N".

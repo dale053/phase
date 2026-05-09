@@ -471,7 +471,7 @@ pub(super) fn parse_seek_details(lower: &str, ctx: &mut ParseContext) -> SeekDet
         .map(|(rest, _)| rest)
         .unwrap_or(remaining);
 
-    let filter = parse_search_filter(remaining, ctx);
+    let (filter, extra_filters) = parse_search_filter_with_extras(remaining, ctx);
 
     SeekDetails {
         filter,
@@ -479,6 +479,7 @@ pub(super) fn parse_seek_details(lower: &str, ctx: &mut ParseContext) -> SeekDet
         from_top,
         destination,
         enter_tapped,
+        extra_filters,
     }
 }
 
