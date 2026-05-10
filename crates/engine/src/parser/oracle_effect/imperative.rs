@@ -22,12 +22,12 @@ use crate::parser::oracle_static::{
     parse_continuous_modifications, parse_quoted_ability_modifications,
 };
 #[cfg(test)]
-use crate::types::ability::FilterProp;
+use crate::types::ability::TypeFilter;
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, CategoryChooserScope, ChoiceType, Chooser,
-    ContinuousModification, ControllerRef, Duration, Effect, GainLifePlayer, LibraryPosition,
-    MultiTargetSpec, PaymentCost, PlayerScope, PreventionAmount, PreventionScope, PtValue,
-    QuantityExpr, QuantityRef, SearchSelectionConstraint, StaticDefinition, TargetFilter,
+    ContinuousModification, ControllerRef, Duration, Effect, FilterProp, GainLifePlayer,
+    LibraryPosition, MultiTargetSpec, PaymentCost, PlayerScope, PreventionAmount, PreventionScope,
+    PtValue, QuantityExpr, QuantityRef, SearchSelectionConstraint, StaticDefinition, TargetFilter,
     TypedFilter,
 };
 use crate::types::card_type::CoreType;
@@ -3463,6 +3463,31 @@ pub(super) fn parse_exile_ast(
         });
     }
 
+    if let Ok((_, (_, filter_text))) = (
+        opt(nom_primitives::parse_article),
+        terminated(
+            take_until(" from your hand"),
+            (tag(" from your hand"), opt(tag(".")), eof),
+        ),
+    )
+        .parse(rest_lower)
+    {
+        let (mut target, rem) = parse_type_phrase(filter_text.trim());
+        if rem.trim().is_empty() && !matches!(target, TargetFilter::Any) {
+            attach_controller_if_absent(&mut target, ControllerRef::You);
+            if let TargetFilter::Typed(typed) = &mut target {
+                typed
+                    .properties
+                    .push(FilterProp::InZone { zone: Zone::Hand });
+            }
+            return Some(ZoneCounterImperativeAst::Exile {
+                origin: Some(Zone::Hand),
+                target,
+                all: false,
+            });
+        }
+    }
+
     let (parsed_target, _rem) = parse_target(rest_text);
     #[cfg(debug_assertions)]
     assert_no_compound_remainder(_rem, text);
@@ -5587,6 +5612,58 @@ mod tests {
             target,
             TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You))
         );
+    }
+
+    #[test]
+    fn parse_exile_from_your_hand_preserves_type_phrase_filter() {
+        let input = "exile a nonartifact, nonland card from your hand";
+        let lower = input.to_lowercase();
+        let result = parse_zone_counter_ast(input, &lower, &mut ParseContext::default());
+        let Some(ZoneCounterImperativeAst::Exile {
+            origin: Some(Zone::Hand),
+            target: TargetFilter::Typed(filter),
+            all: false,
+        }) = result
+        else {
+            panic!("{input}: expected hand-origin typed exile, got {result:?}");
+        };
+
+        assert_eq!(filter.controller, Some(ControllerRef::You));
+        assert!(filter.type_filters.contains(&TypeFilter::Card));
+        assert!(filter
+            .type_filters
+            .contains(&TypeFilter::Non(Box::new(TypeFilter::Artifact))));
+        assert!(filter
+            .type_filters
+            .contains(&TypeFilter::Non(Box::new(TypeFilter::Land))));
+        assert!(filter
+            .properties
+            .contains(&FilterProp::InZone { zone: Zone::Hand }));
+    }
+
+    #[test]
+    fn parse_exile_from_your_hand_handles_article_variants() {
+        for (input, expected_type) in [
+            ("exile an instant card from your hand", TypeFilter::Instant),
+            ("exile a creature card from your hand", TypeFilter::Creature),
+        ] {
+            let lower = input.to_lowercase();
+            let result = parse_zone_counter_ast(input, &lower, &mut ParseContext::default());
+            let Some(ZoneCounterImperativeAst::Exile {
+                origin: Some(Zone::Hand),
+                target: TargetFilter::Typed(filter),
+                all: false,
+            }) = result
+            else {
+                panic!("{input}: expected hand-origin typed exile, got {result:?}");
+            };
+
+            assert_eq!(filter.controller, Some(ControllerRef::You));
+            assert!(filter.type_filters.contains(&expected_type));
+            assert!(filter
+                .properties
+                .contains(&FilterProp::InZone { zone: Zone::Hand }));
+        }
     }
 
     #[test]
