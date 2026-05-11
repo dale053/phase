@@ -1340,6 +1340,16 @@ pub fn synthesize_offspring(face: &mut CardFace) {
 /// the two outcomes resolves. `ChooseOneOf` is the existing primitive for
 /// "you may A or B" patterns and is the correct building block here — adding
 /// a bespoke "may/else" variant would duplicate it without categorical gain.
+///
+/// Timing axis: Fabricate's counter branch is a CR 603 *triggered* ability
+/// that resolves AFTER the permanent has entered, not a CR 614.1c as-enters
+/// replacement. Consequences: counter-placement replacements that modify
+/// "+1/+1 counter placement" broadly (Doubling Season, Hardened Scales) DO
+/// apply to Fabricate's counter branch via the standard counter-placement
+/// modification path. Effects scoped specifically to "enters with counters"
+/// as-enters replacements do NOT apply — Fabricate's counters are added
+/// post-ETB by trigger resolution. Do not move this synthesis into the
+/// as-enters replacement window: that would change the rules-correct timing.
 pub fn synthesize_fabricate(face: &mut CardFace) {
     let fabricate_values: Vec<u32> = face
         .keywords
@@ -1439,6 +1449,166 @@ pub fn synthesize_fabricate(face: &mut CardFace) {
             ));
         face.triggers.push(trigger);
     }
+}
+
+/// CR 702.93a: Undying — "When this permanent is put into a graveyard from the
+/// battlefield, if it had no +1/+1 counters on it, return it to the battlefield
+/// under its owner's control with a +1/+1 counter on it."
+///
+/// Synthesizes one dies-triggered ability per `Keyword::Undying` on the face:
+///   * `TriggerMode::ChangesZone` with `origin = Battlefield`, `destination =
+///     Graveyard`, `valid_card = SelfRef` (the canonical dies trigger shape;
+///     CR 603.10a — leaves-the-battlefield triggers look back in time).
+///   * `condition = Not(HadCounters { Some("P1P1") })` — CR 400.7 LKI lookup
+///     against `state.lki_cache` for the source's pre-death counter map.
+///   * Execute body: `Effect::ChangeZone` from `Graveyard` → `Battlefield`
+///     targeting `SelfRef`, with `enter_with_counters = [("P1P1", 1)]`. The
+///     default `under_your_control = false` matches the rule's "under its
+///     owner's control" exactly.
+///
+/// Per CR 702.93b ("If a permanent has multiple instances of undying, each
+/// triggers separately"), every `Keyword::Undying` on the face emits a
+/// distinct trigger.
+///
+/// Sibling of `synthesize_persist` — both share this dies-trigger shape and
+/// differ only in counter polarity (CR 702.79a vs CR 702.93a). They are kept
+/// as separate synthesizers (not parameterized into one) because the keyword
+/// enum carries the polarity choice at the type level; no runtime branching
+/// is needed.
+pub fn synthesize_undying(face: &mut CardFace) {
+    synthesize_dies_return_with_counter(face, &Keyword::Undying, "P1P1", "+1/+1", "702.93a");
+}
+
+/// CR 702.79a: Persist — "When this permanent is put into a graveyard from the
+/// battlefield, if it had no -1/-1 counters on it, return it to the battlefield
+/// under its owner's control with a -1/-1 counter on it."
+///
+/// Mirror of `synthesize_undying` with -1/-1 counters (`CounterType::Minus1Minus1`
+/// → `"M1M1"`). Per CR 702.79b every `Keyword::Persist` instance triggers
+/// separately, so one synthesized trigger is emitted per keyword on the face.
+pub fn synthesize_persist(face: &mut CardFace) {
+    synthesize_dies_return_with_counter(face, &Keyword::Persist, "M1M1", "-1/-1", "702.79a");
+}
+
+/// Shared synthesizer for the Undying/Persist class (CR 702.93a / CR 702.79a):
+/// "When this permanent dies, if it had no `<polarity>` counters on it, return
+/// it to the battlefield under its owner's control with a `<polarity>` counter
+/// on it."
+///
+/// Build-for-the-class: parameterized over the gating keyword variant and the
+/// counter polarity string (`"P1P1"` or `"M1M1"`). Any future "dies → return
+/// with single typed counter, gated on the same counter type's prior absence"
+/// keyword can reuse this directly.
+fn synthesize_dies_return_with_counter(
+    face: &mut CardFace,
+    keyword: &Keyword,
+    counter_type: &str,
+    counter_label: &str,
+    cr_ref: &str,
+) {
+    // Count keyword instances on the face (CR 702.93b / CR 702.79b: each
+    // instance triggers separately).
+    let instances = face.keywords.iter().filter(|kw| *kw == keyword).count();
+    if instances == 0 {
+        return;
+    }
+
+    // Idempotency: structural-shape match on the synthesized trigger. Match the
+    // dies-trigger shape (mode + origin + destination + valid_card) AND the
+    // execute body's counter type so an Undying synthesis pass can't be
+    // shadowed by a Persist trigger (or vice versa) on a hypothetical
+    // dual-keyword face. The condition shape (Not(HadCounters)) is
+    // counter-type specific via the execute body's `enter_with_counters`.
+    let existing_matching: usize = face
+        .triggers
+        .iter()
+        .filter(|t| is_dies_return_with_counter_trigger(t, counter_type))
+        .count();
+    if existing_matching >= instances {
+        return;
+    }
+
+    let remaining = instances - existing_matching;
+    for _ in 0..remaining {
+        // CR 122.1 + CR 614.1c: Single +1/+1 (or -1/-1) counter applied as
+        // the object enters the battlefield, via the existing
+        // `Effect::ChangeZone.enter_with_counters` plumbing. One zone-change
+        // effect carries both the return and the counter placement —
+        // composing from primitives instead of chaining a separate
+        // `Effect::PutCounter` sub-ability.
+        let return_effect = Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Battlefield,
+            target: TargetFilter::SelfRef,
+            owner_library: false,
+            enter_transformed: false,
+            // CR 702.93a / CR 702.79a: "under its owner's control" — default
+            // (false) sends the object to its owner's control. `true` would
+            // override to the ability controller's control.
+            under_your_control: false,
+            enter_tapped: false,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![(counter_type.to_string(), QuantityExpr::Fixed { value: 1 })],
+        };
+
+        let execute = AbilityDefinition::new(AbilityKind::Spell, return_effect).description(
+            format!("Return it to the battlefield with a {counter_label} counter on it"),
+        );
+
+        // CR 400.7 + CR 603.10a: "if it had no <polarity> counters on it" —
+        // negate `HadCounters` to express the absence of the specific counter
+        // type in the LKI snapshot captured by `apply_zone_exit_cleanup`.
+        let condition = TriggerCondition::Not {
+            condition: Box::new(TriggerCondition::HadCounters {
+                counter_type: Some(counter_type.to_string()),
+            }),
+        };
+
+        let trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+            .origin(Zone::Battlefield)
+            .destination(Zone::Graveyard)
+            .valid_card(TargetFilter::SelfRef)
+            .condition(condition)
+            .execute(execute)
+            .description(format!(
+                "CR {cr_ref}: When ~ dies, if it had no {counter_label} counters on it, return it to the battlefield under its owner's control with a {counter_label} counter on it."
+            ));
+
+        face.triggers.push(trigger);
+    }
+}
+
+/// Idempotency-shape predicate for `synthesize_dies_return_with_counter`.
+/// True iff `trigger` is the synthesized dies-trigger shape for the given
+/// counter polarity. The check is intentionally narrow — it matches the
+/// engine's exact wire-up (origin/destination/valid_card on the trigger plus
+/// the counter type on the execute body's `enter_with_counters`) — so an
+/// unrelated dies-trigger on the same face (e.g., "When ~ dies, draw a card")
+/// is correctly ignored.
+fn is_dies_return_with_counter_trigger(t: &TriggerDefinition, counter_type: &str) -> bool {
+    if !matches!(t.mode, TriggerMode::ChangesZone)
+        || t.origin != Some(Zone::Battlefield)
+        || t.destination != Some(Zone::Graveyard)
+        || !matches!(t.valid_card, Some(TargetFilter::SelfRef))
+    {
+        return false;
+    }
+    let Some(execute) = t.execute.as_deref() else {
+        return false;
+    };
+    matches!(
+        &*execute.effect,
+        Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Battlefield,
+            target: TargetFilter::SelfRef,
+            enter_with_counters,
+            ..
+        } if enter_with_counters
+            .iter()
+            .any(|(ct, _)| ct == counter_type)
+    )
 }
 
 /// CR 702.62a: Suspend N—{cost} synthesizes three abilities for every face
@@ -1751,6 +1921,13 @@ pub fn synthesize_all(face: &mut CardFace) {
     // between N +1/+1 counters or N 1/1 colorless Servo artifact creature
     // tokens. Modeled via `Effect::ChooseOneOf`.
     synthesize_fabricate(face);
+    // CR 702.93a: Undying — dies trigger that returns the permanent with a
+    // +1/+1 counter, gated on having had no +1/+1 counter at death (LKI).
+    synthesize_undying(face);
+    // CR 702.79a: Persist — dies trigger that returns the permanent with a
+    // -1/-1 counter, gated on having had no -1/-1 counter at death (LKI).
+    // Sibling of Undying via shared `synthesize_dies_return_with_counter`.
+    synthesize_persist(face);
     // CR 702.62a: Suspend — hand-activated alt-cost + upkeep counter-removal +
     // last-counter free-cast. Runs after Evoke to keep alt-cost synthesizers
     // grouped; idempotent so order against Cycling/Madness is irrelevant.
