@@ -241,6 +241,12 @@ pub enum CastFrequency {
     OncePerTurnPerPermanentType,
 }
 
+impl CastFrequency {
+    pub fn is_unlimited(&self) -> bool {
+        matches!(self, CastFrequency::Unlimited)
+    }
+}
+
 impl fmt::Display for CastFrequency {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

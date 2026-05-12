@@ -6,7 +6,10 @@ use nom::multi::many1;
 use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
 
-use super::oracle_effect::{lower_effect_chain_ir, parse_effect_chain_ir};
+use super::oracle_effect::{
+    lower_effect_chain_ir, parse_effect_chain_ir,
+    try_parse_exile_top_each_library_with_collection_counter,
+};
 use super::oracle_ir::context::ParseContext;
 use super::oracle_ir::trigger::{TriggerBody, TriggerIr, TriggerModifiers};
 use super::oracle_nom::condition::parse_inner_condition;
@@ -569,8 +572,16 @@ pub(crate) fn parse_trigger_line_with_index_ir(
                 },
             ))))
         } else {
-            let ir = parse_effect_chain_ir(&effect_for_parse, AbilityKind::Spell, &mut effect_ctx);
-            Some(TriggerBody::EffectChain(ir))
+            try_parse_exile_top_each_library_with_collection_counter(
+                &effect_for_parse,
+                AbilityKind::Spell,
+            )
+            .map(|ability| TriggerBody::PreLowered(Box::new(ability)))
+            .or_else(|| {
+                let ir =
+                    parse_effect_chain_ir(&effect_for_parse, AbilityKind::Spell, &mut effect_ctx);
+                Some(TriggerBody::EffectChain(ir))
+            })
         }
     } else {
         None
@@ -6396,13 +6407,14 @@ mod tests {
     use crate::parser::oracle_ir::context::ParseContext;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
-        AbilityCondition, AbilityCost, AbilityKind, AggregateFunction, Comparator,
-        ContinuousModification, ControllerRef, CountScope, DamageModification, Duration, Effect,
-        FilterProp, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
-        TargetFilter, TypeFilter, TypedFilter,
+        AbilityCondition, AbilityCost, AbilityKind, AggregateFunction, CastingPermission,
+        Comparator, ContinuousModification, ControllerRef, CountScope, DamageModification,
+        Duration, Effect, FilterProp, ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope,
+        PtValue, QuantityExpr, QuantityRef, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::replacements::ReplacementEvent;
+    use crate::types::statics::CastFrequency;
 
     fn blocking_source_beyond_first_expr() -> QuantityExpr {
         QuantityExpr::Offset {
@@ -8121,6 +8133,53 @@ mod tests {
         assert_eq!(def.mode, TriggerMode::ChangesZone);
         assert_eq!(def.destination, Some(Zone::Battlefield));
         assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+    }
+
+    #[test]
+    fn trigger_evelyn_exiles_each_library_with_collection_counter_and_permission() {
+        let def = parse_trigger_line(
+            "Whenever Evelyn or another Vampire you control enters, exile the top card of each player's library with a collection counter on it.",
+            "Evelyn, the Covetous",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        assert_eq!(def.destination, Some(Zone::Battlefield));
+
+        let execute = def.execute.as_deref().expect("execute ability");
+        assert_eq!(execute.player_scope, Some(PlayerFilter::All));
+        assert!(matches!(
+            execute.effect.as_ref(),
+            Effect::ExileTop {
+                player: TargetFilter::Controller,
+                count: QuantityExpr::Fixed { value: 1 },
+            }
+        ));
+
+        let counter = execute.sub_ability.as_deref().expect("counter rider");
+        assert!(matches!(
+            counter.effect.as_ref(),
+            Effect::PutCounterAll {
+                counter_type: CounterType::Generic(name),
+                target: TargetFilter::TrackedSet { .. },
+                ..
+            } if name == "collection"
+        ));
+
+        let grant = counter.sub_ability.as_deref().expect("permission rider");
+        let Effect::GrantCastingPermission {
+            permission, target, ..
+        } = grant.effect.as_ref()
+        else {
+            panic!("expected GrantCastingPermission, got {:?}", grant.effect);
+        };
+        assert!(matches!(target, TargetFilter::TrackedSet { .. }));
+        assert!(matches!(
+            permission,
+            CastingPermission::PlayFromExile {
+                frequency: CastFrequency::OncePerTurn,
+                mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
+                ..
+            }
+        ));
     }
 
     #[test]

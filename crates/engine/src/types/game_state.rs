@@ -3035,6 +3035,10 @@ pub struct GameState {
     /// CR 400.7: Zone change creates new ObjectId, naturally resetting.
     #[serde(default)]
     pub hand_cast_free_permissions_used: HashSet<ObjectId>,
+    /// CR 601.2a: Tracks once-per-turn `PlayFromExile` permission sources
+    /// consumed this turn. Keyed by the granting source's ObjectId.
+    #[serde(default)]
+    pub exile_play_permissions_used: HashSet<ObjectId>,
     /// CR 702.94a + CR 603.11: Per-player first-card-drawn-this-turn tracking for
     /// miracle's linked triggered ability. Populated by the draw pipeline on the
     /// first `CardDrawn` event each turn per player; reset at turn start. The
@@ -3565,6 +3569,7 @@ impl GameState {
             graveyard_cast_permissions_used_per_type: HashSet::new(),
             pending_permanent_type_slot: None,
             hand_cast_free_permissions_used: HashSet::new(),
+            exile_play_permissions_used: HashSet::new(),
             first_card_drawn_this_turn: HashMap::new(),
             cards_drawn_this_turn: HashMap::new(),
             pending_miracle_offers: Vec::new(),
@@ -3808,6 +3813,7 @@ impl PartialEq for GameState {
                 == other.graveyard_cast_permissions_used_per_type
             && self.pending_permanent_type_slot == other.pending_permanent_type_slot
             && self.hand_cast_free_permissions_used == other.hand_cast_free_permissions_used
+            && self.exile_play_permissions_used == other.exile_play_permissions_used
             && self.first_card_drawn_this_turn == other.first_card_drawn_this_turn
             && self.cards_drawn_this_turn == other.cards_drawn_this_turn
             && self.pending_miracle_offers == other.pending_miracle_offers

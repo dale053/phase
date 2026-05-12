@@ -2130,6 +2130,14 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
         }
     }
 
+    let exile_play_permission_source = if source_zone == Zone::Exile {
+        state.objects.get(&object_id).and_then(|obj| {
+            super::casting::play_from_exile_permission_source(state, obj, player, state.turn_number)
+        })
+    } else {
+        None
+    };
+
     // CR 601.2a + CR 601.2i: The spell was announced onto the stack earlier,
     // but the object's `zone` field stayed at its origin through cost payment
     // so continuous effects that granted castability ("cards in your graveyard
@@ -2220,6 +2228,11 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
             state.hand_cast_free_permissions_used.insert(source);
         }
         _ => {}
+    }
+    if let Some((source, crate::types::statics::CastFrequency::OncePerTurn)) =
+        exile_play_permission_source
+    {
+        state.exile_play_permissions_used.insert(source);
     }
 
     let obj = state

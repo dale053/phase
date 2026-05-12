@@ -61,7 +61,7 @@ use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
 use crate::types::phase::Phase;
 use crate::types::replacements::ReplacementEvent;
-use crate::types::statics::StaticMode;
+use crate::types::statics::{CastFrequency, StaticMode};
 use crate::types::triggers::TriggerMode;
 use crate::types::zones::Zone;
 
@@ -3808,6 +3808,8 @@ fn try_parse_per_grantee_play_grant(tp: TextPair<'_>) -> Option<ParsedEffectClau
             duration,
             // Placeholder — `grant_permission::resolve` normalizes per-iteration.
             granted_to: crate::types::player::PlayerId(0),
+            frequency: CastFrequency::Unlimited,
+            source_id: None,
             mana_spend_permission: None,
         },
         target: TargetFilter::TrackedSet {
@@ -3878,6 +3880,8 @@ fn try_parse_cast_from_tracked_exile_grant(tp: TextPair<'_>) -> Option<ParsedEff
             // CR 611.2a/b: placeholder — `grant_permission::resolve` rewrites
             // this to the concrete grantee at grant time.
             granted_to: crate::types::player::PlayerId(0),
+            frequency: CastFrequency::Unlimited,
+            source_id: None,
             mana_spend_permission,
         },
         // CR 603.7 + CR 608.2c: TrackedSet sentinel — the runtime resolver
@@ -3934,6 +3938,8 @@ fn try_parse_exile_play_grant_with_any_mana(tp: TextPair<'_>) -> Option<ParsedEf
         permission: CastingPermission::PlayFromExile {
             duration: Duration::Permanent,
             granted_to: crate::types::player::PlayerId(0),
+            frequency: CastFrequency::Unlimited,
+            source_id: None,
             mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
         },
         target: TargetFilter::Any,
@@ -4025,11 +4031,66 @@ fn try_parse_play_from_exile(tp: TextPair) -> Option<ParsedEffectClause> {
             // Placeholder — `grant_permission::resolve` rewrites this to the
             // ability's controller at grant time (CR 611.2a/b).
             granted_to: crate::types::player::PlayerId(0),
+            frequency: CastFrequency::Unlimited,
+            source_id: None,
             mana_spend_permission: None,
         },
         target: TargetFilter::Any,
         grantee: Default::default(),
     }))
+}
+
+pub(crate) fn try_parse_exile_top_each_library_with_collection_counter(
+    text: &str,
+    kind: AbilityKind,
+) -> Option<AbilityDefinition> {
+    let lower = text.to_lowercase();
+    let ((), _) = nom_on_lower(text, &lower, |input| {
+        let (input, _) = tag("exile the top card of each player's library").parse(input)?;
+        let (input, _) = tag(" with a collection counter on it").parse(input)?;
+        let (input, _) = opt(tag(".")).parse(input)?;
+        let (input, _) = eof.parse(input)?;
+        Ok((input, ()))
+    })?;
+
+    let grant = AbilityDefinition::new(
+        kind,
+        Effect::GrantCastingPermission {
+            permission: CastingPermission::PlayFromExile {
+                duration: Duration::Permanent,
+                granted_to: crate::types::player::PlayerId(0),
+                frequency: CastFrequency::OncePerTurn,
+                source_id: None,
+                mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
+            },
+            target: TargetFilter::TrackedSet {
+                id: TrackedSetId(0),
+            },
+            grantee: Default::default(),
+        },
+    );
+    let put_counter = AbilityDefinition::new(
+        kind,
+        Effect::PutCounterAll {
+            counter_type: CounterType::Generic("collection".to_string()),
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::TrackedSet {
+                id: TrackedSetId(0),
+            },
+        },
+    )
+    .sub_ability(grant);
+
+    let mut def = AbilityDefinition::new(
+        kind,
+        Effect::ExileTop {
+            player: TargetFilter::Controller,
+            count: QuantityExpr::Fixed { value: 1 },
+        },
+    );
+    def.player_scope = Some(PlayerFilter::All);
+    def.sub_ability = Some(Box::new(put_counter));
+    Some(def)
 }
 
 /// Parse "for each" quantity patterns on draw/life/damage/mill effects.
@@ -8798,6 +8859,9 @@ fn collapse_ephemeral_color_choice_mana(def: &mut AbilityDefinition) {
 /// that invoke `normalize_card_name_refs` internally. External test callers
 /// must pre-normalize via `normalize_card_name_refs` before invoking.
 pub fn parse_effect_chain(text: &str, kind: AbilityKind) -> AbilityDefinition {
+    if let Some(def) = try_parse_exile_top_each_library_with_collection_counter(text, kind) {
+        return def;
+    }
     let ir = parse_effect_chain_ir(text, kind, &mut ParseContext::default());
     lower_effect_chain_ir(&ir)
 }
@@ -8810,6 +8874,9 @@ pub(crate) fn parse_effect_chain_with_context(
     kind: AbilityKind,
     ctx: &mut ParseContext,
 ) -> AbilityDefinition {
+    if let Some(def) = try_parse_exile_top_each_library_with_collection_counter(text, kind) {
+        return def;
+    }
     let ir = parse_effect_chain_ir(text, kind, ctx);
     lower_effect_chain_ir(&ir)
 }
@@ -27318,6 +27385,71 @@ mod tests {
                 |t| matches!(t, TypeFilter::Non(inner) if matches!(**inner, TypeFilter::Land))
             ),
             "filter must be Non(Land)"
+        );
+    }
+
+    #[test]
+    fn parser_shape_evelyn_exiles_each_library_with_collection_counter_and_permission() {
+        let def = parse_effect_chain(
+            "Exile the top card of each player's library with a collection counter on it.",
+            AbilityKind::Spell,
+        );
+
+        assert_eq!(def.player_scope, Some(PlayerFilter::All));
+        let Effect::ExileTop {
+            player: TargetFilter::Controller,
+            count: QuantityExpr::Fixed { value: 1 },
+        } = *def.effect
+        else {
+            panic!("expected all-player ExileTop, got {:?}", def.effect);
+        };
+        let counter = def.sub_ability.expect("counter sub ability");
+        let Effect::PutCounterAll {
+            counter_type,
+            target,
+            ..
+        } = counter.effect.as_ref()
+        else {
+            panic!(
+                "expected PutCounterAll sub ability, got {:?}",
+                counter.effect
+            );
+        };
+        assert_eq!(
+            counter_type,
+            &CounterType::Generic("collection".to_string())
+        );
+        assert_eq!(
+            target,
+            &TargetFilter::TrackedSet {
+                id: TrackedSetId(0)
+            }
+        );
+        let grant = counter.sub_ability.expect("permission sub ability");
+        let Effect::GrantCastingPermission {
+            permission, target, ..
+        } = grant.effect.as_ref()
+        else {
+            panic!("expected GrantCastingPermission, got {:?}", grant.effect);
+        };
+        let CastingPermission::PlayFromExile {
+            frequency,
+            mana_spend_permission,
+            ..
+        } = permission
+        else {
+            panic!("expected PlayFromExile permission, got {permission:?}");
+        };
+        assert_eq!(*frequency, CastFrequency::OncePerTurn);
+        assert_eq!(
+            *mana_spend_permission,
+            Some(ManaSpendPermission::AnyTypeOrColor)
+        );
+        assert_eq!(
+            target,
+            &TargetFilter::TrackedSet {
+                id: TrackedSetId(0)
+            }
         );
     }
 

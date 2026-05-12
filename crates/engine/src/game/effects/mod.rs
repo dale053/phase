@@ -870,6 +870,11 @@ fn effect_references_tracked_set(effect: &Effect) -> bool {
             return true;
         }
     }
+    if let Effect::PutCounterAll { target, .. } = effect {
+        if filter_references_tracked_set(target) {
+            return true;
+        }
+    }
     // `GrantCastingPermission` has a `target` field that is not exposed by
     // `Effect::target_filter()` (it selects objects to grant permission to,
     // not spell/ability targets). Inspect directly so "the rest" / "those
@@ -974,6 +979,26 @@ fn affected_objects_from_events(effect: &Effect, events: &[GameEvent]) -> Vec<Ob
                 })
                 .collect()
         }
+    }
+}
+
+fn publish_tracked_set(state: &mut GameState, affected_ids: Vec<ObjectId>) {
+    // CR 603.7 + CR 608.2c: Chain unification. If an ancestor in this
+    // resolution chain already published a tracked set, extend that set with
+    // the current publish so compound zone-changing effects expose every
+    // affected object to a single downstream "those cards" reference.
+    // Otherwise start a new chain-scoped set.
+    if let Some(chain_id) = state.chain_tracked_set_id {
+        state
+            .tracked_object_sets
+            .entry(chain_id)
+            .or_default()
+            .extend(affected_ids);
+    } else {
+        let set_id = TrackedSetId(state.next_tracked_set_id);
+        state.next_tracked_set_id += 1;
+        state.tracked_object_sets.insert(set_id, affected_ids);
+        state.chain_tracked_set_id = Some(set_id);
     }
 }
 
@@ -1601,6 +1626,10 @@ pub fn resolve_ability_chain(
         {
             state.last_effect_amount = Some(amount);
         }
+        if next_sub_needs_tracked_set(ability) {
+            let affected_ids = affected_objects_from_events(&scoped_template.effect, scoped_events);
+            publish_tracked_set(state, affected_ids);
+        }
         if !paused {
             if let Some(after_scope) = after_scope {
                 resolve_ability_chain(state, &after_scope, events, depth + 1)?;
@@ -1949,25 +1978,7 @@ pub fn resolve_ability_chain(
     //     actually received counters.
     if next_sub_needs_tracked_set(ability) {
         let affected_ids = affected_objects_from_events(&ability.effect, &events[events_before..]);
-        // CR 603.7 + CR 608.2c: Chain unification. If an ancestor in this
-        // resolution chain already published a tracked set, extend that set
-        // with the current publish so compound zone-changing effects
-        // (e.g., Suspend Aggression: "Exile target permanent and the top
-        // card of your library ... For each of those cards") expose every
-        // affected object to a single downstream "those cards" reference.
-        // Otherwise start a new chain-scoped set.
-        if let Some(chain_id) = state.chain_tracked_set_id {
-            state
-                .tracked_object_sets
-                .entry(chain_id)
-                .or_default()
-                .extend(affected_ids);
-        } else {
-            let set_id = TrackedSetId(state.next_tracked_set_id);
-            state.next_tracked_set_id += 1;
-            state.tracked_object_sets.insert(set_id, affected_ids);
-            state.chain_tracked_set_id = Some(set_id);
-        }
+        publish_tracked_set(state, affected_ids);
     }
 
     // ExileFromTopUntil handles its own sub_ability chain internally for both
@@ -2799,8 +2810,9 @@ mod tests {
     use crate::types::ability::{
         AbilityCondition, AbilityDefinition, AbilityKind, CastingPermission,
         ContinuousModification, ControllerRef, DelayedTriggerCondition, Duration, FilterProp,
-        GainLifePlayer, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
-        SpellContext, StaticDefinition, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+        GainLifePlayer, ManaSpendPermission, PermissionGrantee, PlayerFilter, PlayerScope, PtValue,
+        QuantityExpr, QuantityRef, SpellContext, StaticDefinition, TargetFilter, TargetRef,
+        TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
@@ -2815,6 +2827,7 @@ mod tests {
     use crate::types::mana::ManaCost;
     use crate::types::phase::Phase;
     use crate::types::player::{PlayerCounterKind, PlayerId};
+    use crate::types::statics::CastFrequency;
     use crate::types::zones::Zone;
 
     #[test]
@@ -4996,6 +5009,105 @@ mod tests {
     }
 
     #[test]
+    fn evelyn_chain_exiles_each_players_top_card_with_collection_counter_and_permission() {
+        let mut state = GameState::new_two_player(42);
+        let evelyn = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Evelyn, the Covetous".to_string(),
+            Zone::Battlefield,
+        );
+        let p0_top = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "P0 Top".to_string(),
+            Zone::Library,
+        );
+        let p1_top = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "P1 Top".to_string(),
+            Zone::Library,
+        );
+
+        let grant = ResolvedAbility::new(
+            Effect::GrantCastingPermission {
+                permission: CastingPermission::PlayFromExile {
+                    duration: Duration::Permanent,
+                    granted_to: PlayerId(0),
+                    frequency: CastFrequency::OncePerTurn,
+                    source_id: None,
+                    mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
+                },
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0),
+                },
+                grantee: PermissionGrantee::AbilityController,
+            },
+            vec![],
+            evelyn,
+            PlayerId(0),
+        );
+        let mut put_counter = ResolvedAbility::new(
+            Effect::PutCounterAll {
+                counter_type: CounterType::Generic("collection".to_string()),
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0),
+                },
+            },
+            vec![],
+            evelyn,
+            PlayerId(0),
+        );
+        put_counter.sub_ability = Some(Box::new(grant));
+        let mut exile = ResolvedAbility::new(
+            Effect::ExileTop {
+                player: TargetFilter::Controller,
+                count: QuantityExpr::Fixed { value: 1 },
+            },
+            vec![],
+            evelyn,
+            PlayerId(0),
+        );
+        exile.player_scope = Some(PlayerFilter::All);
+        exile.sub_ability = Some(Box::new(put_counter));
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &exile, &mut events, 0).unwrap();
+
+        for exiled in [p0_top, p1_top] {
+            let obj = state.objects.get(&exiled).unwrap();
+            assert_eq!(obj.zone, Zone::Exile);
+            assert_eq!(
+                obj.counters
+                    .get(&CounterType::Generic("collection".to_string())),
+                Some(&1)
+            );
+            assert!(state.exile_links.iter().any(|link| {
+                link.exiled_id == exiled
+                    && link.source_id == evelyn
+                    && matches!(link.kind, ExileLinkKind::TrackedBySource)
+            }));
+            assert!(obj.casting_permissions.iter().any(|permission| {
+                matches!(
+                    permission,
+                    CastingPermission::PlayFromExile {
+                        granted_to: PlayerId(0),
+                        frequency: CastFrequency::OncePerTurn,
+                        source_id: Some(source),
+                        mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
+                        ..
+                    } if *source == evelyn
+                )
+            }));
+        }
+    }
+
+    #[test]
     fn resolve_ability_chain_player_scope_opponent_sacrifice_uses_scoped_controller() {
         let mut state = GameState::new_two_player(42);
         let own = create_object(
@@ -6582,6 +6694,8 @@ mod tests {
                         player: PlayerScope::Controller,
                     },
                     granted_to: PlayerId(0),
+                    frequency: crate::types::statics::CastFrequency::Unlimited,
+                    source_id: None,
                     mana_spend_permission: None,
                 },
                 target: TargetFilter::TrackedSet {

@@ -498,6 +498,13 @@ fn parse_static_line_inner(text: &str, inverted: InvertedAsLongAs) -> Option<Sta
     let lower = text.to_lowercase();
     let tp = TextPair::new(&text, &lower);
 
+    if let Some(def) = parse_arcane_adaptation_chosen_type_static(&tp, &text) {
+        return Some(def);
+    }
+    if let Some(def) = parse_collection_counter_play_permission_static(&tp, &text) {
+        return Some(def);
+    }
+
     if let Some(defs) = parse_cost_payment_prohibition_statics(&tp, &text) {
         return defs.into_iter().next();
     }
@@ -2018,6 +2025,60 @@ fn parse_static_line_inner(text: &str, inverted: InvertedAsLongAs) -> Option<Sta
     }
 
     None
+}
+
+fn parse_arcane_adaptation_chosen_type_static(
+    tp: &TextPair<'_>,
+    description: &str,
+) -> Option<StaticDefinition> {
+    let ((), _) = nom_on_lower(tp.original, tp.lower, |input| {
+        let (input, _) =
+            tag("creatures you control are the chosen type in addition to their other types")
+                .parse(input)?;
+        let (input, _) = opt(tag(".")).parse(input)?;
+        let (input, _) = opt(preceded(
+            tag(" the same is true for "),
+            terminated(take_until::<_, _, OracleError<'_>>("."), opt(tag("."))),
+        ))
+        .parse(input)?;
+        let (input, _) = eof.parse(input)?;
+        Ok((input, ()))
+    })?;
+
+    Some(
+        StaticDefinition::continuous()
+            .affected(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::You),
+            ))
+            .modifications(vec![ContinuousModification::AddChosenSubtype {
+                kind: ChosenSubtypeKind::CreatureType,
+            }])
+            .description(description.to_string()),
+    )
+}
+
+fn parse_collection_counter_play_permission_static(
+    tp: &TextPair<'_>,
+    description: &str,
+) -> Option<StaticDefinition> {
+    let ((), _) = nom_on_lower(tp.original, tp.lower, |input| {
+        let (input, _) = tag("once each turn, you may play a card from exile with a collection counter on it if it was exiled by an ability you controlled").parse(input)?;
+        let (input, _) = alt((
+            tag(", and mana of any type can be spent to cast that spell"),
+            tag(", and you may spend mana as though it were mana of any color to cast it"),
+        ))
+        .parse(input)?;
+        let (input, _) = opt(tag(".")).parse(input)?;
+        let (input, _) = eof.parse(input)?;
+        Ok((input, ()))
+    })?;
+
+    Some(
+        StaticDefinition::new(StaticMode::Other(
+            "LinkedCollectionCounterPlayPermission".to_string(),
+        ))
+        .description(description.to_string()),
+    )
 }
 
 fn parse_self_loyalty_activation_permission(input: &str) -> OracleResult<'_, ()> {
@@ -15448,6 +15509,43 @@ mod tests {
             }
             other => panic!("Expected Some(Typed filter), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_shape_arcane_adaptation_chosen_type_applies_to_creatures_you_control() {
+        let def = parse_static_line(
+            "Creatures you control are the chosen type in addition to their other types. The same is true for creature spells you control and creature cards you own that aren't on the battlefield.",
+        )
+        .unwrap();
+        assert_eq!(def.mode, StaticMode::Continuous);
+        assert!(def.modifications.iter().any(|modification| matches!(
+            modification,
+            ContinuousModification::AddChosenSubtype {
+                kind: ChosenSubtypeKind::CreatureType
+            }
+        )));
+        match &def.affected {
+            Some(TargetFilter::Typed(tf)) => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(tf
+                    .type_filters
+                    .iter()
+                    .any(|filter| matches!(filter, TypeFilter::Creature)));
+            }
+            other => panic!("Expected Some(Typed filter), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_shape_evelyn_collection_counter_play_permission_static_is_not_unimplemented() {
+        let def = parse_static_line(
+            "Once each turn, you may play a card from exile with a collection counter on it if it was exiled by an ability you controlled, and you may spend mana as though it were mana of any color to cast it.",
+        )
+        .unwrap();
+        assert_eq!(
+            def.mode,
+            StaticMode::Other("LinkedCollectionCounterPlayPermission".to_string())
+        );
     }
 
     // --- Group B: Generic activated ability cost reduction ---

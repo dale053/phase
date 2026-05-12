@@ -254,7 +254,7 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
         state
             .objects
             .get(&obj_id)
-            .is_some_and(|obj| has_exile_cast_permission(obj, player, state.turn_number))
+            .is_some_and(|obj| has_exile_cast_permission(state, obj, player, state.turn_number))
     }));
 
     // CR 601.2a + CR 611.2a: Opponent's exiled cards with `ExileWithAltCost`
@@ -644,44 +644,80 @@ pub(crate) fn effective_spell_keyword_kinds(
 /// Check if an object has any permission allowing it to be cast from exile.
 /// Uses explicit match arms (not `matches!`) so the compiler catches new variants.
 fn has_exile_cast_permission(
+    state: &GameState,
     obj: &crate::game::game_object::GameObject,
     player: PlayerId,
     turn_number: u32,
 ) -> bool {
-    obj.casting_permissions.iter().any(|p| match p {
-        crate::types::ability::CastingPermission::AdventureCreature
-        | crate::types::ability::CastingPermission::ExileWithEnergyCost => obj.owner == player,
-        // CR 611.2a + CR 118.9: When `granted_to` is bound to a specific
-        // player (Jeleva's attack-trigger CastFromZone, Discover's
-        // discovering-player binding, Cascade's cascading-player binding,
-        // Airbending grants resolved through grant_permission::resolve), the
-        // cast permission is scoped to that player only. The legacy
-        // `owner == player` rule applies only when the field is None — for
-        // back-compat with construction sites that have not been threaded
-        // through `grant_permission::resolve` (today only test scaffolding).
-        crate::types::ability::CastingPermission::ExileWithAltCost { granted_to, .. }
-        | crate::types::ability::CastingPermission::ExileWithAltAbilityCost {
-            granted_to, ..
-        } => match granted_to {
-            Some(p) => *p == player,
-            None => obj.owner == player,
-        },
-        crate::types::ability::CastingPermission::PlayFromExile { granted_to, .. } => {
-            *granted_to == player
+    play_from_exile_permission_source(state, obj, player, turn_number).is_some()
+        || obj.casting_permissions.iter().any(|p| match p {
+            crate::types::ability::CastingPermission::AdventureCreature
+            | crate::types::ability::CastingPermission::ExileWithEnergyCost => obj.owner == player,
+            crate::types::ability::CastingPermission::ExileWithAltCost { granted_to, .. }
+            | crate::types::ability::CastingPermission::ExileWithAltAbilityCost {
+                granted_to,
+                ..
+            } => match granted_to {
+                Some(p) => *p == player,
+                None => obj.owner == player,
+            },
+            crate::types::ability::CastingPermission::PlayFromExile { .. } => false,
+            crate::types::ability::CastingPermission::WarpExile {
+                castable_after_turn,
+            } => obj.owner == player && turn_number > *castable_after_turn,
+            crate::types::ability::CastingPermission::Plotted { turn_plotted } => {
+                obj.owner == player && turn_number > *turn_plotted
+            }
+            crate::types::ability::CastingPermission::Foretold { turn_foretold, .. } => {
+                obj.owner == player && turn_number > *turn_foretold
+            }
+        })
+}
+
+fn source_has_linked_collection_counter_play_permission(
+    state: &GameState,
+    source: ObjectId,
+    player: PlayerId,
+) -> bool {
+    state.objects.get(&source).is_some_and(|source_obj| {
+        source_obj.zone == Zone::Battlefield
+            && source_obj.controller == player
+            && source_obj.static_definitions.iter_all().any(|def| {
+                matches!(
+                    &def.mode,
+                    StaticMode::Other(name) if name == "LinkedCollectionCounterPlayPermission"
+                )
+            })
+    })
+}
+
+pub(crate) fn play_from_exile_permission_source(
+    state: &GameState,
+    obj: &crate::game::game_object::GameObject,
+    player: PlayerId,
+    _turn_number: u32,
+) -> Option<(ObjectId, CastFrequency)> {
+    obj.casting_permissions.iter().find_map(|p| match p {
+        crate::types::ability::CastingPermission::PlayFromExile {
+            granted_to,
+            frequency,
+            source_id,
+            ..
+        } if *granted_to == player => {
+            let source = source_id.unwrap_or(obj.id);
+            if *frequency == CastFrequency::OncePerTurn {
+                if state.exile_play_permissions_used.contains(&source) {
+                    return None;
+                }
+                if source_id.is_some()
+                    && !source_has_linked_collection_counter_play_permission(state, source, player)
+                {
+                    return None;
+                }
+            }
+            Some((source, *frequency))
         }
-        // CR 702.185a: Warp cards only castable after the exile turn ends.
-        crate::types::ability::CastingPermission::WarpExile {
-            castable_after_turn,
-        } => obj.owner == player && turn_number > *castable_after_turn,
-        // CR 702.170d: Plotted cards only castable on a later turn than the
-        // one they became plotted on (owner's main phase, empty stack — those
-        // conditions are enforced separately by sorcery-speed timing).
-        crate::types::ability::CastingPermission::Plotted { turn_plotted } => {
-            obj.owner == player && turn_number > *turn_plotted
-        }
-        crate::types::ability::CastingPermission::Foretold { turn_foretold, .. } => {
-            obj.owner == player && turn_number > *turn_foretold
-        }
+        _ => None,
     })
 }
 
@@ -1090,6 +1126,32 @@ pub fn graveyard_lands_playable_by_permission(
     results
 }
 
+/// CR 305.1 + CR 601.2a: Find exiled lands with `PlayFromExile` permission
+/// granted to `player`. Returns `(land_id, source_id)` for once-per-turn
+/// tracking by the play-land path.
+pub fn exile_lands_playable_by_permission(
+    state: &GameState,
+    player: PlayerId,
+) -> Vec<(ObjectId, ObjectId)> {
+    state
+        .exile
+        .iter()
+        .filter_map(|&obj_id| {
+            let obj = state.objects.get(&obj_id)?;
+            if !obj
+                .card_types
+                .core_types
+                .contains(&crate::types::card_type::CoreType::Land)
+            {
+                return None;
+            }
+            let (source, _) =
+                play_from_exile_permission_source(state, obj, player, state.turn_number)?;
+            Some((obj_id, source))
+        })
+        .collect()
+}
+
 /// CR 601.2b + CR 118.9a: Find the first `CastFromHandFree` static permission
 /// source on the controller's battlefield whose filter admits the given spell.
 /// Returns `(source_id, frequency)` so callers can track per-turn usage.
@@ -1168,7 +1230,7 @@ fn prepare_spell_cast_with_variant_override(
         .ok_or_else(|| EngineError::InvalidAction("Object not found".to_string()))?;
     // CR 715.3d: Cards in exile with AdventureCreature or ExileWithAltCost permission.
     let has_exile_permission =
-        obj.zone == Zone::Exile && has_exile_cast_permission(obj, player, state.turn_number);
+        obj.zone == Zone::Exile && has_exile_cast_permission(state, obj, player, state.turn_number);
     let has_madness = obj.zone == Zone::Exile
         && matches!(variant_override, Some(CastingVariant::Madness))
         && obj.owner == player
@@ -8840,6 +8902,8 @@ mod tests {
                 .push(crate::types::ability::CastingPermission::PlayFromExile {
                     duration: crate::types::ability::Duration::Permanent,
                     granted_to: PlayerId(0),
+                    frequency: CastFrequency::Unlimited,
+                    source_id: None,
                     mana_spend_permission: None,
                 });
         }
@@ -8885,6 +8949,8 @@ mod tests {
                 .push(CastingPermission::PlayFromExile {
                     duration: Duration::Permanent,
                     granted_to: PlayerId(0),
+                    frequency: CastFrequency::Unlimited,
+                    source_id: None,
                     mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
                 });
         }
@@ -8898,6 +8964,60 @@ mod tests {
             obj_id,
             &state.objects[&obj_id].mana_cost
         ));
+    }
+
+    #[test]
+    fn once_per_turn_collection_counter_play_permission_requires_live_source_static() {
+        let mut state = setup_game_at_main_phase();
+        let source = create_object(
+            &mut state,
+            CardId(30),
+            PlayerId(0),
+            "Evelyn, the Covetous".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::Other(
+                "LinkedCollectionCounterPlayPermission".to_string(),
+            )));
+
+        let obj_id = create_object(
+            &mut state,
+            CardId(31),
+            PlayerId(1),
+            "Linked Exiled Spell".to_string(),
+            Zone::Exile,
+        );
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Sorcery);
+            Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            ));
+            obj.casting_permissions
+                .push(CastingPermission::PlayFromExile {
+                    duration: Duration::Permanent,
+                    granted_to: PlayerId(0),
+                    frequency: CastFrequency::OncePerTurn,
+                    source_id: Some(source),
+                    mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
+                });
+        }
+
+        assert!(spell_objects_available_to_cast(&state, PlayerId(0)).contains(&obj_id));
+
+        let mut events = Vec::new();
+        zones::move_to_zone(&mut state, source, Zone::Graveyard, &mut events);
+
+        assert!(!spell_objects_available_to_cast(&state, PlayerId(0)).contains(&obj_id));
     }
 
     #[test]

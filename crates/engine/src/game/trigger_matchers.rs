@@ -621,9 +621,15 @@ pub(super) fn match_changes_zone(
         // Check valid_card filter
         if let Some(filter) = &trigger.valid_card {
             let ctx = super::filter::FilterContext::from_source(state, source_id);
-            if !super::filter::matches_target_filter_on_zone_change_record(
-                state, record, filter, &ctx,
-            ) {
+            let matches =
+                if *to == Zone::Battlefield && state.objects.contains_key(&record.object_id) {
+                    super::filter::matches_target_filter(state, record.object_id, filter, &ctx)
+                } else {
+                    super::filter::matches_target_filter_on_zone_change_record(
+                        state, record, filter, &ctx,
+                    )
+                };
+            if !matches {
                 return false;
             }
         }

@@ -2063,6 +2063,18 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
                 ));
             }
         }
+        for (obj_id, _source) in casting::exile_lands_playable_by_permission(state, player) {
+            if let Some(obj) = state.objects.get(&obj_id) {
+                actions.push(candidate(
+                    GameAction::PlayLand {
+                        object_id: obj_id,
+                        card_id: obj.card_id,
+                    },
+                    TacticalClass::Land,
+                    Some(player),
+                ));
+            }
+        }
     }
 
     // CR 702.61a: Spells and non-mana activated abilities are suppressed by split second.

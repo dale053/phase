@@ -106,8 +106,14 @@ pub fn resolve(
         });
         if let Some(obj) = state.objects.get_mut(&obj_id) {
             let mut granted = permission.clone();
-            if let CastingPermission::PlayFromExile { granted_to, .. } = &mut granted {
+            if let CastingPermission::PlayFromExile {
+                granted_to,
+                source_id,
+                ..
+            } = &mut granted
+            {
                 *granted_to = granted_to_pid;
+                *source_id = Some(ability.source_id);
             }
             // CR 611.2a + CR 118.9: Bind `granted_to` for `ExileWithAltCost` and
             // `ExileWithAltAbilityCost` to the resolved grantee. Without this
@@ -186,6 +192,8 @@ mod tests {
                         player: PlayerScope::Controller,
                     },
                     granted_to: PlayerId(0),
+                    frequency: crate::types::statics::CastFrequency::Unlimited,
+                    source_id: None,
                     mana_spend_permission: None,
                 },
                 target: TargetFilter::Any,
@@ -235,6 +243,8 @@ mod tests {
                         player: PlayerScope::Controller,
                     },
                     granted_to: PlayerId(0),
+                    frequency: crate::types::statics::CastFrequency::Unlimited,
+                    source_id: None,
                     mana_spend_permission: None,
                 },
                 target: TargetFilter::Any,
@@ -283,6 +293,8 @@ mod tests {
                         player: PlayerScope::Controller,
                     },
                     granted_to: PlayerId(0),
+                    frequency: crate::types::statics::CastFrequency::Unlimited,
+                    source_id: None,
                     mana_spend_permission: None,
                 },
                 target: TargetFilter::Any,

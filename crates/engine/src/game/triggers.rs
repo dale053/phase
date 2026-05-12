@@ -2767,11 +2767,12 @@ pub mod tests {
     use crate::game::filter::{matches_target_filter, FilterContext};
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, AggregateFunction, Comparator, ContinuousModification,
-        ControllerRef, DelayedTriggerCondition, Duration, Effect, FilterProp, GainLifePlayer,
-        KickerVariant, MultiTargetSpec, PlayerScope, QuantityExpr, QuantityRef, ResolvedAbility,
-        SharedQuality, SharedQualityRelation, StaticCondition, StaticDefinition, TargetFilter,
-        TargetRef, TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
+        AbilityDefinition, AbilityKind, AggregateFunction, ChosenAttribute, ChosenSubtypeKind,
+        Comparator, ContinuousModification, ControllerRef, DelayedTriggerCondition, Duration,
+        Effect, FilterProp, GainLifePlayer, KickerVariant, MultiTargetSpec, PlayerScope,
+        QuantityExpr, QuantityRef, ResolvedAbility, SharedQuality, SharedQualityRelation,
+        StaticCondition, StaticDefinition, TargetFilter, TargetRef, TriggerCondition,
+        TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
@@ -9488,6 +9489,80 @@ pub mod tests {
                 .unwrap()
                 .has_keyword(&Keyword::Deathtouch),
             "Venom Sliver self-grants deathtouch once layers run via process_triggers"
+        );
+    }
+
+    #[test]
+    fn arcane_adaptation_vampire_type_change_is_visible_to_etb_trigger_matching() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let adaptation = create_object(
+            &mut state,
+            CardId(0xADAF),
+            PlayerId(0),
+            "Arcane Adaptation".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&adaptation).unwrap();
+            obj.chosen_attributes
+                .push(ChosenAttribute::CreatureType("Vampire".to_string()));
+            let static_def = StaticDefinition::continuous()
+                .affected(TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::You),
+                ))
+                .modifications(vec![ContinuousModification::AddChosenSubtype {
+                    kind: ChosenSubtypeKind::CreatureType,
+                }]);
+            obj.static_definitions.push(static_def.clone());
+            std::sync::Arc::make_mut(&mut obj.base_static_definitions).push(static_def);
+        }
+
+        let evelyn = make_creature(&mut state, PlayerId(0), "Evelyn, the Covetous", 2, 5);
+        {
+            let obj = state.objects.get_mut(&evelyn).unwrap();
+            obj.card_types.subtypes.push("Vampire".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            obj.trigger_definitions.push(
+                TriggerDefinition::new(TriggerMode::ChangesZone)
+                    .destination(Zone::Battlefield)
+                    .valid_card(TargetFilter::Typed(
+                        TypedFilter::creature()
+                            .subtype("Vampire".to_string())
+                            .controller(ControllerRef::You),
+                    ))
+                    .execute(AbilityDefinition::new(
+                        AbilityKind::Database,
+                        Effect::Draw {
+                            count: QuantityExpr::Fixed { value: 1 },
+                            target: TargetFilter::Controller,
+                        },
+                    )),
+            );
+        }
+
+        let bear = make_creature(&mut state, PlayerId(0), "Grizzly Bears", 2, 2);
+        {
+            let obj = state.objects.get_mut(&bear).unwrap();
+            obj.card_types.subtypes.push("Bear".to_string());
+            obj.base_card_types = obj.card_types.clone();
+        }
+        state.layers_dirty = true;
+
+        let events = vec![zone_changed_event(
+            bear,
+            Zone::Hand,
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+            vec!["Bear"],
+        )];
+        process_triggers(&mut state, &events);
+
+        assert_eq!(
+            state.stack.len(),
+            1,
+            "Arcane Adaptation's type-changing layer must make the entering creature match Evelyn's Vampire ETB trigger"
         );
     }
 }

@@ -327,17 +327,41 @@ pub fn resolve_add_all(
         }
         _ => return Ok(()),
     };
-    let target_filter = crate::game::effects::resolved_object_filter(ability, &target_filter);
+    let target_filter = match crate::game::effects::resolved_object_filter(ability, &target_filter)
+    {
+        TargetFilter::TrackedSet {
+            id: crate::types::identifiers::TrackedSetId(0),
+        } => state
+            .tracked_object_sets
+            .iter()
+            .max_by_key(|(id, _)| id.0)
+            .map(|(id, _)| TargetFilter::TrackedSet { id: *id })
+            .unwrap_or(TargetFilter::TrackedSet {
+                id: crate::types::identifiers::TrackedSetId(0),
+            }),
+        filter => filter,
+    };
 
     // Collect matching IDs first to avoid borrow conflict during mutation.
     // CR 107.3a + CR 601.2b: ability-context filter evaluation.
     let ctx = crate::game::filter::FilterContext::from_ability(ability);
-    let matching_ids: Vec<crate::types::identifiers::ObjectId> = state
-        .battlefield
-        .iter()
-        .filter(|id| crate::game::filter::matches_target_filter(state, **id, &target_filter, &ctx))
-        .copied()
-        .collect();
+    let matching_ids: Vec<crate::types::identifiers::ObjectId> =
+        if let TargetFilter::TrackedSet { id } = target_filter {
+            state
+                .tracked_object_sets
+                .get(&id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            state
+                .battlefield
+                .iter()
+                .filter(|id| {
+                    crate::game::filter::matches_target_filter(state, **id, &target_filter, &ctx)
+                })
+                .copied()
+                .collect()
+        };
 
     for obj_id in matching_ids {
         add_counter_with_replacement(

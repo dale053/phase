@@ -2,7 +2,7 @@ use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::zones;
 use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
 use crate::types::events::GameEvent;
-use crate::types::game_state::GameState;
+use crate::types::game_state::{ExileLink, ExileLinkKind, GameState};
 use crate::types::zones::Zone;
 
 pub fn resolve(
@@ -43,6 +43,11 @@ pub fn resolve(
 
     for object_id in top_cards {
         zones::move_to_zone(state, object_id, Zone::Exile, events);
+        state.exile_links.push(ExileLink {
+            exiled_id: object_id,
+            source_id: ability.source_id,
+            kind: ExileLinkKind::TrackedBySource,
+        });
     }
 
     events.push(GameEvent::EffectResolved {

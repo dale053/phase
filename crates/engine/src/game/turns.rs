@@ -232,6 +232,8 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     state.graveyard_cast_permissions_used_per_type.clear();
     // CR 601.2b: Reset per-turn CastFromHandFree once-per-turn tracking (Zaffai).
     state.hand_cast_free_permissions_used.clear();
+    // CR 601.2a: Reset per-turn PlayFromExile source usage (Evelyn-style permissions).
+    state.exile_play_permissions_used.clear();
     // CR 702.94a: Reset per-player first-card-drawn-this-turn tracking for miracle.
     state.first_card_drawn_this_turn.clear();
     state.cards_drawn_this_turn.clear();

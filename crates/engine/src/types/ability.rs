@@ -16,7 +16,7 @@ use super::mana::{ManaColor, ManaCost, ManaType};
 use super::phase::Phase;
 use super::player::{PlayerCounterKind, PlayerId};
 use super::replacements::ReplacementEvent;
-use super::statics::StaticMode;
+use super::statics::{CastFrequency, StaticMode};
 use super::triggers::TriggerMode;
 use super::zones::Zone;
 use crate::types::events::PlayerActionKind;
@@ -1110,6 +1110,15 @@ pub enum CastingPermission {
     PlayFromExile {
         duration: Duration,
         granted_to: PlayerId,
+        /// CR 601.2a: Per-source use frequency for persistent play
+        /// permissions. `Unlimited` preserves existing impulse-draw behavior;
+        /// `OncePerTurn` models linked static permissions like Evelyn.
+        #[serde(default, skip_serializing_if = "CastFrequency::is_unlimited")]
+        frequency: CastFrequency,
+        /// Source object whose once-per-turn slot is consumed when
+        /// `frequency` is bounded. Filled by `grant_permission::resolve`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<ObjectId>,
         /// CR 609.4b: Optional payment permission carried by the same effect
         /// that allows the card to be played/cast from exile. This scopes
         /// "mana of any type can be spent to cast that spell" to the exiled
