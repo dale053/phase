@@ -1523,10 +1523,11 @@ pub fn synthesize_annihilator(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Annihilator(_)));
 }
 
-/// CR 702.95a: Soulbond represents two optional triggered abilities. One fires
-/// when the soulbond creature enters and targets another unpaired creature you
-/// control; the other fires when another unpaired creature you control enters
-/// and pairs it with the soulbond source.
+/// CR 702.95a + CR 115.10a: Soulbond represents two optional triggered
+/// abilities. One fires when the soulbond creature enters and can pair it with
+/// another unpaired creature you control; the other fires when another unpaired
+/// creature you control enters and can pair that creature with the soulbond
+/// source. The paired creature is not a target.
 pub fn synthesize_soulbond(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Soulbond));
 }
@@ -1551,6 +1552,24 @@ fn build_soulbond_triggers() -> Vec<TriggerDefinition> {
     let source_unpaired = TriggerCondition::SourceMatchesFilter {
         filter: unpaired_creature_you_control(),
     };
+    let source_enters_condition = TriggerCondition::And {
+        conditions: vec![
+            source_unpaired.clone(),
+            TriggerCondition::ControlsType {
+                filter: another_unpaired_creature_you_control(),
+            },
+        ],
+    };
+    let other_enters_condition = TriggerCondition::And {
+        conditions: vec![
+            source_unpaired,
+            TriggerCondition::ZoneChangeObjectMatchesFilter {
+                origin: None,
+                destination: Zone::Battlefield,
+                filter: another_unpaired_creature_you_control(),
+            },
+        ],
+    };
     let pair_target = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::PairWith {
@@ -1572,7 +1591,7 @@ fn build_soulbond_triggers() -> Vec<TriggerDefinition> {
         TriggerDefinition::new(TriggerMode::ChangesZone)
             .valid_card(TargetFilter::SelfRef)
             .destination(Zone::Battlefield)
-            .condition(source_unpaired.clone())
+            .condition(source_enters_condition)
             .execute(pair_target)
             .description(
                 "CR 702.95a: When this creature enters, you may pair it with another unpaired creature you control.".to_string(),
@@ -1580,7 +1599,7 @@ fn build_soulbond_triggers() -> Vec<TriggerDefinition> {
         TriggerDefinition::new(TriggerMode::ChangesZone)
             .valid_card(another_unpaired_creature_you_control())
             .destination(Zone::Battlefield)
-            .condition(source_unpaired)
+            .condition(other_enters_condition)
             .execute(pair_triggering)
             .description(
                 "CR 702.95a: Whenever another unpaired creature you control enters, you may pair it with this creature.".to_string(),

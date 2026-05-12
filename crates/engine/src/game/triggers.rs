@@ -2931,6 +2931,25 @@ pub mod tests {
         choose_soulbond_partner(state, target);
     }
 
+    fn resolve_stack_without_soulbond_prompt(state: &mut GameState) {
+        for _ in 0..20 {
+            assert!(
+                !matches!(
+                    state.waiting_for,
+                    WaitingFor::OptionalEffectChoice { .. } | WaitingFor::PairChoice { .. }
+                ),
+                "unexpected Soulbond prompt: {:?}",
+                state.waiting_for
+            );
+            if state.stack.is_empty() {
+                return;
+            }
+            crate::game::engine::apply_as_current(state, GameAction::PassPriority)
+                .expect("pass priority");
+        }
+        panic!("stack did not resolve");
+    }
+
     #[test]
     fn soulbond_source_enters_pairs_with_selected_unpaired_creature() {
         let mut state = setup();
@@ -2955,6 +2974,32 @@ pub mod tests {
 
         assert_eq!(state.objects[&source].paired_with, Some(chosen));
         assert_eq!(state.objects[&chosen].paired_with, Some(source));
+    }
+
+    #[test]
+    fn soulbond_lone_source_entering_does_not_prompt() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        let source = make_soulbond_creature(&mut state, PlayerId(0), "Lone Soulbond Source");
+
+        process_triggers(
+            &mut state,
+            &[zone_changed_event(
+                source,
+                Zone::Stack,
+                Zone::Battlefield,
+                vec![CoreType::Creature],
+                vec![],
+            )],
+        );
+
+        assert!(state.stack.is_empty());
+        assert!(!matches!(
+            state.waiting_for,
+            WaitingFor::OptionalEffectChoice { .. } | WaitingFor::PairChoice { .. }
+        ));
+        assert_eq!(state.objects[&source].paired_with, None);
     }
 
     #[test]
@@ -3051,6 +3096,33 @@ pub mod tests {
 
         assert_eq!(state.objects[&source].paired_with, Some(entrant));
         assert_eq!(state.objects[&entrant].paired_with, Some(source));
+    }
+
+    #[test]
+    fn soulbond_other_enters_rechecks_triggering_creature_legality() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        let source = make_soulbond_creature(&mut state, PlayerId(0), "Soulbond Source");
+        let entrant = make_creature(&mut state, PlayerId(0), "New Partner", 1, 1);
+
+        process_triggers(
+            &mut state,
+            &[zone_changed_event(
+                entrant,
+                Zone::Stack,
+                Zone::Battlefield,
+                vec![CoreType::Creature],
+                vec![],
+            )],
+        );
+        assert_eq!(state.stack.len(), 1);
+        state.objects.get_mut(&entrant).unwrap().controller = PlayerId(1);
+
+        resolve_stack_without_soulbond_prompt(&mut state);
+
+        assert_eq!(state.objects[&source].paired_with, None);
+        assert_eq!(state.objects[&entrant].paired_with, None);
     }
 
     #[test]
