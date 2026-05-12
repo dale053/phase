@@ -13971,7 +13971,7 @@ mod tests {
         GainLifePlayer, LinkedExileScope, ManaContribution, ManaProduction, ObjectScope,
         PaymentCost, QuantityExpr, QuantityRef, SearchSelectionConstraint, TypeFilter, ZoneRef,
     };
-    use crate::types::card_type::Supertype;
+    use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
     use crate::types::mana::{ManaColor, ManaExpiry};
     use crate::types::player::PlayerCounterKind;
@@ -15382,6 +15382,57 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[test]
+    fn effect_animation_preserves_pump_and_keywords() {
+        let def = parse_effect_chain(
+            "Until end of turn, this creature becomes a Dragon, gets +5/+3, and gains flying and trample",
+            AbilityKind::Activated,
+        );
+
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = def.effect.as_ref()
+        else {
+            panic!("expected GenericEffect, got {:?}", def.effect);
+        };
+        let modifications = &static_abilities[0].modifications;
+        assert!(modifications.contains(&ContinuousModification::AddSubtype {
+            subtype: "Dragon".to_string(),
+        }));
+        assert!(modifications.contains(&ContinuousModification::AddPower { value: 5 }));
+        assert!(modifications.contains(&ContinuousModification::AddToughness { value: 3 }));
+        assert!(modifications.contains(&ContinuousModification::AddKeyword {
+            keyword: Keyword::Flying,
+        }));
+        assert!(modifications.contains(&ContinuousModification::AddKeyword {
+            keyword: Keyword::Trample,
+        }));
+    }
+
+    #[test]
+    fn effect_vehicle_animation_preserves_pump() {
+        let def = parse_effect_chain(
+            "this Vehicle becomes an artifact creature and gets +1/+1 until end of turn",
+            AbilityKind::Spell,
+        );
+
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = def.effect.as_ref()
+        else {
+            panic!("expected GenericEffect, got {:?}", def.effect);
+        };
+        let modifications = &static_abilities[0].modifications;
+        assert!(modifications.contains(&ContinuousModification::AddType {
+            core_type: CoreType::Artifact,
+        }));
+        assert!(modifications.contains(&ContinuousModification::AddType {
+            core_type: CoreType::Creature,
+        }));
+        assert!(modifications.contains(&ContinuousModification::AddPower { value: 1 }));
+        assert!(modifications.contains(&ContinuousModification::AddToughness { value: 1 }));
     }
 
     #[test]

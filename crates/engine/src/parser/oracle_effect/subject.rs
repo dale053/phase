@@ -1490,7 +1490,12 @@ fn build_become_clause(
 
     let (become_text, name_override) = strip_become_name_override(become_text);
     let animation = parse_animation_spec(&become_text, ctx)?;
-    let modifications = animation_modifications(&animation);
+    let mut modifications = animation_modifications(&animation);
+    for modification in parse_continuous_modifications(predicate) {
+        if !modifications.contains(&modification) {
+            modifications.push(modification);
+        }
+    }
     let modifications = if let Some(name) = name_override {
         let mut with_name = Vec::with_capacity(modifications.len() + 1);
         with_name.push(ContinuousModification::SetName { name });
