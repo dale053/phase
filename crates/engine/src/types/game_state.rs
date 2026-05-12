@@ -1001,6 +1001,12 @@ pub struct PlayerDeckPool {
     pub current_commander: std::sync::Arc<Vec<DeckEntry>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutsideGameChoiceEntry {
+    pub sideboard_index: usize,
+    pub entry: DeckEntry,
+}
+
 /// CR 103.6: A beginning-of-game ability waiting to resolve after mulligans.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingBeginGameAbility {
@@ -1234,6 +1240,19 @@ pub enum WaitingFor {
         /// AI candidate enumerator to prune illegal combinations.
         #[serde(default)]
         constraint: SearchSelectionConstraint,
+    },
+    /// CR 400.11/400.11a + CR 701.23j: Player chooses card(s) they own from
+    /// outside the game. The engine's bounded outside-game set is the player's
+    /// current sideboard, represented by `DeckEntry`s rather than `GameObject`s.
+    OutsideGameChoice {
+        player: PlayerId,
+        choices: Vec<OutsideGameChoiceEntry>,
+        count: usize,
+        #[serde(default)]
+        reveal: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        up_to: bool,
+        destination: Zone,
     },
     /// CR 700.2: Player selects card(s) from a tracked set (e.g., exiled cards).
     /// Chosen/unchosen cards flow into sub-abilities via pending_continuation,
@@ -2190,6 +2209,7 @@ impl WaitingFor {
             | WaitingFor::SurveilChoice { player, .. }
             | WaitingFor::RevealChoice { player, .. }
             | WaitingFor::SearchChoice { player, .. }
+            | WaitingFor::OutsideGameChoice { player, .. }
             | WaitingFor::ChooseFromZoneChoice { player, .. }
             | WaitingFor::ChooseOneOfBranch { player, .. }
             | WaitingFor::LearnChoice { player, .. }

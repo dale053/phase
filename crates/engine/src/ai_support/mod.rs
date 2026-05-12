@@ -161,6 +161,27 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
                 crate::types::actions::LearnOption::Skip => false,
             }
         }
+        (
+            WaitingFor::OutsideGameChoice {
+                choices,
+                count,
+                up_to,
+                ..
+            },
+            GameAction::ChooseOutsideGameCards { sideboard_indices },
+        ) => {
+            let valid_count = if *up_to {
+                sideboard_indices.len() <= *count
+            } else {
+                sideboard_indices.len() == *count
+            };
+            !valid_count
+                || sideboard_indices.iter().any(|index| {
+                    !choices
+                        .iter()
+                        .any(|choice| choice.sideboard_index == *index)
+                })
+        }
         (WaitingFor::PairChoice { choices, .. }, GameAction::ChoosePair { partner }) => {
             partner.is_some_and(|partner| !choices.contains(&partner))
         }

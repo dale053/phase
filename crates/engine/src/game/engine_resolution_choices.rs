@@ -38,6 +38,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::SurveilChoice { .. }
             | WaitingFor::RevealChoice { .. }
             | WaitingFor::SearchChoice { .. }
+            | WaitingFor::OutsideGameChoice { .. }
             | WaitingFor::ChooseFromZoneChoice { .. }
             | WaitingFor::ChooseOneOfBranch { .. }
             | WaitingFor::DiscardToHandSize { .. }
@@ -775,6 +776,79 @@ pub(super) fn handle_resolution_choice(
             }
             effects::drain_pending_continuation(state, events);
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+        }
+        (
+            WaitingFor::OutsideGameChoice {
+                player,
+                choices,
+                count,
+                reveal,
+                up_to,
+                destination,
+            },
+            GameAction::ChooseOutsideGameCards { sideboard_indices },
+        ) => {
+            let valid = if up_to {
+                sideboard_indices.len() <= count
+            } else {
+                sideboard_indices.len() == count
+            };
+            if !valid {
+                return Err(EngineError::InvalidAction(format!(
+                    "Must select {}{} outside-game card(s), got {}",
+                    if up_to { "up to " } else { "exactly " },
+                    count,
+                    sideboard_indices.len()
+                )));
+            }
+            for index in &sideboard_indices {
+                if !choices
+                    .iter()
+                    .any(|choice| choice.sideboard_index == *index)
+                {
+                    return Err(EngineError::InvalidAction(
+                        "Selected card not in outside-game choices".to_string(),
+                    ));
+                }
+            }
+
+            let mut sorted_indices = sideboard_indices.clone();
+            sorted_indices.sort_unstable_by(|a, b| b.cmp(a));
+            let mut chosen_ids = Vec::new();
+            for sideboard_index in sorted_indices {
+                let object_id = effects::search_outside_game::put_sideboard_entry_into_game(
+                    state,
+                    player,
+                    sideboard_index,
+                    destination,
+                )
+                .map_err(|error| EngineError::InvalidAction(format!("{error:?}")))?;
+                chosen_ids.push(object_id);
+            }
+            chosen_ids.reverse();
+
+            if reveal {
+                state.last_revealed_ids = chosen_ids.clone();
+                for &card_id in &chosen_ids {
+                    state.revealed_cards.insert(card_id);
+                }
+                let card_names: Vec<String> = chosen_ids
+                    .iter()
+                    .filter_map(|id| state.objects.get(id).map(|obj| obj.name.clone()))
+                    .collect();
+                events.push(GameEvent::CardsRevealed {
+                    player,
+                    card_ids: chosen_ids.clone(),
+                    card_names,
+                });
+            } else {
+                state.last_revealed_ids.clear();
+            }
+
+            if let Some(cont) = state.pending_continuation.as_mut() {
+                cont.chain.targets = chosen_ids.iter().map(|&id| TargetRef::Object(id)).collect();
+            }
+            ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }
         (
             WaitingFor::ChooseFromZoneChoice {
