@@ -134,6 +134,16 @@ impl KeywordTriggerInstaller {
         }
     }
 
+    pub fn trigger_matches_keyword_kind(trigger: &TriggerDefinition, keyword: &Keyword) -> bool {
+        match keyword {
+            Keyword::Echo(_) => is_echo_trigger(trigger),
+            Keyword::Undying => is_dies_return_with_counter_trigger(trigger, "P1P1"),
+            Keyword::Persist => is_dies_return_with_counter_trigger(trigger, "M1M1"),
+            Keyword::Annihilator(_) => is_annihilator_attack_trigger(trigger),
+            _ => false,
+        }
+    }
+
     fn install_matching<F>(face: &mut CardFace, matches_keyword: F)
     where
         F: Fn(&Keyword) -> bool,
@@ -1515,7 +1525,6 @@ pub fn synthesize_annihilator(face: &mut CardFace) {
 /// The check is narrow on purpose: an unrelated `Attacks` trigger on the same
 /// face (e.g., "Whenever ~ attacks, you draw a card") must NOT be counted as
 /// an existing Annihilator emission.
-#[cfg(test)]
 fn is_annihilator_attack_trigger(t: &TriggerDefinition) -> bool {
     if !matches!(t.mode, TriggerMode::Attacks)
         || !matches!(t.valid_card, Some(TargetFilter::SelfRef))
@@ -1533,6 +1542,21 @@ fn is_annihilator_attack_trigger(t: &TriggerDefinition) -> bool {
         TargetFilter::Typed(tf)
             if tf.controller == Some(ControllerRef::DefendingPlayer)
     )
+}
+
+fn is_echo_trigger(t: &TriggerDefinition) -> bool {
+    matches!(t.mode, TriggerMode::PayEcho)
+        && t.phase == Some(Phase::Upkeep)
+        && matches!(t.valid_target, Some(TargetFilter::Controller))
+        && matches!(t.condition, Some(TriggerCondition::EchoDue))
+        && t.unless_pay.is_some()
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                ..
+            })
+        )
 }
 
 fn build_echo_trigger(cost: ManaCost) -> TriggerDefinition {
@@ -1652,7 +1676,6 @@ fn build_dies_return_with_counter_trigger(
 /// the counter type on the execute body's `enter_with_counters`) — so an
 /// unrelated dies-trigger on the same face (e.g., "When ~ dies, draw a card")
 /// is correctly ignored.
-#[cfg(test)]
 fn is_dies_return_with_counter_trigger(t: &TriggerDefinition, counter_type: &str) -> bool {
     if !matches!(t.mode, TriggerMode::ChangesZone)
         || t.origin != Some(Zone::Battlefield)

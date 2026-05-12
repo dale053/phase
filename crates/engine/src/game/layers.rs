@@ -1577,6 +1577,9 @@ fn apply_continuous_effect(state: &mut GameState, effect: &ActiveContinuousEffec
             ContinuousModification::RemoveKeyword { keyword } => {
                 obj.keywords
                     .retain(|k| std::mem::discriminant(k) != std::mem::discriminant(keyword));
+                obj.trigger_definitions.retain(|trigger| {
+                    !KeywordTriggerInstaller::trigger_matches_keyword_kind(trigger, keyword)
+                });
             }
             ContinuousModification::RemoveAllAbilities => {
                 Arc::make_mut(&mut obj.abilities).clear();
@@ -6042,6 +6045,47 @@ mod tests {
             .expect("dynamic Annihilator 3 should install a sacrifice trigger");
         assert!(matches!(trigger.mode, TriggerMode::Attacks));
         assert!(matches!(trigger.valid_card, Some(TargetFilter::SelfRef)));
+    }
+
+    #[test]
+    fn remove_keyword_undying_removes_synthesized_trigger() {
+        let mut state = setup();
+        let bear = make_creature(&mut state, "Bear", 2, 2, PlayerId(0));
+        let grant_source = make_creature(&mut state, "Undying Granter", 1, 1, PlayerId(0));
+        let remove_source = make_creature(&mut state, "Undying Suppressor", 1, 1, PlayerId(0));
+        let grant = StaticDefinition::continuous()
+            .affected(TargetFilter::SpecificObject { id: bear })
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Undying,
+            }]);
+        let remove = StaticDefinition::continuous()
+            .affected(TargetFilter::SpecificObject { id: bear })
+            .modifications(vec![ContinuousModification::RemoveKeyword {
+                keyword: Keyword::Undying,
+            }]);
+        state
+            .objects
+            .get_mut(&grant_source)
+            .unwrap()
+            .static_definitions
+            .push(grant);
+        state
+            .objects
+            .get_mut(&remove_source)
+            .unwrap()
+            .static_definitions
+            .push(remove);
+
+        evaluate_layers(&mut state);
+
+        let obj = state.objects.get(&bear).unwrap();
+        assert!(!obj.keywords.contains(&Keyword::Undying));
+        assert!(
+            !obj.trigger_definitions.iter_all().any(|trigger| {
+                KeywordTriggerInstaller::trigger_matches_keyword_kind(trigger, &Keyword::Undying)
+            }),
+            "RemoveKeyword(Undying) must remove the synthesized dies trigger"
+        );
     }
 
     /// CR 702.16m: Multiple instances of protection from the same quality on
