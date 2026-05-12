@@ -310,6 +310,14 @@ pub fn rehydrate_game_from_card_db(state: &mut GameState, db: &CardDatabase) {
         );
     }
 
+    // Restore the `#[serde(skip)]` "name a card" validation list. Without this,
+    // a NamedChoice { choice_type: CardName, options: [] } (e.g. Petrified Hamlet's
+    // "choose a land card name") leaves the AI with zero legal candidates after a
+    // game is restored from a persisted snapshot, deadlocking the session.
+    if state.all_card_names.is_empty() {
+        state.all_card_names = db.card_names().into();
+    }
+
     let object_ids: Vec<_> = state.objects.keys().copied().collect();
     let mut changed_any = false;
     let mut changed_battlefield = false;
