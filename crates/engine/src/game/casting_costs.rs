@@ -508,7 +508,7 @@ pub(crate) fn handle_sacrifice_for_cost(
 pub(crate) fn handle_return_to_hand_for_cost(
     state: &mut GameState,
     player: PlayerId,
-    pending: PendingCast,
+    mut pending: PendingCast,
     count: usize,
     legal_permanents: &[ObjectId],
     chosen: &[ObjectId],
@@ -526,6 +526,16 @@ pub(crate) fn handle_return_to_hand_for_cost(
             return Err(EngineError::InvalidAction(
                 "Selected permanent not eligible to return".to_string(),
             ));
+        }
+    }
+
+    if pending.activation_ability_index.is_some() {
+        if let Some(cost) = pending.activation_cost.take() {
+            // CR 118.3 + CR 602.2h: A player pays an activated ability's total
+            // cost before that ability becomes activated. For self-bounce costs
+            // such as Maze's End, pay automatic components like {T} while the
+            // source is still on the battlefield, then perform the chosen return.
+            super::casting::pay_ability_cost(state, player, pending.object_id, &cost, events)?;
         }
     }
 

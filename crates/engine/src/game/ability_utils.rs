@@ -2664,10 +2664,110 @@ mod tests {
         UnlessPayModifier,
     };
     use crate::types::card_type::CoreType;
-    use crate::types::game_state::{GameState, TargetSelectionConstraint, TargetSelectionSlot};
+    use crate::types::game_state::{
+        GameState, StackEntryKind, TargetSelectionConstraint, TargetSelectionSlot, WaitingFor,
+    };
     use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
+    use crate::types::mana::{ManaCost, ManaType, ManaUnit};
     use crate::types::player::PlayerId;
     use crate::types::zones::Zone;
+    use crate::types::{FormatConfig, GameAction};
+    //mazes end test for self bounce lands
+    #[test]
+    fn mazes_end_search_resolves_after_self_bounce_cost() {
+        let format = FormatConfig::duel_commander();
+        let mut state = GameState::new(format, 2, 2);
+        let mazes_end = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Maze's End".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&mazes_end).expect("Maze's End");
+            obj.card_types.core_types.push(CoreType::Land);
+            std::sync::Arc::make_mut(&mut obj.abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::SearchLibrary {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::new(TypeFilter::Land)
+                                .with_type(TypeFilter::Subtype("Gate".to_string())),
+                        ),
+                        count: QuantityExpr::Fixed { value: 1 },
+                        reveal: false,
+                        target_player: None,
+                        selection_constraint: SearchSelectionConstraint::None,
+                    },
+                )
+                .cost(AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Mana {
+                            cost: ManaCost::Cost {
+                                shards: Vec::new(),
+                                generic: 3,
+                            },
+                        },
+                        AbilityCost::Tap,
+                        AbilityCost::ReturnToHand {
+                            count: 1,
+                            filter: Some(TargetFilter::SelfRef),
+                            from_zone: Some(Zone::Battlefield),
+                        },
+                    ],
+                }),
+            );
+        }
+        for _ in 0..3 {
+            state.players[0].mana_pool.add(ManaUnit::new(
+                ManaType::Colorless,
+                ObjectId(999),
+                false,
+                Vec::new(),
+            ));
+        }
+
+        let waiting = crate::game::casting::handle_activate_ability(
+            &mut state,
+            PlayerId(0),
+            mazes_end,
+            0,
+            &mut Vec::new(),
+        )
+        .expect("Maze's End activation should begin");
+        assert!(
+            matches!(waiting, WaitingFor::ReturnToHandForCost { .. }),
+            "self-bounce cost should request a return-to-hand selection"
+        );
+        state.waiting_for = waiting;
+
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![mazes_end],
+            },
+        )
+        .expect("paying the self-bounce cost should finish activation");
+
+        assert_eq!(state.objects[&mazes_end].zone, Zone::Hand);
+        assert!(
+            state.players[0].hand.contains(&mazes_end),
+            "Maze's End is returned to hand as an activation cost"
+        );
+        assert_eq!(
+            state.stack.len(),
+            1,
+            "Maze's End ability should be on the stack"
+        );
+        match &state.stack[0].kind {
+            StackEntryKind::ActivatedAbility { source_id, ability } => {
+                assert_eq!(*source_id, mazes_end);
+                assert!(matches!(ability.effect, Effect::SearchLibrary { .. }));
+            }
+            other => panic!("expected Maze's End activated ability on stack, got {other:?}"),
+        }
+    }
 
     #[test]
     fn build_chained_resolved_preserves_mode_sub_abilities() {

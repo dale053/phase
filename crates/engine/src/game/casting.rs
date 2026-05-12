@@ -5114,13 +5114,14 @@ pub(crate) fn find_eligible_exile_for_cost_targets(
 fn find_return_to_hand_cost(cost: &AbilityCost) -> Option<(u32, Option<&TargetFilter>)> {
     match cost {
         // CR 118.12: This helper currently only handles the default
-        // battlefield-source shape (`from_zone: None`). Cards with
-        // `from_zone: Some(_)` use the unless-cost path in
+        // battlefield-source shape (`from_zone: None`) and its explicit
+        // spelling (`from_zone: Some(Battlefield)`). Cards with other
+        // `from_zone` values use the unless-cost path in
         // `engine_payment_choices.rs`, not the activation-cost path here.
         AbilityCost::ReturnToHand {
             count,
             filter,
-            from_zone: None,
+            from_zone: None | Some(Zone::Battlefield),
         } => Some((*count, filter.as_ref())),
         AbilityCost::ReturnToHand {
             from_zone: Some(_), ..
