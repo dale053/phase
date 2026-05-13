@@ -10,7 +10,8 @@ use crate::types::ability::{
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    AutoMayChoice, DayNight, GameState, MayTriggerAutoChoiceKey, PendingContinuation, WaitingFor,
+    AutoMayChoice, DayNight, GameState, LKISnapshot, MayTriggerAutoChoiceKey, PendingContinuation,
+    WaitingFor, ZoneChangeRecord,
 };
 use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::mana::ManaCost;
@@ -416,7 +417,21 @@ fn prepend_to_pending_continuation(state: &mut GameState, mut head: ResolvedAbil
     }
 }
 
-pub(crate) fn sacrificed_object_context_from_events(
+pub(crate) fn parent_referent_context_from_events(
+    state: &GameState,
+    events: &[GameEvent],
+) -> Option<CostPaidObjectSnapshot> {
+    // CR 608.2c + CR 400.7j: Later instructions in one resolving effect may
+    // refer to a single object the earlier instruction sacrificed or moved to a
+    // public zone, even after that object changed zones.
+    if let Some(snapshot) = sacrificed_object_context_from_events(state, events) {
+        return Some(snapshot);
+    }
+
+    moved_object_context_from_events(events)
+}
+
+fn sacrificed_object_context_from_events(
     state: &GameState,
     events: &[GameEvent],
 ) -> Option<CostPaidObjectSnapshot> {
@@ -431,6 +446,47 @@ pub(crate) fn sacrificed_object_context_from_events(
             }),
         _ => None,
     })
+}
+
+fn moved_object_context_from_events(events: &[GameEvent]) -> Option<CostPaidObjectSnapshot> {
+    let mut moved = events.iter().filter_map(|event| match event {
+        GameEvent::ZoneChanged {
+            object_id,
+            from: Some(_),
+            to,
+            record,
+        } if is_public_zone(*to) => Some(CostPaidObjectSnapshot {
+            object_id: *object_id,
+            lki: lki_snapshot_from_zone_change_record(record),
+        }),
+        _ => None,
+    });
+    let first = moved.next()?;
+    moved.next().is_none().then_some(first)
+}
+
+fn lki_snapshot_from_zone_change_record(record: &ZoneChangeRecord) -> LKISnapshot {
+    LKISnapshot {
+        name: record.name.clone(),
+        power: record.power,
+        toughness: record.toughness,
+        mana_value: record.mana_value,
+        controller: record.controller,
+        owner: record.owner,
+        card_types: record.core_types.clone(),
+        subtypes: record.subtypes.clone(),
+        supertypes: record.supertypes.clone(),
+        keywords: record.keywords.clone(),
+        colors: record.colors.clone(),
+        counters: Default::default(),
+    }
+}
+
+fn is_public_zone(zone: crate::types::zones::Zone) -> bool {
+    !matches!(
+        zone,
+        crate::types::zones::Zone::Library | crate::types::zones::Zone::Hand
+    )
 }
 
 fn apply_parent_chain_context(
@@ -2084,11 +2140,8 @@ pub fn resolve_ability_chain(
     } else {
         vec![]
     };
-    let effect_context_object = if matches!(ability.effect, Effect::Sacrifice { .. }) {
-        sacrificed_object_context_from_events(state, &events[events_before..])
-    } else {
-        None
-    };
+    let effect_context_object =
+        parent_referent_context_from_events(state, &events[events_before..]);
 
     // Follow typed sub_ability chain, propagating parent targets when sub has none.
     // This allows sub-abilities like "its controller gains life" to access the object
@@ -3396,6 +3449,123 @@ mod tests {
         assert!(state.players[0].graveyard.contains(&victim));
         assert_eq!(state.players[0].life, 24);
         assert_eq!(state.players[0].hand.len(), 4);
+    }
+
+    #[test]
+    fn moved_object_context_reads_single_zone_change_record() {
+        let state = GameState::new_two_player(42);
+        let moved = ObjectId(7);
+        let record = ZoneChangeRecord {
+            name: "Eight Mana Creature".to_string(),
+            mana_value: 8,
+            controller: PlayerId(0),
+            owner: PlayerId(0),
+            ..ZoneChangeRecord::test_minimal(moved, Some(Zone::Graveyard), Zone::Battlefield)
+        };
+        let events = vec![GameEvent::ZoneChanged {
+            object_id: moved,
+            from: Some(Zone::Graveyard),
+            to: Zone::Battlefield,
+            record: Box::new(record),
+        }];
+
+        let snapshot = parent_referent_context_from_events(&state, &events)
+            .expect("single zone change to a public zone should provide context");
+
+        assert_eq!(snapshot.object_id, moved);
+        assert_eq!(snapshot.lki.mana_value, 8);
+        assert_eq!(snapshot.lki.name, "Eight Mana Creature");
+    }
+
+    #[test]
+    fn moved_object_context_ignores_ambiguous_multiple_zone_changes() {
+        let state = GameState::new_two_player(42);
+        let first = ObjectId(7);
+        let second = ObjectId(8);
+        let events = vec![
+            GameEvent::ZoneChanged {
+                object_id: first,
+                from: Some(Zone::Graveyard),
+                to: Zone::Battlefield,
+                record: Box::new(ZoneChangeRecord::test_minimal(
+                    first,
+                    Some(Zone::Graveyard),
+                    Zone::Battlefield,
+                )),
+            },
+            GameEvent::ZoneChanged {
+                object_id: second,
+                from: Some(Zone::Graveyard),
+                to: Zone::Battlefield,
+                record: Box::new(ZoneChangeRecord::test_minimal(
+                    second,
+                    Some(Zone::Graveyard),
+                    Zone::Battlefield,
+                )),
+            },
+        ];
+
+        assert!(parent_referent_context_from_events(&state, &events).is_none());
+    }
+
+    #[test]
+    fn change_zone_then_lose_life_reads_moved_object_mana_value() {
+        let mut state = GameState::new_two_player(42);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Eight Mana Creature".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.mana_cost = ManaCost::generic(8);
+            obj.base_mana_cost = obj.mana_cost.clone();
+        }
+        let lose_life = ResolvedAbility::new(
+            Effect::LoseLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextSourceManaValue,
+                },
+                target: Some(TargetFilter::Controller),
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let reanimate_shape = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: None,
+                    properties: vec![FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    }],
+                }),
+                owner_library: false,
+                enter_transformed: false,
+                under_your_control: true,
+                enter_tapped: false,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+            },
+            vec![TargetRef::Object(creature)],
+            ObjectId(100),
+            PlayerId(0),
+        )
+        .sub_ability(lose_life);
+        let mut events = Vec::new();
+
+        resolve_ability_chain(&mut state, &reanimate_shape, &mut events, 0).unwrap();
+
+        assert_eq!(state.objects[&creature].zone, Zone::Battlefield);
+        assert_eq!(state.players[0].life, 12);
     }
 
     fn bounce_then_draw_if_controller_matched_lki(

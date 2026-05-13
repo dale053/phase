@@ -1281,14 +1281,11 @@ pub(super) fn handle_resolution_choice(
                 }
             }
 
-            if matches!(effect_kind, EffectKind::Sacrifice) {
-                if let Some(snapshot) = effects::sacrificed_object_context_from_events(
-                    state,
-                    &events[events_before_effect..],
-                ) {
-                    if let Some(cont) = state.pending_continuation.as_mut() {
-                        cont.chain.set_effect_context_object_recursive(snapshot);
-                    }
+            if let Some(snapshot) =
+                effects::parent_referent_context_from_events(state, &events[events_before_effect..])
+            {
+                if let Some(cont) = state.pending_continuation.as_mut() {
+                    cont.chain.set_effect_context_object_recursive(snapshot);
                 }
             }
             state.last_effect_count = Some(chosen.len() as i32);
