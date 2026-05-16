@@ -1308,7 +1308,12 @@ pub(crate) fn parse_oracle_ir(
         // Must run before keyword extraction so "Spree" header + follow-on `+` lines
         // are consumed as a modal block, not swallowed as a keyword-only line.
         if let Some((block, next_i)) = parse_oracle_block(&lines, i) {
-            lower_oracle_block(block, card_name, &mut result);
+            lower_oracle_block(
+                block,
+                card_name,
+                ctx.host_self_reference.clone(),
+                &mut result,
+            );
             i = next_i;
             continue;
         }
@@ -2515,7 +2520,7 @@ pub(crate) fn parse_oracle_ir(
 
         // Priority 14a: Nom dispatch — try effect, trigger, static, and replacement
         // sub-parsers. If any succeeds, use the result directly.
-        let nom_effect = dispatch_line_nom(&line, card_name);
+        let nom_effect = dispatch_line_nom(&line, card_name, ctx.host_self_reference.clone());
         if !matches!(nom_effect, Effect::Unimplemented { .. }) {
             result
                 .abilities

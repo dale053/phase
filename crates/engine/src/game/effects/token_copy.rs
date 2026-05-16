@@ -114,9 +114,10 @@ pub fn resolve(
     // `Not(IfYouDo)` Insect-token fallback can still fire. `EffectResolved` is
     // still emitted so the chain treats the effect as resolved.
     if copy_source_ids.is_empty() {
-        // CR 603.7 + CR 701.36a: No tokens created — clear the per-resolution
-        // ledger so a downstream "the token created this way" anaphor does not
-        // pick up a stale id from an earlier resolution.
+        // No tokens created — clear the per-resolution token-id ledger so a
+        // downstream "the token created this way" anaphor does not pick up a
+        // stale id from an earlier resolution. Engine bookkeeping, not a
+        // CR-specified rule.
         state.last_created_token_ids = Vec::new();
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::from(&ability.effect),

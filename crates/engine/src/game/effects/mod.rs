@@ -579,11 +579,12 @@ pub(super) fn resolve_optional_effect_decision(
     Ok(())
 }
 
-/// CR 608.2c: Whether a sub-ability condition is a "was the effect performed"
-/// gate (`IfYouDo` / `IfAPlayerDoes`, including a `Not`-wrapped form). Such
+/// Whether a sub-ability condition is a "was the effect performed" gate
+/// (`IfYouDo` / `IfAPlayerDoes`, including a `Not`-wrapped form). Such
 /// conditions cannot be evaluated while the parent effect is suspended for a
 /// player choice — the answer is not yet known — so the sub-ability must be
-/// deferred as a continuation rather than gated eagerly.
+/// deferred as a continuation rather than gated eagerly. Predicate helper, not
+/// rule-implementing code.
 fn condition_depends_on_effect_performed(condition: &AbilityCondition) -> bool {
     match condition {
         AbilityCondition::IfYouDo | AbilityCondition::IfAPlayerDoes => true,
@@ -1854,7 +1855,7 @@ pub fn resolve_ability_chain(
                 else_resolved.context = ability.context.clone();
                 resolve_ability_chain(state, &else_resolved, events, depth + 1)?;
             } else if let Some(ref sub) = ability.sub_ability {
-                // CR 608.2c + CR 609.3: A skipped `IfYouDo` head whose effect
+                // CR 608.2c: A skipped `IfYouDo` head whose effect
                 // did not happen must still hand off to a paired `Not(IfYouDo)`
                 // continuation. The head's own condition gates only the head's
                 // effect — the `sub_ability` is the next chain link with its
