@@ -7967,6 +7967,29 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         {
             *target_player = Some(subject_filter);
         }
+        // CR 508.1d / CR 509.1c + CR 611.2c: "<set-scoped subject> attack(s) this
+        // combat if able" / "... must be blocked ...". A non-targeted set subject
+        // ("all Revelers") is threaded onto the `GenericEffect` produced by the
+        // standalone combat-requirement parsers — both the per-static `affected`
+        // (which objects the layer system grants the requirement to) and the
+        // outer broadcast `target`. Only inject when the parser left the default
+        // sentinel (`None`/`SelfRef`); a targeted subject never reaches here
+        // (the conjunction splitter prepends the anaphor "it" instead, which the
+        // chunk loop rewrites to `ParentTarget`).
+        Effect::GenericEffect {
+            ref mut static_abilities,
+            ref mut target,
+            ..
+        } if subject.target.is_none() => {
+            for static_def in static_abilities.iter_mut() {
+                if matches!(static_def.affected, None | Some(TargetFilter::SelfRef)) {
+                    static_def.affected = Some(subject_filter.clone());
+                }
+            }
+            if target.is_none() {
+                *target = Some(subject_filter);
+            }
+        }
         _ => {}
     }
 }
@@ -19692,6 +19715,165 @@ mod tests {
                 target: Some(TargetFilter::Typed(ref tf)),
                 ..
             } if tf.type_filters.contains(&TypeFilter::Creature)
+        ));
+    }
+
+    /// CR 508.1d / CR 509.1c: Deadly Allure — "Target creature gains deathtouch
+    /// until end of turn and must be blocked this turn if able." The trailing
+    /// combat-requirement conjunct splits into a second chained `GenericEffect`,
+    /// each carrying its own duration. def#1 = the keyword grant; def#2 = the
+    /// MustBeBlocked requirement, whose `affected` resolves to `ParentTarget`
+    /// (the same chosen creature, not a second target slot).
+    #[test]
+    fn effect_gain_keyword_and_must_be_blocked_splits_into_chained_generic_effects() {
+        use crate::types::keywords::Keyword;
+        use crate::types::statics::StaticMode;
+        let def = parse_effect_chain(
+            "Target creature gains deathtouch until end of turn and must be blocked this turn if able",
+            AbilityKind::Spell,
+        );
+        // def#1 — keyword grant with recovered UntilEndOfTurn duration.
+        match &*def.effect {
+            Effect::GenericEffect {
+                static_abilities,
+                duration,
+                ..
+            } => {
+                assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
+                assert!(static_abilities.iter().any(|s| s.modifications.contains(
+                    &ContinuousModification::AddKeyword {
+                        keyword: Keyword::Deathtouch
+                    }
+                )));
+            }
+            other => panic!("def#1 must be GenericEffect, got {other:?}"),
+        }
+        // def#2 — the MustBeBlocked requirement conjunct.
+        let sub = def
+            .sub_ability
+            .as_deref()
+            .expect("combat requirement must become a chained sub_ability");
+        match &*sub.effect {
+            Effect::GenericEffect {
+                static_abilities,
+                duration,
+                ..
+            } => {
+                assert_eq!(static_abilities[0].mode, StaticMode::MustBeBlocked);
+                assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
+                assert_eq!(
+                    static_abilities[0].affected,
+                    Some(TargetFilter::ParentTarget),
+                    "conjunct 2 must reuse conjunct 1's target, not a new slot"
+                );
+            }
+            other => panic!("def#2 must be GenericEffect, got {other:?}"),
+        }
+    }
+
+    /// CR 508.1d: Impulsive Charge — "all Revelers gain haste until end of turn
+    /// and attack this combat if able." The divergent-duration assertion:
+    /// def#1 keeps `UntilEndOfTurn`, def#2 (MustAttack) carries
+    /// `UntilEndOfCombat` — proving the requirement does NOT wrongly persist
+    /// past combat.
+    #[test]
+    fn effect_gain_keyword_and_attack_if_able_splits_with_divergent_durations() {
+        use crate::types::keywords::Keyword;
+        use crate::types::statics::StaticMode;
+        let def = parse_effect_chain(
+            "all Revelers gain haste until end of turn and attack this combat if able",
+            AbilityKind::Spell,
+        );
+        match &*def.effect {
+            Effect::GenericEffect {
+                static_abilities,
+                duration,
+                ..
+            } => {
+                assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
+                assert!(static_abilities.iter().any(|s| s.modifications.contains(
+                    &ContinuousModification::AddKeyword {
+                        keyword: Keyword::Haste
+                    }
+                )));
+            }
+            other => panic!("def#1 must be GenericEffect, got {other:?}"),
+        }
+        let sub = def
+            .sub_ability
+            .as_deref()
+            .expect("combat requirement must become a chained sub_ability");
+        match &*sub.effect {
+            Effect::GenericEffect {
+                static_abilities,
+                duration,
+                ..
+            } => {
+                assert_eq!(static_abilities[0].mode, StaticMode::MustAttack);
+                assert_eq!(
+                    *duration,
+                    Some(Duration::UntilEndOfCombat),
+                    "MustAttack must carry its own UntilEndOfCombat, not inherit UntilEndOfTurn"
+                );
+                // Non-targeted set subject — the typed filter, not SelfRef.
+                assert!(
+                    !matches!(static_abilities[0].affected, Some(TargetFilter::SelfRef)),
+                    "non-targeted subject must thread the typed filter, got {:?}",
+                    static_abilities[0].affected
+                );
+            }
+            other => panic!("def#2 must be GenericEffect, got {other:?}"),
+        }
+    }
+
+    /// GAP-4 regression: "Target creature gains flying and haste until end of
+    /// turn" is a multi-keyword list — NOT a combat requirement — so the
+    /// combat-requirement-gated split must NOT fire. Stays one `GenericEffect`.
+    #[test]
+    fn effect_gain_multiple_keywords_does_not_split() {
+        use crate::types::keywords::Keyword;
+        let def = parse_effect_chain(
+            "Target creature gains flying and haste until end of turn",
+            AbilityKind::Spell,
+        );
+        assert!(
+            def.sub_ability.is_none(),
+            "multi-keyword list must not split, got chained sub_ability"
+        );
+        match &*def.effect {
+            Effect::GenericEffect {
+                static_abilities, ..
+            } => {
+                let mods: Vec<_> = static_abilities
+                    .iter()
+                    .flat_map(|s| s.modifications.iter())
+                    .collect();
+                assert!(mods.contains(&&ContinuousModification::AddKeyword {
+                    keyword: Keyword::Flying
+                }));
+                assert!(mods.contains(&&ContinuousModification::AddKeyword {
+                    keyword: Keyword::Haste
+                }));
+            }
+            other => panic!("expected single GenericEffect, got {other:?}"),
+        }
+    }
+
+    /// Regression: a gain-keyword clause with no combat-requirement conjunct
+    /// still parses as one `GenericEffect` with the duration recovered.
+    #[test]
+    fn effect_gain_keyword_no_conjunct_unaffected() {
+        let def = parse_effect_chain(
+            "Target creature gains deathtouch until end of turn",
+            AbilityKind::Spell,
+        );
+        assert!(def.sub_ability.is_none());
+        assert!(matches!(
+            &*def.effect,
+            Effect::GenericEffect {
+                duration: Some(Duration::UntilEndOfTurn),
+                ..
+            }
         ));
     }
 

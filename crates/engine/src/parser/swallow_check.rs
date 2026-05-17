@@ -1356,8 +1356,9 @@ fn detect_condition_if(
     }
     // Bare " if " — covers prefix conditional ("if X, do Y") and suffix
     // conditional ("do Y if X"). Excluded: "as if", "even if" — modifiers,
-    // not conditions. Also "if able" (CR 701.27) — must-attack/must-block
-    // riders, encoded as `MustAttack`/`MustBeBlocked` static modes.
+    // not conditions. Also "if able" (CR 508.1d / CR 509.1c) —
+    // must-attack/must-block riders, encoded as `MustAttack`/`MustBeBlocked`
+    // static modes.
     let has_marker = stripped.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !stripped.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !stripped.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
@@ -1381,9 +1382,9 @@ fn detect_condition_if(
         // CR 614.1a: AddTargetReplacement encodes the "if [target] would die"
         // gate via the carried ReplacementDefinition's event/destination_zone.
         "AddTargetReplacement",
-        // CR 701.27 / CR 506.6: must-attack and must-block "if able" riders
-        // are encoded as static-mode constraints or as `ForceBlock`/`ForceAttack`
-        // effects, not conditional gates.
+        // CR 508.1d / CR 509.1c / CR 506.6: must-attack and must-block "if able"
+        // riders are encoded as static-mode constraints or as
+        // `ForceBlock`/`ForceAttack` effects, not conditional gates.
         "\"mode\":\"MustAttack\"",
         "\"mode\":\"MustBlock\"",
         "\"mode\":\"MustBeBlocked\"",

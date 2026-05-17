@@ -5933,8 +5933,6 @@ fn try_parse_adapt(lower: &str) -> Option<Effect> {
 ///
 /// Emits a `GenericEffect` with `StaticMode::MustAttack` and the appropriate duration.
 fn try_parse_attack_if_able(lower: &str) -> Option<ImperativeFamilyAst> {
-    use crate::types::statics::StaticMode;
-
     let trimmed = lower.trim_end_matches('.');
 
     // First try: bare forms without a player reference.
@@ -5962,7 +5960,7 @@ fn try_parse_attack_if_able(lower: &str) -> Option<ImperativeFamilyAst> {
 
     if let Ok((_, duration)) = result {
         return Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect {
-            static_abilities: vec![StaticDefinition::new(StaticMode::MustAttack)],
+            static_abilities: vec![must_attack_static_definition()],
             duration: Some(duration),
             target: None,
         }));
@@ -5997,7 +5995,7 @@ fn try_parse_attack_if_able(lower: &str) -> Option<ImperativeFamilyAst> {
         ] {
             if rest.ends_with(suffix_tag) {
                 return Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect {
-                    static_abilities: vec![StaticDefinition::new(StaticMode::MustAttack)],
+                    static_abilities: vec![must_attack_static_definition()],
                     duration: Some(dur),
                     target: None,
                 }));
@@ -6009,10 +6007,50 @@ fn try_parse_attack_if_able(lower: &str) -> Option<ImperativeFamilyAst> {
     let (_, duration) = duration_suffix.ok()?;
 
     Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect {
-        static_abilities: vec![StaticDefinition::new(StaticMode::MustAttack)],
+        static_abilities: vec![must_attack_static_definition()],
         duration: Some(duration),
         target: None,
     }))
+}
+
+/// CR 508.1d: Build the `StaticDefinition` for a transient "attacks if able"
+/// requirement. `Effect::GenericEffect` resolution snapshots only
+/// `static_def.modifications` (the `mode` field is inert for a transient grant —
+/// `snapshot_transient_modifications` never reads it), so the `MustAttack` mode
+/// must be carried by an explicit `AddStaticMode` modification to actually reach
+/// the layer system and `combat.rs` enforcement. Mirrors the block path's
+/// `ImperativeFamilyAst::MustBeBlocked` lowering.
+fn must_attack_static_definition() -> StaticDefinition {
+    use crate::types::statics::StaticMode;
+    StaticDefinition::new(StaticMode::MustAttack).modifications(vec![
+        ContinuousModification::AddStaticMode {
+            mode: StaticMode::MustAttack,
+        },
+    ])
+}
+
+/// CR 508.1d / CR 509.1c: True iff `lower` (already lowercased, trimmed) is a
+/// recognized *standalone* combat requirement — "attack(s) [player] this
+/// turn/combat if able" or "must be blocked [this turn] [if able]". Used by
+/// `split_clause_sequence` to gate the trailing-conjunct split of
+/// "gains <keyword> until end of turn and <combat requirement>" so the
+/// requirement reaches its existing standalone parser. Composes the existing
+/// recognizers as Some/None classifiers; their produced AST is discarded.
+pub(crate) fn is_standalone_combat_requirement(lower: &str) -> bool {
+    let trimmed = lower.trim().trim_end_matches('.').trim();
+    if try_parse_attack_if_able(trimmed).is_some() {
+        return true;
+    }
+    // CR 509.1c: "must be blocked [this turn] [if able]" — mirrors the
+    // imperative `"must"` verb arm.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("must be blocked").parse(trimmed) {
+        let rest = rest.trim();
+        return rest.is_empty()
+            || rest == "this turn if able"
+            || rest == "if able"
+            || rest == "this turn";
+    }
+    false
 }
 
 /// Handles "can't be blocked [this turn]", "can't attack [this turn]", "can't block [this turn]",
@@ -8105,6 +8143,27 @@ mod tests {
             }
             other => panic!("Expected GenericEffect, got {other:?}"),
         }
+    }
+
+    /// CR 508.1d / CR 509.1c: the standalone-combat-requirement recognizer
+    /// used to gate the conjunction split. Recognizes both attack and
+    /// must-be-blocked forms, and rejects non-requirements.
+    #[test]
+    fn standalone_combat_requirement_recognizer() {
+        assert!(is_standalone_combat_requirement(
+            "attack this combat if able"
+        ));
+        assert!(is_standalone_combat_requirement(
+            "attacks this turn if able"
+        ));
+        assert!(is_standalone_combat_requirement(
+            "must be blocked this turn if able"
+        ));
+        assert!(is_standalone_combat_requirement("must be blocked if able"));
+        // Not combat requirements.
+        assert!(!is_standalone_combat_requirement("haste"));
+        assert!(!is_standalone_combat_requirement("gains flying"));
+        assert!(!is_standalone_combat_requirement("draw a card"));
     }
 
     /// CR 400.6 + CR 701.24a: "shuffle the cards from your hand into your
