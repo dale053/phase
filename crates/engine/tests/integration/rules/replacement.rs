@@ -250,7 +250,10 @@ fn spelunking_order_can_leave_tapland_tapped() {
             card_id,
         })
         .expect("play land should succeed");
-    let spelunking_first = replacement_choice_index(&runner, "Lands you control enter untapped.");
+    // #505 (CR 616.1): competing-replacement candidates are labelled by their
+    // outcome (`replacement_choice_label`), not raw Oracle text. Spelunking's
+    // grant is an `Untap` SelfRef replacement → "Enters untapped".
+    let spelunking_first = replacement_choice_index(&runner, "Enters untapped");
     runner
         .act(GameAction::ChooseReplacement {
             index: spelunking_first,
@@ -288,9 +291,10 @@ fn spelunking_order_can_leave_tapland_untapped() {
             card_id,
         })
         .expect("play land should succeed");
-    // Description normalized at the parser entry point (CR 201.4b): `this land`
-    // → `~`, matching the codebase-wide self-reference convention.
-    let tapland_first = replacement_choice_index(&runner, "~ enters tapped.");
+    // #505 (CR 616.1): the tapland's own `Tap` SelfRef replacement is labelled
+    // by its outcome → "Enters tapped" (distinct from Spelunking's "Enters
+    // untapped" candidate, so the substring uniquely identifies it).
+    let tapland_first = replacement_choice_index(&runner, "Enters tapped");
     runner
         .act(GameAction::ChooseReplacement {
             index: tapland_first,
@@ -329,9 +333,10 @@ fn archelos_untapped_makes_other_taplands_enter_untapped() {
             card_id,
         })
         .expect("play land should succeed");
-    // Description normalized at the parser entry point (CR 201.4b): `this land`
-    // → `~`, matching the codebase-wide self-reference convention.
-    let tapland_first = replacement_choice_index(&runner, "~ enters tapped.");
+    // #505 (CR 616.1): the tapland's own `Tap` SelfRef replacement is labelled
+    // by its outcome → "Enters tapped" (distinct from Archelos's "Enters
+    // untapped" candidate, so the substring uniquely identifies it).
+    let tapland_first = replacement_choice_index(&runner, "Enters tapped");
     runner
         .act(GameAction::ChooseReplacement {
             index: tapland_first,
