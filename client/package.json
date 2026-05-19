@@ -10,7 +10,7 @@
     "type-check": "tsc -b --noEmit",
     "preview": "vite preview",
     "test": "vitest",
-    "test:integration": "vitest run --include 'src/**/*.integration.test.{ts,tsx}'",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
