@@ -88,4 +88,24 @@ describe("PackDisplay pod state", () => {
 
     expect(onConfirmPick).toHaveBeenCalledTimes(1);
   });
+
+  it("renders pod auto-pick and dispatches the pod auto-pick action", () => {
+    const onAutoPick = vi.fn();
+
+    render(
+      <PackDisplay
+        view={view}
+        selectedCard={null}
+        onSelectCard={vi.fn()}
+        onConfirmPick={vi.fn()}
+        showAutoPick
+        onAutoPick={onAutoPick}
+        onCardHover={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Auto-pick" }));
+
+    expect(onAutoPick).toHaveBeenCalledTimes(1);
+  });
 });

@@ -14,7 +14,13 @@
 
 import { create } from "zustand";
 
-import type { DraftPlayerView, PairingView, SeatPublicView, StandingEntry } from "../adapter/draft-adapter";
+import type {
+  DraftCardInstance,
+  DraftPlayerView,
+  PairingView,
+  SeatPublicView,
+  StandingEntry,
+} from "../adapter/draft-adapter";
 import type { MatchScore } from "../adapter/types";
 import {
   DraftPodHostAdapter,
@@ -119,6 +125,8 @@ interface MultiplayerDraftActions {
   selectCard: (cardInstanceId: string | null) => void;
   /** Both: confirm the currently selected card as pick. */
   confirmPick: () => Promise<void>;
+  /** Both: pick a card from the current pack using a deterministic draft heuristic. */
+  autoPickCard: () => Promise<void>;
   /** Both: add a card to the deck during deckbuilding. */
   addToDeck: (cardName: string) => void;
   /** Both: remove a card from the deck during deckbuilding. */
@@ -159,6 +167,72 @@ interface MultiplayerDraftActions {
 
 let activeHostAdapter: DraftPodHostAdapter | null = null;
 let activeGuestAdapter: DraftPodGuestAdapter | null = null;
+
+const RARITY_SCORE: Record<string, number> = {
+  mythic: 4,
+  rare: 3,
+  uncommon: 2,
+  common: 1,
+};
+
+function preferredColors(pool: DraftCardInstance[]): Set<string> {
+  const counts = new Map<string, number>();
+  for (const card of pool) {
+    for (const color of card.colors) {
+      counts.set(color, (counts.get(color) ?? 0) + 1);
+    }
+  }
+
+  return new Set(
+    [...counts.entries()]
+      .sort(([, a], [, b]) => b - a)
+      .slice(0, 2)
+      .map(([color]) => color),
+  );
+}
+
+function curveScore(cmc: number, poolSize: number): number {
+  if (poolSize < 5) {
+    if (cmc <= 2) return 1;
+    if (cmc >= 6) return -1;
+    return 0;
+  }
+
+  if (cmc >= 2 && cmc <= 4) return 2;
+  if (cmc >= 6) return -1;
+  return 0;
+}
+
+function scoreDraftCard(card: DraftCardInstance, colors: Set<string>, poolSize: number): number {
+  const rarityScore = (RARITY_SCORE[card.rarity.toLowerCase()] ?? 0) * 2;
+  let colorScore = 0;
+  if (card.colors.length === 0) {
+    colorScore = 1;
+  } else if (colors.size > 0) {
+    colorScore = card.colors.some((color) => colors.has(color)) ? 3 : -1;
+  }
+
+  return rarityScore + colorScore + curveScore(card.cmc, poolSize);
+}
+
+function chooseAutoPickCard(view: DraftPlayerView | null): string | null {
+  const pack = view?.current_pack;
+  if (!pack || pack.length === 0) return null;
+
+  const colors = preferredColors(view.pool);
+  let bestCard = pack[0];
+  let bestScore = scoreDraftCard(bestCard, colors, view.pool.length);
+
+  for (const card of pack.slice(1)) {
+    const score = scoreDraftCard(card, colors, view.pool.length);
+    if (score > bestScore) {
+      bestCard = card;
+      bestScore = score;
+    }
+  }
+
+  return bestCard.instance_id;
+}
 
 /** Dispose the active match adapter (P2PHostAdapter or P2PGuestAdapter). */
 function disposeMatchAdapter(set: SetFn): void {
@@ -271,6 +345,13 @@ export const useMultiplayerDraftStore = create<
     const { selectedCard, submitPick } = get();
     if (!selectedCard) return;
     await submitPick(selectedCard);
+  },
+
+  autoPickCard: async () => {
+    const { view, submitPick } = get();
+    const cardInstanceId = chooseAutoPickCard(view);
+    if (!cardInstanceId) return;
+    await submitPick(cardInstanceId);
   },
 
   addToDeck: (cardName) => {

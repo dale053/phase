@@ -533,6 +533,7 @@ function DraftingPhaseContent() {
   const selectedCard = useMultiplayerDraftStore((s) => s.selectedCard);
   const selectCard = useMultiplayerDraftStore((s) => s.selectCard);
   const confirmPick = useMultiplayerDraftStore((s) => s.confirmPick);
+  const autoPickCard = useMultiplayerDraftStore((s) => s.autoPickCard);
 
   if (!introDismissed) {
     return <DraftIntro mode="pod" podSize={podSize} onContinue={() => setIntroDismissed(true)} />;
@@ -550,6 +551,8 @@ function DraftingPhaseContent() {
             selectedCard={selectedCard}
             onSelectCard={selectCard}
             onConfirmPick={confirmPick}
+            showAutoPick
+            onAutoPick={autoPickCard}
             onCardHover={setHoveredCard}
           />
         </div>

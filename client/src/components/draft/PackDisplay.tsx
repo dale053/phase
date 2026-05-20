@@ -111,7 +111,7 @@ function groupByRarity(cards: DraftCardInstance[]) {
 
 interface PackDisplayProps {
   onCardHover: (info: CardHoverInfo | null) => void;
-  /** Show the "Auto-pick" button — Quick Draft only (no-op for P2P pods). */
+  /** Show the "Auto-pick" button when the active draft mode supports it. */
   showAutoPick?: boolean;
   view?: DraftPlayerView | null;
   selectedCard?: string | null;
