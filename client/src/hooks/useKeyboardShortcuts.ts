@@ -11,6 +11,7 @@ import {
 
 /**
  * Registers global keyboard shortcuts for the game.
+ * - ?: Open help and shortcuts
  * - Alt: Toggle parsed-abilities preview (shared via useAltToggle)
  * - Space: Pass priority / advance phase
  * - Enter: Toggle end-turn mode
@@ -69,7 +70,20 @@ export function useKeyboardShortcuts(): void {
         useGameStore.getState();
       const uiState = useUiStore.getState();
 
+      if (uiState.helpSheetOpen) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          uiState.setHelpSheetOpen(false);
+        }
+        return;
+      }
+
       switch (e.key) {
+        case "?":
+          e.preventDefault();
+          uiState.setHelpSheetOpen(true);
+          break;
+
         case " ":
           if (waitingFor?.type === "Priority") {
             e.preventDefault();

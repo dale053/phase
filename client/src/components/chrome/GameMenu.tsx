@@ -15,6 +15,7 @@ interface GameMenuProps {
   showAiHand: boolean;
   onToggleAiHand: () => void;
   onSettingsClick: () => void;
+  onHelpClick: () => void;
   onConcede?: () => void;
 }
 
@@ -25,6 +26,7 @@ export function GameMenu({
   showAiHand,
   onToggleAiHand,
   onSettingsClick,
+  onHelpClick,
   onConcede,
 }: GameMenuProps) {
   const navigate = useNavigate();
@@ -87,9 +89,17 @@ export function GameMenu({
               onSettingsClick();
             }}
           />
+          <MenuButton
+            label="Help & Shortcuts"
+            shortcut="?"
+            onClick={() => {
+              setOpen(false);
+              onHelpClick();
+            }}
+          />
           {isAiMode && (
-            <MenuButton
-              label={showAiHand ? "Hide AI Hand" : "Show AI Hand"}
+          <MenuButton
+            label={showAiHand ? "Hide AI Hand" : "Show AI Hand"}
               onClick={() => {
                 onToggleAiHand();
                 setOpen(false);
@@ -164,21 +174,24 @@ function MenuButton({
   label,
   onClick,
   variant,
+  shortcut,
 }: {
   label: string;
   onClick: () => void;
   variant?: "danger";
+  shortcut?: string;
 }) {
   return (
     <button
       onClick={onClick}
-      className={`w-full px-3 py-2 text-left text-sm transition-colors ${
+      className={`flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm transition-colors ${
         variant === "danger"
           ? "text-red-400 hover:bg-red-900/30 hover:text-red-300"
           : "text-gray-300 hover:bg-gray-800 hover:text-white"
       }`}
     >
-      {label}
+      <span>{label}</span>
+      {shortcut && <span className="font-mono text-xs text-gray-500">{shortcut}</span>}
     </button>
   );
 }

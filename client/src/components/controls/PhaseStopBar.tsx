@@ -3,6 +3,7 @@ import { useId, type ReactNode } from "react";
 import { useIsCompactHeight } from "../../hooks/useIsCompactHeight.ts";
 import { useGameStore } from "../../stores/gameStore";
 import { usePreferencesStore } from "../../stores/preferencesStore";
+import { GameplayTooltip } from "../ui/GameplayTooltip.tsx";
 
 // MTGA-style phase icons as inline SVGs (14x14)
 const PHASE_ICONS: Record<Phase, ReactNode> = {
@@ -196,13 +197,9 @@ function PhaseDot({ phase }: { phase: Phase }) {
       {hasStop && (
         <span className="absolute -bottom-0.5 left-1/2 h-1 w-1 -translate-x-1/2 rounded-full bg-amber-400" />
       )}
-      <span
-        id={tooltipId}
-        role="tooltip"
-        className="pointer-events-none absolute right-0 bottom-full z-50 mb-2 hidden w-64 rounded-md border border-white/10 bg-slate-950/95 px-3 py-2 text-left text-[11px] leading-snug font-medium text-slate-100 shadow-2xl shadow-black/40 backdrop-blur-xl group-hover:block group-focus-visible:block"
-      >
+      <GameplayTooltip id={tooltipId}>
         {tooltip}
-      </span>
+      </GameplayTooltip>
     </button>
   );
 }

@@ -35,6 +35,8 @@ import { OpponentHand } from "../components/hand/OpponentHand.tsx";
 import { MobileHandDrawer } from "../components/hand/MobileHandDrawer.tsx";
 import { HandBadge } from "../components/hand/HandBadge.tsx";
 import { PlayerHand } from "../components/hand/PlayerHand.tsx";
+import { FlowHelpNudge } from "../components/help/FlowHelpNudge.tsx";
+import { HelpSheet } from "../components/help/HelpSheet.tsx";
 import { GameLogPanel } from "../components/log/GameLogPanel.tsx";
 import { ChooseXValueUI } from "../components/mana/ChooseXValueUI.tsx";
 import { ManaPaymentUI } from "../components/mana/ManaPaymentUI.tsx";
@@ -645,6 +647,7 @@ function GamePageContent({
   const turnNumber = useGameStore((s) => s.gameState?.turn_number);
   const engineWaitingFor = useGameStore((s) => s.gameState?.waiting_for);
   const deckPools = useGameStore((s) => s.gameState?.deck_pools);
+  const stackLength = useGameStore((s) => s.gameState?.stack.length ?? 0);
   const isSandboxGame = useGameStore(
     (s) => s.gameState?.format_config?.allow_debug_actions === true,
   );
@@ -662,6 +665,9 @@ function GamePageContent({
   const playerId = usePlayerId();
   const perspectivePlayerId = usePerspectivePlayerId();
   const canActForWaitingState = useCanActForWaitingState();
+  const helpSheetOpen = useUiStore((s) => s.helpSheetOpen);
+  const setHelpSheetOpen = useUiStore((s) => s.setHelpSheetOpen);
+  const dismissedFlowHelpNudge = usePreferencesStore((s) => s.dismissedFlowHelpNudge);
   const opponentDisplayName = useMultiplayerStore((s) => s.opponentDisplayName);
   const adapter = useGameStore((s) => s.adapter);
   const focusedOpponent = useUiStore((s) => s.focusedOpponent);
@@ -865,6 +871,23 @@ function GamePageContent({
   const pileSize = isMobile
     ? { width: "38px", height: "53px" }
     : { width: "clamp(45px, 4.5vw, 70px)", height: "clamp(63px, 6.3vw, 98px)" };
+  const showFlowHelpNudge =
+    !dismissedFlowHelpNudge &&
+    !helpSheetOpen &&
+    (mode === "ai" || mode === "local") &&
+    viewingZone == null &&
+    preferencesOpen == null &&
+    boardContextMenu == null &&
+    !showCardDataMissing &&
+    resumeResetReason == null &&
+    !showConcedeDialog &&
+    disconnectChoice == null &&
+    pauseReason == null &&
+    reconnectState.status === "idle" &&
+    waitingFor?.type === "Priority" &&
+    waitingFor.data.player === playerId &&
+    canActForWaitingState &&
+    stackLength === 0;
 
   return (
     <div
@@ -1026,6 +1049,7 @@ function GamePageContent({
           right: "calc(env(safe-area-inset-right) + var(--game-edge-right) + var(--game-right-rail-offset, 0px))",
         }}
       >
+        {showFlowHelpNudge && <FlowHelpNudge />}
         <CombatPhaseIndicator />
         <div className="flex items-center gap-1.5">
           <HandBadge />
@@ -1045,8 +1069,10 @@ function GamePageContent({
         showAiHand={showAiHand}
         onToggleAiHand={() => setShowAiHand((v) => !v)}
         onSettingsClick={() => setPreferencesOpen({})}
+        onHelpClick={() => setHelpSheetOpen(true)}
         onConcede={onShowConcedeDialog}
       />
+      <HelpSheet />
 
       {/* Connection failure toast */}
       {isOnlineMode && (

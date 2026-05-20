@@ -48,6 +48,7 @@ interface UiStoreState {
   debugPanelOpen: boolean;
   debugInteractionMode: boolean;
   debugContextMenu: { objectId: ObjectId; x: number; y: number } | null;
+  helpSheetOpen: boolean;
   /** Object currently being "previewed" by a debug-panel control (e.g. an
    *  ObjectSelect dropdown option under the cursor). Drives a distinct,
    *  always-obvious highlight on the board permanent / player avatar that is
@@ -90,6 +91,8 @@ interface UiStoreActions {
   toggleDebugInteractionMode: () => void;
   openDebugContextMenu: (menu: { objectId: ObjectId; x: number; y: number }) => void;
   closeDebugContextMenu: () => void;
+  setHelpSheetOpen: (open: boolean) => void;
+  toggleHelpSheet: () => void;
   /** Set or clear the debug-panel preview highlight for an object. */
   setDebugHighlightedObjectId: (id: ObjectId | null) => void;
   /** Set or clear the debug-panel preview highlight for a player. */
@@ -125,6 +128,7 @@ export const useUiStore = create<UiStore>()((set) => ({
   debugPanelOpen: false,
   debugInteractionMode: false,
   debugContextMenu: null,
+  helpSheetOpen: false,
   debugHighlightedObjectId: null,
   debugHighlightedPlayerId: null,
   logPanelOpen: false,
@@ -272,6 +276,8 @@ export const useUiStore = create<UiStore>()((set) => ({
   })),
   openDebugContextMenu: (menu) => set({ debugContextMenu: menu, selectedObjectId: menu.objectId }),
   closeDebugContextMenu: () => set({ debugContextMenu: null }),
+  setHelpSheetOpen: (open) => set({ helpSheetOpen: open }),
+  toggleHelpSheet: () => set((state) => ({ helpSheetOpen: !state.helpSheetOpen })),
   setLogPanelOpen: (open) => set({ logPanelOpen: open }),
   toggleLogPanel: () => set((state) => ({ logPanelOpen: !state.logPanelOpen })),
 }));

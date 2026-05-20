@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import type { AttackTarget, ObjectId, WaitingFor } from "../../adapter/types.ts";
 import { usePlayerId } from "../../hooks/usePlayerId.ts";
@@ -10,6 +10,7 @@ import { useMultiplayerStore } from "../../stores/multiplayerStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { buildAttacks, hasMultipleAttackTargets, getValidAttackTargets } from "../../utils/combat.ts";
 import { gameButtonClass } from "../ui/buttonStyles.ts";
+import { GameplayTooltip } from "../ui/GameplayTooltip.tsx";
 import { AttackTargetPicker } from "../controls/AttackTargetPicker.tsx";
 
 type ActionButtonMode =
@@ -49,6 +50,10 @@ function getActionButtonMode(
 }
 
 export function ActionButton() {
+  const priorityTooltipId = useId();
+  const resolveTooltipId = useId();
+  const resolveAllTooltipId = useId();
+  const passToEndTooltipId = useId();
   const playerId = usePlayerId();
   const gameState = useGameStore((s) => s.gameState);
   const waitingFor = useGameStore((s) => s.waitingFor);
@@ -341,9 +346,13 @@ export function ActionButton() {
             <button
               disabled={actionPending}
               onClick={() => dispatchAction({ type: "PassPriority" })}
-              className={gameButtonClass({ tone: "blue", size: "md", disabled: actionPending, className: primaryButtonClass })}
+              aria-describedby={resolveTooltipId}
+              className={gameButtonClass({ tone: "blue", size: "md", disabled: actionPending, className: `${primaryButtonClass} group relative` })}
             >
               Resolve
+              <GameplayTooltip id={resolveTooltipId}>
+                Pass priority so the top stack item can resolve if every player also passes. Shortcut: Space.
+              </GameplayTooltip>
             </button>
             <button
               disabled={actionPending}
@@ -356,9 +365,13 @@ export function ActionButton() {
                 }));
                 dispatchResolveAll(playerId, seats);
               }}
-              className={gameButtonClass({ tone: "slate", size: "md", disabled: actionPending, className: secondaryButtonClass })}
+              aria-describedby={resolveAllTooltipId}
+              className={gameButtonClass({ tone: "slate", size: "md", disabled: actionPending, className: `${secondaryButtonClass} group relative` })}
             >
               Resolve All
+              <GameplayTooltip id={resolveAllTooltipId}>
+                Keep passing priority while the stack resolves. A required choice or stop can interrupt it.
+              </GameplayTooltip>
             </button>
           </>
         )}
@@ -377,18 +390,23 @@ export function ActionButton() {
             <button
               disabled={blocked}
               onClick={() => dispatchAction({ type: "PassPriority" })}
+              aria-describedby={priorityTooltipId}
               className={gameButtonClass({
                 tone: "emerald",
                 size: "md",
                 disabled: blocked,
-                className: primaryButtonClass,
+                className: `${primaryButtonClass} group relative`,
               })}
             >
               {idle ? "Waiting" : advanceLabel}
+              <GameplayTooltip id={priorityTooltipId}>
+                Pass priority. If the stack is empty, this advances through the current priority window. Shortcut: Space.
+              </GameplayTooltip>
             </button>
             <button
               disabled={blocked}
               onClick={() => dispatchAction({ type: "SetAutoPass", data: { mode: { type: "UntilEndOfTurn" } } })}
+              aria-describedby={passToEndTooltipId}
               className={`group relative ${gameButtonClass({ tone: "slate", size: "md", disabled: blocked, className: secondaryButtonClass })}`}
             >
               <span className="flex items-center gap-1">
@@ -397,12 +415,9 @@ export function ActionButton() {
                   <path fillRule="evenodd" d="M2 10a.75.75 0 0 1 .75-.75h12.59l-2.1-1.95a.75.75 0 1 1 1.02-1.1l3.5 3.25a.75.75 0 0 1 0 1.1l-3.5 3.25a.75.75 0 1 1-1.02-1.1l2.1-1.95H2.75A.75.75 0 0 1 2 10Z" clipRule="evenodd" />
                 </svg>
               </span>
-              <span
-                role="tooltip"
-                className="pointer-events-none absolute bottom-full right-0 z-50 mb-2 hidden w-48 rounded-md border border-white/10 bg-slate-950/95 px-3 py-2 text-left text-[11px] leading-snug font-medium text-slate-100 shadow-2xl shadow-black/40 backdrop-blur-xl group-hover:block group-focus-visible:block"
-              >
-                Pass until end step — skip all remaining priority in this turn
-              </span>
+              <GameplayTooltip id={passToEndTooltipId} className="w-56">
+                Auto-pass until the end step unless a choice, stop, or Full Control interrupts. Shortcut: Enter.
+              </GameplayTooltip>
             </button>
           </>
         )}

@@ -123,6 +123,7 @@ function buildDefaultPreferences(): PreferencesState {
     lastMatchType: "Bo1",
     lastPlayerCount: 2,
     experimentalFeatures: false,
+    dismissedFlowHelpNudge: false,
     artChain: [] as ArtChainEntry[],
     artOverrides: {} as Record<string, CardArtOverride>,
   };
@@ -168,6 +169,7 @@ interface PreferencesState {
   lastMatchType: MatchType;
   lastPlayerCount: number;
   experimentalFeatures: boolean;
+  dismissedFlowHelpNudge: boolean;
   artChain: ArtChainEntry[];
   artOverrides: Record<string, CardArtOverride>;
 }
@@ -215,6 +217,7 @@ interface PreferencesActions {
   setLastMatchType: (matchType: MatchType) => void;
   setLastPlayerCount: (count: number) => void;
   setExperimentalFeatures: (enabled: boolean) => void;
+  setDismissedFlowHelpNudge: (dismissed: boolean) => void;
   addArtChainEntry: (entry: ArtChainEntry) => void;
   removeArtChainEntry: (index: number) => void;
   moveArtChainEntry: (fromIndex: number, toIndex: number) => void;
@@ -340,6 +343,7 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
       setLastMatchType: (matchType) => set({ lastMatchType: matchType }),
       setLastPlayerCount: (count) => set({ lastPlayerCount: count }),
       setExperimentalFeatures: (enabled) => set({ experimentalFeatures: enabled }),
+      setDismissedFlowHelpNudge: (dismissed) => set({ dismissedFlowHelpNudge: dismissed }),
       addArtChainEntry: (entry) =>
         set((state) => {
           const isDuplicate = state.artChain.some((e) =>
