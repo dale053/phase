@@ -3167,6 +3167,25 @@ pub enum QuantityExpr {
 }
 
 impl QuantityExpr {
+    /// Scale a quantity expression by a non-negative runtime factor. Fixed
+    /// values fold immediately; dynamic quantities compose through
+    /// `QuantityExpr::Multiply` so the existing quantity resolver evaluates the
+    /// scaled expression in context.
+    pub fn scaled_by(&self, factor: u32) -> Self {
+        let factor = i32::try_from(factor).unwrap_or(i32::MAX);
+        match (factor, self) {
+            (0, _) => QuantityExpr::Fixed { value: 0 },
+            (1, expr) => expr.clone(),
+            (_, QuantityExpr::Fixed { value }) => QuantityExpr::Fixed {
+                value: value.saturating_mul(factor),
+            },
+            (_, expr) => QuantityExpr::Multiply {
+                factor,
+                inner: Box::new(expr.clone()),
+            },
+        }
+    }
+
     /// Construct an `UpTo { max }` expression, debug-asserting the
     /// non-nesting invariant. Always use this rather than the raw struct
     /// literal.
@@ -4055,6 +4074,24 @@ pub enum AbilityCost {
     EffectCost {
         effect: Box<Effect>,
     },
+    /// CR 702.24a: A cost that multiplies a base cost by the number of
+    /// counters of `counter` type on `target`. The runtime resolves the
+    /// multiplier at the unless-payment entry point and expands `base`
+    /// into the effective payment: mana scales via `ManaCost::scaled(n)`,
+    /// life/sacrifice counts multiply directly, and `OneOf` unfolds into
+    /// a `Composite` of `n` independent disjunctive choices (each made
+    /// separately per CR 702.24a).
+    ///
+    /// Building block, not a special case: this is the typed shape of
+    /// "pay [cost] for each counter on it". Cumulative upkeep is the
+    /// only mechanic using it today, but the variant is composable with
+    /// every existing base cost (Mana, PayLife, Sacrifice, OneOf,
+    /// Composite).
+    PerCounter {
+        counter: CounterType,
+        target: TargetFilter,
+        base: Box<AbilityCost>,
+    },
     Unimplemented {
         description: String,
     },
@@ -4092,6 +4129,34 @@ pub enum CostCategory {
 }
 
 impl AbilityCost {
+    /// CR 702.24a + CR 118.12: True iff this cost can be used as the base
+    /// cost for a cumulative-upkeep trigger and then paid by the current
+    /// unless-payment pipeline after `PerCounter` expansion.
+    ///
+    /// This is the single support boundary for cumulative-upkeep synthesis and
+    /// coverage reporting. Widen it only when `expand_per_counter` and
+    /// `handle_unless_payment` can pay the resulting expanded shape end-to-end.
+    pub fn supports_cumulative_upkeep_payment(&self) -> bool {
+        match self {
+            AbilityCost::Mana { .. }
+            | AbilityCost::PayLife { .. }
+            | AbilityCost::Sacrifice { .. } => true,
+            // CR 118.12a: OneOf at the base must be a disjunction of mana
+            // costs; mixed-shape disjunctions are not yet expanded into a
+            // payable per-counter form.
+            AbilityCost::OneOf { costs } => {
+                !costs.is_empty() && costs.iter().all(|c| matches!(c, AbilityCost::Mana { .. }))
+            }
+            // The payment path currently folds only all-Mana composites into a
+            // single combined mana cost. Mixed composites need sequenced
+            // sub-cost payment before they can be installed safely.
+            AbilityCost::Composite { costs } => {
+                !costs.is_empty() && costs.iter().all(|c| matches!(c, AbilityCost::Mana { .. }))
+            }
+            _ => false,
+        }
+    }
+
     /// CR 118: Classify this cost into one or more `CostCategory` buckets.
     ///
     /// `Composite` recurses, flattening every sub-cost. Variants that pay
@@ -4160,6 +4225,9 @@ impl AbilityCost {
                 }
                 _ => Vec::new(),
             },
+            // CR 702.24a: The multiplier doesn't change *what kind* of cost
+            // this is, only *how much* — delegate classification to the base.
+            AbilityCost::PerCounter { base, .. } => base.categories(),
             AbilityCost::Unimplemented { .. } => Vec::new(),
         }
     }
@@ -4185,6 +4253,9 @@ impl AbilityCost {
             AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
                 costs.iter().any(AbilityCost::consumes_source)
             }
+            // CR 702.24a: The PerCounter wrapper multiplies its base; whether
+            // the source is consumed is determined entirely by the base cost.
+            AbilityCost::PerCounter { base, .. } => base.consumes_source(),
             // Every other variant: pays mana / life / loyalty / counters /
             // taps / sacrifices-or-exiles-other — none destroys the source.
             AbilityCost::Mana { .. }
@@ -10575,6 +10646,105 @@ mod tests {
         assert_eq!(cycling_json["consumes_source"], serde_json::json!(true));
         let benign_json = serde_json::to_value(&tap_only).unwrap();
         assert!(benign_json.get("consumes_source").is_none());
+    }
+
+    #[test]
+    fn per_counter_cost_delegates_categories_to_base() {
+        let base = AbilityCost::Mana {
+            cost: ManaCost::generic(1),
+        };
+        let wrapped = AbilityCost::PerCounter {
+            counter: CounterType::Age,
+            target: TargetFilter::SelfRef,
+            base: Box::new(base.clone()),
+        };
+        assert_eq!(wrapped.categories(), base.categories());
+    }
+
+    #[test]
+    fn quantity_expr_scaled_by_folds_fixed_and_composes_dynamic_values() {
+        assert_eq!(
+            QuantityExpr::Fixed { value: 3 }.scaled_by(4),
+            QuantityExpr::Fixed { value: 12 },
+        );
+
+        let dynamic = QuantityExpr::Ref {
+            qty: QuantityRef::Variable {
+                name: "X".to_string(),
+            },
+        };
+
+        assert_eq!(dynamic.scaled_by(1), dynamic);
+        assert_eq!(dynamic.scaled_by(0), QuantityExpr::Fixed { value: 0 });
+        assert_eq!(
+            dynamic.scaled_by(4),
+            QuantityExpr::Multiply {
+                factor: 4,
+                inner: Box::new(dynamic),
+            },
+        );
+    }
+
+    #[test]
+    fn cumulative_upkeep_support_boundary_matches_payment_pipeline() {
+        assert!(AbilityCost::Mana {
+            cost: ManaCost::generic(1)
+        }
+        .supports_cumulative_upkeep_payment());
+        assert!(AbilityCost::PayLife {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: "X".to_string(),
+                },
+            },
+        }
+        .supports_cumulative_upkeep_payment());
+        assert!(AbilityCost::Sacrifice {
+            target: TargetFilter::SelfRef,
+            count: 1,
+        }
+        .supports_cumulative_upkeep_payment());
+        assert!(AbilityCost::OneOf {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(1),
+                },
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(2),
+                },
+            ],
+        }
+        .supports_cumulative_upkeep_payment());
+        assert!(AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(1),
+                },
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(2),
+                },
+            ],
+        }
+        .supports_cumulative_upkeep_payment());
+
+        assert!(!AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(1),
+                },
+                AbilityCost::PayLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                },
+            ],
+        }
+        .supports_cumulative_upkeep_payment());
+        assert!(!AbilityCost::Discard {
+            count: QuantityExpr::Fixed { value: 1 },
+            filter: None,
+            random: false,
+            self_ref: false,
+        }
+        .supports_cumulative_upkeep_payment());
     }
 
     #[test]
