@@ -781,6 +781,12 @@ fn mode_carries_event_source_object(mode: &TriggerMode) -> bool {
             | TriggerMode::CycledOrDiscarded
             | TriggerMode::Milled
             | TriggerMode::MilledOnce
+            // CR 608.2k: A single-object zone-change trigger ("Whenever a
+            // nontoken Zombie you control enters") carries the entering/leaving
+            // object as the event source; "that creature" in the body refers to
+            // it (Necroduality, Mimic Vat class). The batched ChangesZoneAll
+            // mode is excluded — its event carries a set, not one object.
+            | TriggerMode::ChangesZone
     )
 }
 
@@ -792,10 +798,17 @@ fn mode_carries_event_source_object(mode: &TriggerMode) -> bool {
 /// object (e.g. `ChangeZone` operating on the just-discarded card). Other
 /// effect variants are left untouched.
 fn lift_parent_target_to_triggering_source(effect: &mut Effect) {
-    if let Effect::ChangeZone { target, .. } = effect {
-        if matches!(target, TargetFilter::ParentTarget) {
-            *target = TargetFilter::TriggeringSource;
-        }
+    // CR 608.2k: each variant carries a top-level `target` that, when the
+    // surface anaphor was "that <object>", refers to the event object.
+    let target = match effect {
+        Effect::ChangeZone { target, .. } => target,
+        // "create a token that's a copy of that creature" (Necroduality) — the
+        // copy source is the entering object, not the trigger's own source.
+        Effect::CopyTokenOf { target, .. } => target,
+        _ => return,
+    };
+    if matches!(target, TargetFilter::ParentTarget) {
+        *target = TargetFilter::TriggeringSource;
     }
 }
 
@@ -807,12 +820,39 @@ fn lift_parent_target_to_triggering_source(effect: &mut Effect) {
 /// Without the descent, the second link would silently bind to the trigger
 /// source object instead of the just-acted-on event object.
 fn lift_parent_target_to_triggering_source_in_ability(ability: &mut AbilityDefinition) {
-    lift_parent_target_to_triggering_source(ability.effect.as_mut());
-    let mut next = ability.sub_ability.as_deref_mut();
-    while let Some(child) = next {
-        lift_parent_target_to_triggering_source(child.effect.as_mut());
-        next = child.sub_ability.as_deref_mut();
+    // CR 608.2c + CR 608.2k: Stop the descent as soon as a link introduces a
+    // player-*chosen* object target. A later `ParentTarget` then refers to
+    // *that* choice, not the trigger event — the enters-flicker class
+    // ("exile target permanent, then return that card": Felidar Guardian,
+    // Restoration Angel) keeps its sub-ability bound to the chosen permanent.
+    // Necroduality (top-level `CopyTokenOf` with no prior choice) and Tergrid
+    // ("put that card …, then create a token") still lift correctly.
+    let mut node = Some(ability);
+    while let Some(link) = node {
+        if introduces_chosen_object_target(link.effect.as_ref()) {
+            break;
+        }
+        lift_parent_target_to_triggering_source(link.effect.as_mut());
+        node = link.sub_ability.as_deref_mut();
     }
+}
+
+/// CR 608.2c: Does this effect introduce a freshly *chosen* object target — one
+/// that a subsequent "that <object>" (`ParentTarget`) anaphor binds to, rather
+/// than the trigger event? True for player-selected object filters (`Typed`,
+/// and `Or`/`And` combinations of them); false for anaphoric/contextual refs
+/// (`ParentTarget`, `TriggeringSource`, `SelfRef`, …) and untargeted effects.
+fn introduces_chosen_object_target(effect: &Effect) -> bool {
+    fn is_chosen(filter: &TargetFilter) -> bool {
+        match filter {
+            TargetFilter::Typed(_) => true,
+            TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+                filters.iter().any(is_chosen)
+            }
+            _ => false,
+        }
+    }
+    effect.target_filter().is_some_and(is_chosen)
 }
 
 /// Thin wrapper: parse trigger line through IR production + lowering.
@@ -9673,6 +9713,63 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn necroduality_copies_entering_zombie_not_source() {
+        // CR 608.2k: "Whenever a nontoken Zombie you control enters, create a
+        // token that's a copy of that creature." "That creature" is the
+        // entering Zombie (the event source), NOT Necroduality itself. The
+        // untargeted ChangesZone trigger lifts CopyTokenOf's ParentTarget to
+        // TriggeringSource. (#596)
+        let def = parse_trigger_line(
+            "Whenever a nontoken Zombie you control enters, create a token that's a copy of that creature.",
+            "Necroduality",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        let exec = def.execute.as_ref().expect("execute must be Some");
+        match &*exec.effect {
+            Effect::CopyTokenOf { target, .. } => {
+                assert_eq!(
+                    *target,
+                    TargetFilter::TriggeringSource,
+                    "copy source must be the entering Zombie, not the trigger's own source"
+                );
+            }
+            other => panic!("expected Effect::CopyTokenOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flicker_enters_trigger_keeps_chosen_target_anaphor() {
+        // CR 608.2c: "When ~ enters, you may exile another target permanent you
+        // control, then return that card …" — "that card" refers to the CHOSEN
+        // exiled permanent (ParentTarget), NOT the trigger event. The enters
+        // event-source lift must STOP at the first chosen target so the
+        // sub-ability stays ParentTarget (regression guard for #596 — Felidar
+        // Guardian / Restoration Angel flicker class).
+        let def = parse_trigger_line(
+            "When this creature enters, you may exile another target permanent you control, then return that card to the battlefield under your control.",
+            "Felidar Guardian",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        let exec = def.execute.as_ref().expect("execute must be Some");
+        // Top link targets the chosen permanent.
+        assert!(
+            matches!(exec.effect.target_filter(), Some(TargetFilter::Typed(_))),
+            "top-level exile must keep its chosen Typed target, got {:?}",
+            exec.effect.target_filter()
+        );
+        // Sub-ability "that card" must remain ParentTarget, not be lifted.
+        let sub = exec
+            .sub_ability
+            .as_ref()
+            .expect("flicker chains to a return");
+        assert_eq!(
+            sub.effect.target_filter(),
+            Some(&TargetFilter::ParentTarget),
+            "return-that-card must bind to the chosen permanent (ParentTarget), not TriggeringSource"
+        );
     }
 
     #[test]
