@@ -1,9 +1,9 @@
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, ChoiceValue, CostPaidObjectSnapshot, Effect, ManaProduction,
-    ResolvedAbility, TargetFilter,
+    AbilityCondition, AbilityCost, AbilityDefinition, ChoiceValue, CostPaidObjectSnapshot, Effect,
+    ManaProduction, ResolvedAbility, TargetFilter,
 };
 #[cfg(test)]
-use crate::types::counter::{CounterMatch, CounterType};
+use crate::types::counter::CounterMatch;
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
     GameState, ManaAbilityResume, ManaChoice, ManaChoiceContext, ManaChoicePrompt,
@@ -224,17 +224,19 @@ fn produce_mana_from_ability(
     // cost-paid object snapshot so quantity resolution sees it. Reused for
     // both production-count and sub-chain resolution paths so the same
     // snapshot is visible end-to-end.
-    let mut resolved_for_quantity =
-        super::ability_utils::build_resolved_from_def(ability_def, source_id, player);
-    if let Some(snapshot) = cost_paid_object {
-        resolved_for_quantity.set_cost_paid_object_recursive(snapshot);
-    }
+    let resolved_for_quantity = resolved_mana_ability_for_current_state(
+        state,
+        source_id,
+        player,
+        ability_def,
+        cost_paid_object,
+    );
 
     // CR 106.6: Resolve spend-restriction templates, grants, and expiry so they
     // attach to each produced `ManaUnit`. Dropping these here is the bug that
     // made Flamebraider's Elemental-only mana behave as unrestricted mana.
     let (produced_mana, restrictions, grants, expiry, source_could_produce_two_or_more_colors) =
-        match &*ability_def.effect {
+        match &resolved_for_quantity.effect {
             Effect::Mana {
                 produced,
                 restrictions,
@@ -308,7 +310,44 @@ fn produce_mana_from_ability(
     // effect chain (e.g. painlands' "This land deals 1 damage to you.")
     // resolves that chain inline — mana abilities don't use the stack, so
     // the sub-ability runs as part of the same atomic resolution.
-    resolve_mana_ability_sub_chain(state, source_id, player, ability_def, events);
+    resolve_mana_ability_sub_chain(state, &resolved_for_quantity, events);
+}
+
+fn resolved_mana_ability_for_current_state(
+    state: &GameState,
+    source_id: ObjectId,
+    player: PlayerId,
+    ability_def: &AbilityDefinition,
+    cost_paid_object: Option<CostPaidObjectSnapshot>,
+) -> ResolvedAbility {
+    let mut resolved =
+        super::ability_utils::build_resolved_from_def(ability_def, source_id, player);
+    if let Some(snapshot) = cost_paid_object {
+        resolved.set_cost_paid_object_recursive(snapshot);
+    }
+    apply_condition_instead_mana_swap(state, &resolved)
+}
+
+fn apply_condition_instead_mana_swap(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> ResolvedAbility {
+    let Some(sub) = ability.sub_ability.as_deref() else {
+        return ability.clone();
+    };
+    let Some(AbilityCondition::ConditionInstead { inner }) = sub.condition.as_ref() else {
+        return ability.clone();
+    };
+    if super::effects::evaluate_condition(inner, state, ability) {
+        if matches!(sub.effect, Effect::Mana { target: None, .. }) {
+            return super::ability_utils::apply_instead_swap(ability, sub);
+        }
+        return ability.clone();
+    }
+
+    let mut base = ability.clone();
+    base.sub_ability = sub.else_ability.clone();
+    base
 }
 
 fn resolve_single_color_override(
@@ -996,16 +1035,15 @@ fn advance_mana_ability_activation(
     }
 
     if pending.color_override.is_none() {
-        let mut resolved_for_prompt = super::ability_utils::build_resolved_from_def(
-            &ability_def,
+        let resolved_for_prompt = resolved_mana_ability_for_current_state(
+            state,
             pending.source_id,
             pending.player,
+            &ability_def,
+            pending.cost_paid_object.clone(),
         );
-        if let Some(snapshot) = pending.cost_paid_object.clone() {
-            resolved_for_prompt.set_cost_paid_object_recursive(snapshot);
-        }
         if let Some(choice) = mana_choice_prompt(
-            &ability_def.effect,
+            &resolved_for_prompt.effect,
             state,
             pending.source_id,
             Some(&resolved_for_prompt),
@@ -1163,16 +1201,18 @@ fn resolve_mana_ability_with_selected_choices(
     // CR 117.1 + CR 202.3: Build a transient `ResolvedAbility` carrying the
     // cost-paid object snapshot so production-count resolution sees it
     // (Food Chain class).
-    let mut resolved_for_quantity =
-        super::ability_utils::build_resolved_from_def(ability_def, source_id, player);
-    if let Some(snapshot) = cost_paid_object {
-        resolved_for_quantity.set_cost_paid_object_recursive(snapshot);
-    }
+    let resolved_for_quantity = resolved_mana_ability_for_current_state(
+        state,
+        source_id,
+        player,
+        ability_def,
+        cost_paid_object,
+    );
 
     // CR 106.6: Thread restrictions, grants, and expiry through the
     // selected-choices path too — otherwise color-picked or hybrid-paid mana
     // abilities would still emit unrestricted mana.
-    let (produced_mana, restrictions, grants, expiry) = match &*ability_def.effect {
+    let (produced_mana, restrictions, grants, expiry) = match &resolved_for_quantity.effect {
         Effect::Mana {
             produced,
             restrictions,
@@ -1229,7 +1269,7 @@ fn resolve_mana_ability_with_selected_choices(
 
     // CR 605.3b + CR 605.1a: Resolve the sub-ability chain inline (painlands'
     // "deals 1 damage to you", Llanowar Wastes-style self-damage, etc.).
-    resolve_mana_ability_sub_chain(state, source_id, player, ability_def, events);
+    resolve_mana_ability_sub_chain(state, &resolved_for_quantity, events);
 
     Ok(())
 }
@@ -1241,19 +1281,16 @@ fn resolve_mana_ability_with_selected_choices(
 /// controller, GainLife, etc.) route through the standard effect handlers.
 fn resolve_mana_ability_sub_chain(
     state: &mut GameState,
-    source_id: ObjectId,
-    player: PlayerId,
-    ability_def: &AbilityDefinition,
+    ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) {
-    let Some(sub_def) = ability_def.sub_ability.as_deref() else {
+    let Some(sub) = ability.sub_ability.as_deref() else {
         return;
     };
-    let resolved = super::ability_utils::build_resolved_from_def(sub_def, source_id, player);
     // Errors during the sub-chain are non-fatal — mana has already been
     // added to the pool and the cost has been paid. The damage/life clause
     // of a painland cannot legitimately fail in a well-formed game state.
-    let _ = super::effects::resolve_ability_chain(state, &resolved, events, 0);
+    let _ = super::effects::resolve_ability_chain(state, sub, events, 0);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2253,12 +2290,13 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityCondition, AbilityCost, AbilityKind, AbilityTag, ActivationRestriction,
+        AbilityCondition, AbilityCost, AbilityKind, AbilityTag, ActivationRestriction, Comparator,
         ContinuousModification, ControllerRef, DevotionColors, Duration, Effect, LinkedExileScope,
-        ManaContribution, ManaProduction, MultiTargetSpec, PlayerScope, QuantityExpr, QuantityRef,
-        StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
+        ManaContribution, ManaProduction, MultiTargetSpec, ObjectScope, PlayerScope, QuantityExpr,
+        QuantityRef, StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
+    use crate::types::counter::CounterType;
     use crate::types::game_state::{ExileLink, ExileLinkKind};
     use crate::types::identifiers::CardId;
     use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
@@ -2278,6 +2316,41 @@ mod tests {
             },
         )
         .cost(AbilityCost::Tap)
+    }
+
+    fn gemstone_caverns_mana_ability() -> AbilityDefinition {
+        let replacement = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Mana {
+                produced: ManaProduction::AnyOneColor {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    color_options: ManaColor::ALL.to_vec(),
+                    contribution: ManaContribution::Base,
+                },
+                restrictions: vec![],
+                grants: vec![],
+                expiry: None,
+                target: None,
+            },
+        )
+        .condition(AbilityCondition::ConditionInstead {
+            inner: Box::new(AbilityCondition::QuantityCheck {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::CountersOn {
+                        scope: ObjectScope::Source,
+                        counter_type: Some(CounterType::Generic("luck".to_string())),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            }),
+        });
+
+        let mut ability = make_mana_ability(ManaProduction::Colorless {
+            count: QuantityExpr::Fixed { value: 1 },
+        });
+        ability.sub_ability = Some(Box::new(replacement));
+        ability
     }
 
     use crate::game::test_fixtures::brushland_colored_ability;
@@ -2377,6 +2450,116 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, GameEvent::ManaAdded { .. })));
+    }
+
+    #[test]
+    fn condition_instead_mana_ability_without_counter_produces_base_mana() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Gemstone Caverns".to_string(),
+            Zone::Battlefield,
+        );
+        let ability = gemstone_caverns_mana_ability();
+        Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(ability.clone());
+
+        let mut events = Vec::new();
+        let waiting = activate_mana_ability(
+            &mut state,
+            source,
+            PlayerId(0),
+            0,
+            &ability,
+            &mut events,
+            ManaAbilityResume::Priority,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            waiting,
+            WaitingFor::Priority {
+                player: PlayerId(0)
+            }
+        );
+        assert_eq!(
+            state.players[0].mana_pool.count_color(ManaType::Colorless),
+            1
+        );
+        assert_eq!(state.players[0].mana_pool.total(), 1);
+        assert!(state.objects.get(&source).unwrap().tapped);
+    }
+
+    #[test]
+    fn condition_instead_mana_ability_with_luck_counter_prompts_for_any_color() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Gemstone Caverns".to_string(),
+            Zone::Battlefield,
+        );
+        let ability = gemstone_caverns_mana_ability();
+        let obj = state.objects.get_mut(&source).unwrap();
+        obj.counters
+            .insert(CounterType::Generic("luck".to_string()), 1);
+        Arc::make_mut(&mut obj.abilities).push(ability.clone());
+
+        let mut events = Vec::new();
+        let waiting = activate_mana_ability(
+            &mut state,
+            source,
+            PlayerId(0),
+            0,
+            &ability,
+            &mut events,
+            ManaAbilityResume::Priority,
+            None,
+        )
+        .unwrap();
+
+        let WaitingFor::ChooseManaColor {
+            player,
+            choice: ManaChoicePrompt::SingleColor { options },
+            context,
+        } = waiting
+        else {
+            panic!("expected ChooseManaColor, got {waiting:?}");
+        };
+        assert_eq!(player, PlayerId(0));
+        assert_eq!(
+            options,
+            vec![
+                ManaType::White,
+                ManaType::Blue,
+                ManaType::Black,
+                ManaType::Red,
+                ManaType::Green,
+            ]
+        );
+
+        let pending = expect_mana_ability_context(context);
+        handle_choose_mana_color(
+            &mut state,
+            &pending,
+            &ManaChoicePrompt::SingleColor {
+                options: options.clone(),
+            },
+            ManaChoice::SingleColor(ManaType::Blue),
+            &mut events,
+        )
+        .unwrap();
+
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Blue), 1);
+        assert_eq!(
+            state.players[0].mana_pool.count_color(ManaType::Colorless),
+            0
+        );
+        assert_eq!(state.players[0].mana_pool.total(), 1);
+        assert!(state.objects.get(&source).unwrap().tapped);
     }
 
     #[test]

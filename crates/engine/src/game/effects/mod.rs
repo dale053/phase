@@ -3483,7 +3483,7 @@ fn resolve_chain_body(
 /// Returns whether the condition is met. Handles all `AbilityCondition` variants as
 /// pure boolean evaluators — callers are responsible for any terminal control flow
 /// (e.g., "Instead" overrides that early-return in the sub-ability context).
-fn evaluate_condition(
+pub(crate) fn evaluate_condition(
     condition: &AbilityCondition,
     state: &GameState,
     ability: &ResolvedAbility,
