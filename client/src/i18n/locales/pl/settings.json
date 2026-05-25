@@ -120,7 +120,17 @@
     "slowest": "Najwolniej",
     "resetSliderLabel": "Zresetuj {{label}} do wartości domyślnej",
     "atDefault": "Wartość domyślna",
-    "resetToDefault": "Zresetuj do wartości domyślnej"
+    "resetToDefault": "Zresetuj do wartości domyślnej",
+    "labels": {
+      "effects": "Tempo efektów",
+      "combat": "Tempo walki",
+      "banners": "Tempo banerów"
+    },
+    "descriptions": {
+      "effects": "Rzucanie czarów, zmiany stref, śmierci, zmiany życia, znaczniki, obracanie/odwracanie.",
+      "combat": "Czas obrażeń bojowych — jak długo blokujący i atakujący pozostają, zanim obrażenia zostaną rozpatrzone.",
+      "banners": "Wyświetlanie banera na początku tury."
+    }
   },
   "artChain": {
     "emptyState": "Używanie domyślnej grafiki Scryfall. Dodaj reguły poniżej, aby dostosować.",

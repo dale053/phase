@@ -15,8 +15,6 @@ import {
   ANIMATION_SPEED_STEP,
   PACING_CATEGORIES,
   PACING_DEFAULT,
-  PACING_DESCRIPTIONS,
-  PACING_LABELS,
   PACING_MAX,
   PACING_MIN,
   PACING_STEP,
@@ -878,8 +876,8 @@ function PacingSection({
         {PACING_CATEGORIES.map((category) => (
           <MultiplierSlider
             key={category}
-            label={PACING_LABELS[category]}
-            description={PACING_DESCRIPTIONS[category]}
+            label={t(`pacing.labels.${category}`)}
+            description={t(`pacing.descriptions.${category}`)}
             value={PACING_MAX - pacingMultipliers[category]}
             defaultValue={PACING_MAX - PACING_DEFAULT}
             min={PACING_MIN}
