@@ -91,12 +91,24 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
             HashSet::new()
         };
 
+    // Sandbox debug exposure: a viewer who holds debug permission in a sandbox
+    // game (CR is silent; this is an out-of-game capability) sees the names of
+    // cards in their *own* library, so the debug "move card from library to
+    // hand" picker can identify a specific card. Opponents' libraries remain
+    // hidden — sandbox is shared, but reading an opponent's deck is not. The
+    // FE's debug picker alphabetizes within each zone bucket, so exposing names
+    // does not leak draw order. The actual `library` Vec order on the wire is
+    // left untouched (preserving simulate-mode draw semantics) but is never
+    // surfaced as draw order anywhere the viewer can observe it.
+    let sandbox_self_library_visible =
+        state.format_config.allow_debug_actions && state.debug_permitted.contains(&viewer);
     let all_library_ids: Vec<ObjectId> = filtered
         .players
         .iter()
         .flat_map(|p| p.library.iter().copied())
         .collect();
     for obj_id in all_library_ids {
+        let owner = state.objects.get(&obj_id).map(|o| o.owner);
         let visible = manifest_dread_visible.contains(&obj_id)
             || dig_visible.contains(&obj_id)
             || search_visible.contains(&obj_id)
@@ -105,7 +117,8 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
             // public during DigChoice. For private digs ("look at"), revealed_cards won't
             // contain dig cards, so the exclusion still applies.
             || (state.revealed_cards.contains(&obj_id)
-                && !manifest_dread_cards.contains(&obj_id));
+                && !manifest_dread_cards.contains(&obj_id))
+            || (sandbox_self_library_visible && owner == Some(viewer));
         if !visible
             && !effect_zone_hand_cards.contains(&obj_id)
             && !drawn_choice_hand_cards.contains(&obj_id)
@@ -641,6 +654,68 @@ mod tests {
         assert_eq!(
             filtered.objects.get(&card_id).map(|obj| obj.name.as_str()),
             Some("Hidden Card")
+        );
+    }
+
+    /// Sandbox debug exposure: a viewer with debug permission in a sandbox
+    /// game sees their own library card names (so the debug "move from
+    /// library to hand" picker can identify a specific card). Opponents'
+    /// libraries stay hidden — sandbox is a shared playground for your own
+    /// materials, not an opponent-deck-leak. The FE alphabetizes the picker
+    /// within each zone, so name exposure alone leaks no draw order.
+    #[test]
+    fn sandbox_debug_permitted_sees_own_library_but_not_opponent_library() {
+        let mut state = GameState::new(FormatConfig::standard().with_sandbox(), 2, 42);
+        state.debug_permitted.insert(PlayerId(0));
+        state.debug_permitted.insert(PlayerId(1));
+        let own = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "My Library Card".to_string(),
+            Zone::Library,
+        );
+        let opp = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Opponent Library Card".to_string(),
+            Zone::Library,
+        );
+
+        let filtered = filter_state_for_viewer(&state, PlayerId(0));
+        assert_eq!(
+            filtered.objects.get(&own).map(|obj| obj.name.as_str()),
+            Some("My Library Card"),
+            "viewer must see their own library names in sandbox+permitted"
+        );
+        assert_eq!(
+            filtered.objects.get(&opp).map(|obj| obj.name.as_str()),
+            Some("Hidden Card"),
+            "opponent's library stays hidden even in sandbox"
+        );
+    }
+
+    /// Without the sandbox capability, debug permission alone must not
+    /// expose the library — defense in depth against accidentally leaving
+    /// `debug_permitted` populated in a non-sandbox game.
+    #[test]
+    fn non_sandbox_keeps_own_library_hidden_even_when_debug_permitted() {
+        let mut state = GameState::new(FormatConfig::standard(), 2, 42);
+        state.debug_permitted.insert(PlayerId(0));
+        let own = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "My Library Card".to_string(),
+            Zone::Library,
+        );
+
+        let filtered = filter_state_for_viewer(&state, PlayerId(0));
+        assert_eq!(
+            filtered.objects.get(&own).map(|obj| obj.name.as_str()),
+            Some("Hidden Card"),
+            "non-sandbox must keep library hidden regardless of debug_permitted"
         );
     }
 
