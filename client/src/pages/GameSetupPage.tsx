@@ -480,7 +480,7 @@ export function GameSetupPage() {
                   tone: "emerald",
                   size: "lg",
                   disabled: cannotStartAi,
-                  className: "w-full",
+                  className: "w-full whitespace-nowrap px-6",
                 })}
               >
                 {playerCount > 2
