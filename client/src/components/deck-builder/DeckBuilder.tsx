@@ -401,8 +401,10 @@ export function DeckBuilder({
                       cardDataCache={cardDataCache}
                       onAddCard={handleAddCardByName}
                       onRemoveCard={handleRemoveCard}
+                      onMoveCard={handleMoveCard}
                       onRemoveCommander={handleRemoveCommander}
                       onCardHover={onCardHover}
+                      format={format}
                     />
                   )}
                 </div>
