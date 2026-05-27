@@ -1805,6 +1805,22 @@ fn is_default_shared_quality_relation(value: &SharedQualityRelation) -> bool {
     matches!(value, SharedQualityRelation::Shares)
 }
 
+/// Combat relationship required by `FilterProp::CombatRelation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CombatRelation {
+    /// CR 509.1g/509.1h: Candidate is blocking the subject or is blocked by it.
+    BlockingOrBlockedBy,
+}
+
+/// Context object for a combat relationship filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CombatRelationSubject {
+    /// The source object of the resolving spell or ability.
+    Source,
+    /// The first selected object target of the resolving spell or ability.
+    ParentTarget,
+}
+
 /// Individual filter properties that can be combined in a Typed filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -1819,6 +1835,12 @@ pub enum FilterProp {
     /// CR 509.1g: Matches creatures currently blocking the filter source.
     /// Used for "creature(s) blocking it" source-relative quantities and filters.
     BlockingSource,
+    /// CR 509.1g/509.1h: Matches creatures in a combat relationship with a
+    /// source or selected parent target.
+    CombatRelation {
+        relation: CombatRelation,
+        subject: CombatRelationSubject,
+    },
     /// CR 509.1h: Matches attacking creatures with no blockers assigned.
     Unblocked,
     Tapped,
@@ -12282,6 +12304,10 @@ mod tests {
             FilterProp::AttackingController,
             FilterProp::Blocking,
             FilterProp::BlockingSource,
+            FilterProp::CombatRelation {
+                relation: CombatRelation::BlockingOrBlockedBy,
+                subject: CombatRelationSubject::ParentTarget,
+            },
             FilterProp::Unblocked,
             FilterProp::Tapped,
             FilterProp::Untapped,

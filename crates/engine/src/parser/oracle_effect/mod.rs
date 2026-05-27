@@ -17810,11 +17810,12 @@ fn extract_effect_verb(effect: &Effect) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        AbilityCondition, CardTypeSetSource, CastVariantPaid, ChoiceType, Comparator,
-        ContinuousModification, ControllerRef, CopyRetargetPermission, CountScope, DoublePTMode,
-        Duration, FilterProp, GainLifePlayer, LibraryPosition, LinkedExileScope, ManaContribution,
-        ManaProduction, ObjectScope, PaymentCost, PermissionGrantee, QuantityExpr, QuantityRef,
-        SearchSelectionConstraint, TypeFilter, ZoneRef,
+        AbilityCondition, CardTypeSetSource, CastVariantPaid, ChoiceType, CombatRelation,
+        CombatRelationSubject, Comparator, ContinuousModification, ControllerRef,
+        CopyRetargetPermission, CountScope, DoublePTMode, Duration, FilterProp, GainLifePlayer,
+        LibraryPosition, LinkedExileScope, ManaContribution, ManaProduction, ObjectScope,
+        PaymentCost, PermissionGrantee, QuantityExpr, QuantityRef, SearchSelectionConstraint,
+        TypeFilter, ZoneRef,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
@@ -21250,6 +21251,29 @@ mod tests {
                 assert!(filter.controller.is_none(), "no controller scoping");
             }
             other => panic!("expected BounceAll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effect_bounce_all_creatures_blocking_or_blocked_by_target_creature() {
+        let e = parse_effect(
+            "Return all creatures blocking or blocked by target creature to their owner's hand",
+        );
+        match e {
+            Effect::BounceAll {
+                target: TargetFilter::Typed(filter),
+                ..
+            } => {
+                assert_eq!(filter.type_filters, vec![TypeFilter::Creature]);
+                assert_eq!(
+                    filter.properties,
+                    vec![FilterProp::CombatRelation {
+                        relation: CombatRelation::BlockingOrBlockedBy,
+                        subject: CombatRelationSubject::ParentTarget,
+                    }]
+                );
+            }
+            other => panic!("expected combat-relation BounceAll, got {other:?}"),
         }
     }
 

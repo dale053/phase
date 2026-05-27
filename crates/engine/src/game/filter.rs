@@ -11,9 +11,9 @@ use crate::game::quantity::{
     counter_count_from_map, resolve_quantity, resolve_quantity_with_targets,
 };
 use crate::types::ability::{
-    ChoiceValue, ChosenAttribute, ControllerRef, FilterProp, PtStat, PtValueScope, QuantityExpr,
-    ResolvedAbility, SharedQuality, SharedQualityRelation, TargetFilter, TargetRef, TypeFilter,
-    TypedFilter,
+    ChoiceValue, ChosenAttribute, CombatRelation, CombatRelationSubject, ControllerRef, FilterProp,
+    PtStat, PtValueScope, QuantityExpr, ResolvedAbility, SharedQuality, SharedQualityRelation,
+    TargetFilter, TargetRef, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterMatch;
@@ -1622,6 +1622,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::AttackingController
         | FilterProp::Blocking
         | FilterProp::BlockingSource
+        | FilterProp::CombatRelation { .. }
         | FilterProp::Unblocked
         | FilterProp::Tapped
         | FilterProp::Untapped
@@ -1718,14 +1719,53 @@ struct SourceContext<'a> {
 /// or `state.lki_cache`.
 fn parent_target_name(state: &GameState, ability: Option<&ResolvedAbility>) -> Option<String> {
     let ability = ability?;
-    let id = ability.targets.iter().find_map(|t| match t {
-        crate::types::ability::TargetRef::Object(id) => Some(*id),
-        crate::types::ability::TargetRef::Player(_) => None,
-    })?;
+    let id = first_object_target(ability)?;
     if let Some(obj) = state.objects.get(&id) {
         return Some(obj.name.clone());
     }
     state.lki_cache.get(&id).map(|lki| lki.name.clone())
+}
+
+fn first_object_target(ability: &ResolvedAbility) -> Option<ObjectId> {
+    ability.targets.iter().find_map(|target| match target {
+        TargetRef::Object(id) => Some(*id),
+        TargetRef::Player(_) => None,
+    })
+}
+
+fn combat_relation_subject_id(
+    subject: CombatRelationSubject,
+    source: &SourceContext<'_>,
+) -> Option<ObjectId> {
+    match subject {
+        CombatRelationSubject::Source => Some(source.id),
+        CombatRelationSubject::ParentTarget => source.ability.and_then(first_object_target),
+    }
+}
+
+fn matches_combat_relation(
+    state: &GameState,
+    object_id: ObjectId,
+    relation: CombatRelation,
+    subject: CombatRelationSubject,
+    source: &SourceContext<'_>,
+) -> bool {
+    let Some(subject_id) = combat_relation_subject_id(subject, source) else {
+        return false;
+    };
+    match relation {
+        CombatRelation::BlockingOrBlockedBy => state.combat.as_ref().is_some_and(|combat| {
+            let candidate_blocks_subject = combat
+                .blocker_to_attacker
+                .get(&object_id)
+                .is_some_and(|attackers| attackers.contains(&subject_id));
+            let subject_blocks_candidate = combat
+                .blocker_to_attacker
+                .get(&subject_id)
+                .is_some_and(|attackers| attackers.contains(&object_id));
+            candidate_blocks_subject || subject_blocks_candidate
+        }),
+    }
 }
 
 fn referenced_targets_for_filter<'a>(
@@ -1856,6 +1896,9 @@ fn matches_filter_prop(
                 .get(&object_id)
                 .is_some_and(|attackers| attackers.contains(&source.id))
         }),
+        FilterProp::CombatRelation { relation, subject } => {
+            matches_combat_relation(state, object_id, *relation, *subject, source)
+        }
         // CR 509.1h: Unblocked = attacking creature that was never assigned blockers.
         // unblocked_attackers checks the permanent `blocked` flag, not the current blocker list.
         FilterProp::Unblocked => combat::unblocked_attackers(state).contains(&object_id),
@@ -2567,7 +2610,7 @@ fn zone_change_record_matches_property(
         FilterProp::Blocking => record.combat_status.blocking,
         // `ZoneChangeCombatStatus` snapshots role, not the blocker-to-attacker
         // relation. Source-relative blocker checks require live combat state.
-        FilterProp::BlockingSource => false,
+        FilterProp::BlockingSource | FilterProp::CombatRelation { .. } => false,
         FilterProp::Unblocked => {
             record.combat_status.attacking && !record.combat_status.blocked
         }
@@ -4185,6 +4228,64 @@ mod tests {
             other_blocker,
             &filter,
             attacker,
+        ));
+    }
+
+    #[test]
+    fn combat_relation_matches_creatures_blocking_or_blocked_by_parent_target() {
+        use crate::game::combat::{AttackerInfo, CombatState};
+
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Source");
+        let target_attacker = add_creature(&mut state, PlayerId(0), "Target Attacker");
+        let target_blocker = add_creature(&mut state, PlayerId(1), "Target Blocker");
+        let unrelated_attacker = add_creature(&mut state, PlayerId(0), "Unrelated Attacker");
+        let unrelated_blocker = add_creature(&mut state, PlayerId(1), "Unrelated Blocker");
+        state.combat = Some(CombatState {
+            attackers: vec![
+                AttackerInfo::attacking_player(target_attacker, PlayerId(1)),
+                AttackerInfo::attacking_player(unrelated_attacker, PlayerId(1)),
+            ],
+            blocker_assignments: [
+                (target_attacker, vec![target_blocker]),
+                (unrelated_attacker, vec![unrelated_blocker]),
+            ]
+            .into(),
+            blocker_to_attacker: [
+                (target_blocker, vec![target_attacker]),
+                (unrelated_blocker, vec![unrelated_attacker]),
+            ]
+            .into(),
+            ..CombatState::default()
+        });
+        let ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 0 },
+                target: TargetFilter::Controller,
+            },
+            vec![TargetRef::Object(target_attacker)],
+            source,
+            PlayerId(0),
+        );
+        let ctx = FilterContext::from_ability(&ability);
+        let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::CombatRelation {
+                relation: CombatRelation::BlockingOrBlockedBy,
+                subject: CombatRelationSubject::ParentTarget,
+            },
+        ]));
+
+        assert!(crate::game::filter::matches_target_filter(
+            &state,
+            target_blocker,
+            &filter,
+            &ctx
+        ));
+        assert!(!crate::game::filter::matches_target_filter(
+            &state,
+            unrelated_blocker,
+            &filter,
+            &ctx
         ));
     }
 

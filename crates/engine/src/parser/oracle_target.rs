@@ -7,9 +7,10 @@ use nom::multi::many0;
 use nom::Parser;
 
 use crate::types::ability::{
-    AggregateFunction, AttachmentKind, Comparator, ControllerRef, FilterProp, ObjectProperty,
-    ObjectScope, QuantityExpr, QuantityRef, SharedQuality, SharedQualityRelation, TargetFilter,
-    TargetSelectionMode, TypeFilter, TypedFilter,
+    AggregateFunction, AttachmentKind, CombatRelation, CombatRelationSubject, Comparator,
+    ControllerRef, FilterProp, ObjectProperty, ObjectScope, QuantityExpr, QuantityRef,
+    SharedQuality, SharedQualityRelation, TargetFilter, TargetSelectionMode, TypeFilter,
+    TypedFilter,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
@@ -1555,6 +1556,11 @@ pub fn parse_type_phrase_with_ctx<'a>(
         pos += consumed;
     }
 
+    if let Some((prop, consumed)) = parse_combat_relation_suffix(&lower[pos..]) {
+        properties.push(prop);
+        pos += consumed;
+    }
+
     // CR 205.3a: Comma-separated type lists ("artifacts, creatures, and lands") are
     // syntactic sugar for set-union, same as "and" between two types.
     let rest_lower = lower[pos..].trim_start();
@@ -2354,6 +2360,22 @@ fn parse_token_suffix(text: &str) -> Option<usize> {
     }
 
     None
+}
+
+fn parse_combat_relation_suffix(text: &str) -> Option<(FilterProp, usize)> {
+    let (rest, _) = (
+        tag::<_, _, OracleError<'_>>(" blocking or blocked by target "),
+        tag("creature"),
+    )
+        .parse(text)
+        .ok()?;
+    Some((
+        FilterProp::CombatRelation {
+            relation: CombatRelation::BlockingOrBlockedBy,
+            subject: CombatRelationSubject::ParentTarget,
+        },
+        text.len() - rest.len(),
+    ))
 }
 
 /// Parse a color adjective prefix: "white ", "blue ", "black ", "red ", "green ".
@@ -4443,6 +4465,21 @@ mod tests {
     fn target_creature() {
         let (f, _) = parse_target("target creature");
         assert_eq!(f, TargetFilter::Typed(TypedFilter::creature()));
+    }
+
+    #[test]
+    fn creatures_blocking_or_blocked_by_target_creature() {
+        let (filter, rest) = parse_target("creatures blocking or blocked by target creature");
+        assert_eq!(rest, "");
+        assert_eq!(
+            filter,
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                FilterProp::CombatRelation {
+                    relation: CombatRelation::BlockingOrBlockedBy,
+                    subject: CombatRelationSubject::ParentTarget,
+                }
+            ]))
+        );
     }
 
     #[test]

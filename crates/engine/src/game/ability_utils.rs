@@ -1,9 +1,9 @@
 use crate::types::ability::{
-    AbilityCondition, AbilityDefinition, CardTypeSetSource, CastManaSpentMetric, ControllerRef,
-    Effect, FilterProp, GameRestriction, ModalChoice, ModalSelectionCondition,
-    ModalSelectionConstraint, ObjectScope, PlayerFilter, QuantityExpr, QuantityRef,
-    ResolvedAbility, RestrictionPlayerScope, SpellContext, TargetChoiceTiming, TargetFilter,
-    TargetRef, TypeFilter, TypedFilter,
+    AbilityCondition, AbilityDefinition, CardTypeSetSource, CastManaSpentMetric,
+    CombatRelationSubject, ControllerRef, Effect, FilterProp, GameRestriction, ModalChoice,
+    ModalSelectionCondition, ModalSelectionConstraint, ObjectScope, PlayerFilter, QuantityExpr,
+    QuantityRef, ResolvedAbility, RestrictionPlayerScope, SpellContext, TargetChoiceTiming,
+    TargetFilter, TargetRef, TypeFilter, TypedFilter,
 };
 #[cfg(test)]
 use crate::types::counter::CounterType;
@@ -1122,6 +1122,21 @@ fn collect_target_slots(
             });
         }
         if ability.target_choice_timing == TargetChoiceTiming::Stack
+            && effect_needs_parent_target_combat_relation_slot(&ability.effect)
+        {
+            let filter = parent_target_combat_relation_slot_filter();
+            let legal_targets = legal_targets_for_ability_filter(state, ability, &filter, slots);
+            if legal_targets.is_empty() && !ability.optional_targeting {
+                return Err(EngineError::ActionNotAllowed(
+                    "No legal targets available".to_string(),
+                ));
+            }
+            slots.push(TargetSelectionSlot {
+                legal_targets,
+                optional: ability.optional_targeting,
+            });
+        }
+        if ability.target_choice_timing == TargetChoiceTiming::Stack
             && !effect_target_filter_references_chosen_player(&ability.effect)
         {
             if let Some(filter) = triggers::extract_target_filter_from_effect(&ability.effect) {
@@ -1496,9 +1511,63 @@ fn target_creature_quantity_slot_filter() -> TargetFilter {
     TargetFilter::Typed(TypedFilter::creature())
 }
 
+fn parent_target_combat_relation_slot_filter() -> TargetFilter {
+    TargetFilter::Typed(TypedFilter::creature())
+}
+
+fn effect_needs_parent_target_combat_relation_slot(effect: &Effect) -> bool {
+    effect_references_parent_target_combat_relation(effect)
+}
+
 fn effect_needs_target_creature_quantity_slot(effect: &Effect) -> bool {
     effect_references_target_creature_quantity(effect)
         && !effect_primary_target_supplies_creature_target(effect)
+}
+
+fn effect_references_parent_target_combat_relation(effect: &Effect) -> bool {
+    if effect
+        .target_filter()
+        .is_some_and(filter_references_parent_target_combat_relation)
+    {
+        return true;
+    }
+
+    match effect {
+        Effect::DestroyAll { target, .. }
+        | Effect::PumpAll { target, .. }
+        | Effect::TapAll { target, .. }
+        | Effect::UntapAll { target, .. }
+        | Effect::BounceAll { target, .. }
+        | Effect::CounterAll { target, .. }
+        | Effect::ChangeZoneAll { target, .. }
+        | Effect::DoublePTAll { target, .. }
+        | Effect::DamageAll { target, .. }
+        | Effect::PutCounterAll { target, .. } => {
+            filter_references_parent_target_combat_relation(target)
+        }
+        _ => false,
+    }
+}
+
+fn filter_references_parent_target_combat_relation(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(TypedFilter { properties, .. }) => properties.iter().any(|prop| {
+            matches!(
+                prop,
+                FilterProp::CombatRelation {
+                    subject: CombatRelationSubject::ParentTarget,
+                    ..
+                }
+            )
+        }),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
+            .iter()
+            .any(filter_references_parent_target_combat_relation),
+        TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
+            filter_references_parent_target_combat_relation(filter)
+        }
+        _ => false,
+    }
 }
 
 fn effect_primary_target_supplies_creature_target(effect: &Effect) -> bool {
@@ -1753,6 +1822,14 @@ fn collect_target_slot_specs(
         {
             specs.push(TargetSlotSpec {
                 filter: target_creature_quantity_slot_filter(),
+                optional: ability.optional_targeting,
+            });
+        }
+        if ability.target_choice_timing == TargetChoiceTiming::Stack
+            && effect_needs_parent_target_combat_relation_slot(&ability.effect)
+        {
+            specs.push(TargetSlotSpec {
+                filter: parent_target_combat_relation_slot_filter(),
                 optional: ability.optional_targeting,
             });
         }
@@ -2916,6 +2993,18 @@ fn assign_targets_recursive(
         }
     }
     if ability.target_choice_timing == TargetChoiceTiming::Stack
+        && effect_needs_parent_target_combat_relation_slot(&ability.effect)
+    {
+        if let Some(target) = targets.get(*next_target) {
+            ability.targets.push(target.clone());
+            *next_target += 1;
+        } else if !ability.optional_targeting {
+            return Err(EngineError::InvalidAction(
+                "Missing required target".to_string(),
+            ));
+        }
+    }
+    if ability.target_choice_timing == TargetChoiceTiming::Stack
         && triggers::extract_target_filter_from_effect(&ability.effect).is_some()
     {
         if let Some(spec) = ability.multi_target.as_ref() {
@@ -3097,6 +3186,25 @@ fn assign_selected_slots_recursive(
     }
     if ability.target_choice_timing == TargetChoiceTiming::Stack
         && effect_needs_target_creature_quantity_slot(&ability.effect)
+    {
+        let Some(selected_slot) = selected_slots.get(*next_slot) else {
+            return Err(EngineError::InvalidAction(
+                "Missing target selection".to_string(),
+            ));
+        };
+        match selected_slot {
+            Some(target) => ability.targets.push(target.clone()),
+            None if ability.optional_targeting => {}
+            None => {
+                return Err(EngineError::InvalidAction(
+                    "Missing required target".to_string(),
+                ));
+            }
+        }
+        *next_slot += 1;
+    }
+    if ability.target_choice_timing == TargetChoiceTiming::Stack
+        && effect_needs_parent_target_combat_relation_slot(&ability.effect)
     {
         let Some(selected_slot) = selected_slots.get(*next_slot) else {
             return Err(EngineError::InvalidAction(
@@ -3316,6 +3424,11 @@ fn chain_has_target_sink(ability: &ResolvedAbility) -> bool {
         return true;
     }
     if ability.target_choice_timing == TargetChoiceTiming::Stack
+        && effect_needs_parent_target_combat_relation_slot(&ability.effect)
+    {
+        return true;
+    }
+    if ability.target_choice_timing == TargetChoiceTiming::Stack
         && triggers::extract_target_filter_from_effect(&ability.effect).is_some()
     {
         return true;
@@ -3388,6 +3501,15 @@ fn minimum_targets_in_chain(ability: &ResolvedAbility) -> usize {
     } else {
         0
     };
+    let parent_target_combat_relation_companion = if ability.target_choice_timing
+        == TargetChoiceTiming::Stack
+        && effect_needs_parent_target_combat_relation_slot(&ability.effect)
+        && !ability.optional_targeting
+    {
+        1
+    } else {
+        0
+    };
     let current = if matches!(
         &ability.effect,
         Effect::Attach { .. } | Effect::MoveCounters { .. }
@@ -3414,6 +3536,7 @@ fn minimum_targets_in_chain(ability: &ResolvedAbility) -> usize {
         + move_counter_targets
         + player_companion
         + target_creature_quantity_companion
+        + parent_target_combat_relation_companion
         + current;
 
     let rest = if defers_sub_ability_target_selection(&ability.effect) {
