@@ -3646,7 +3646,7 @@
     },
     "CoinFlipResult": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 9668,
+      "line": 9678,
       "doc": "CR 705.2: Typed result filter for coin-flip triggers.",
       "cr_refs": [
         "CR 705.2"
@@ -3654,7 +3654,7 @@
       "variants": [
         {
           "name": "Won",
-          "line": 9669,
+          "line": 9679,
           "kind": "unit",
           "field_names": [],
           "doc": "",
@@ -3662,7 +3662,7 @@
         },
         {
           "name": "Lost",
-          "line": 9670,
+          "line": 9680,
           "kind": "unit",
           "field_names": [],
           "doc": "",
@@ -3729,7 +3729,7 @@
     },
     "CombatDamageScope": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10159,
+      "line": 10178,
       "doc": "CR 614.1a: Restricts whether a damage replacement applies to combat, noncombat, or all damage.",
       "cr_refs": [
         "CR 614.1a"
@@ -3737,7 +3737,7 @@
       "variants": [
         {
           "name": "CombatOnly",
-          "line": 10160,
+          "line": 10179,
           "kind": "unit",
           "field_names": [],
           "doc": "",
@@ -3745,7 +3745,7 @@
         },
         {
           "name": "NoncombatOnly",
-          "line": 10161,
+          "line": 10180,
           "kind": "unit",
           "field_names": [],
           "doc": "",
@@ -3996,13 +3996,13 @@
     },
     "ContinuousModification": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10575,
+      "line": 10594,
       "doc": "What modification a continuous effect applies to an object. Each variant knows its own layer implicitly.",
       "cr_refs": [],
       "variants": [
         {
           "name": "CopyValues",
-          "line": 10576,
+          "line": 10595,
           "kind": "struct",
           "field_names": [
             "values",
@@ -4013,7 +4013,7 @@
         },
         {
           "name": "SetName",
-          "line": 10591,
+          "line": 10610,
           "kind": "struct",
           "field_names": [
             "name"
@@ -4027,7 +4027,7 @@
         },
         {
           "name": "AddPower",
-          "line": 10594,
+          "line": 10613,
           "kind": "struct",
           "field_names": [
             "value"
@@ -4037,7 +4037,7 @@
         },
         {
           "name": "AddToughness",
-          "line": 10597,
+          "line": 10616,
           "kind": "struct",
           "field_names": [
             "value"
@@ -4047,7 +4047,7 @@
         },
         {
           "name": "SetPower",
-          "line": 10600,
+          "line": 10619,
           "kind": "struct",
           "field_names": [
             "value"
@@ -4057,7 +4057,7 @@
         },
         {
           "name": "SetToughness",
-          "line": 10603,
+          "line": 10622,
           "kind": "struct",
           "field_names": [
             "value"
@@ -4067,7 +4067,7 @@
         },
         {
           "name": "AddKeyword",
-          "line": 10606,
+          "line": 10625,
           "kind": "struct",
           "field_names": [
             "keyword"
@@ -4077,7 +4077,7 @@
         },
         {
           "name": "RemoveKeyword",
-          "line": 10609,
+          "line": 10628,
           "kind": "struct",
           "field_names": [
             "keyword"
@@ -4087,7 +4087,7 @@
         },
         {
           "name": "GrantAbility",
-          "line": 10612,
+          "line": 10631,
           "kind": "struct",
           "field_names": [
             "definition"
@@ -4097,7 +4097,7 @@
         },
         {
           "name": "GrantTrigger",
-          "line": 10619,
+          "line": 10638,
           "kind": "struct",
           "field_names": [
             "trigger"
@@ -4109,7 +4109,7 @@
         },
         {
           "name": "RemoveAllAbilities",
-          "line": 10622,
+          "line": 10641,
           "kind": "unit",
           "field_names": [],
           "doc": "",
@@ -4117,7 +4117,7 @@
         },
         {
           "name": "AddType",
-          "line": 10623,
+          "line": 10642,
           "kind": "struct",
           "field_names": [
             "core_type"
@@ -4127,7 +4127,7 @@
         },
         {
           "name": "RemoveType",
-          "line": 10626,
+          "line": 10645,
           "kind": "struct",
           "field_names": [
             "core_type"
@@ -4137,7 +4137,7 @@
         },
         {
           "name": "AddSubtype",
-          "line": 10629,
+          "line": 10648,
           "kind": "struct",
           "field_names": [
             "subtype"
@@ -4147,7 +4147,7 @@
         },
         {
           "name": "RemoveSubtype",
-          "line": 10632,
+          "line": 10651,
           "kind": "struct",
           "field_names": [
             "subtype"
@@ -4157,7 +4157,7 @@
         },
         {
           "name": "SetCardTypes",
-          "line": 10639,
+          "line": 10658,
           "kind": "struct",
           "field_names": [
             "core_types"
@@ -4170,7 +4170,7 @@
         },
         {
           "name": "RemoveAllSubtypes",
-          "line": 10645,
+          "line": 10664,
           "kind": "struct",
           "field_names": [
             "set"
@@ -4183,7 +4183,7 @@
         },
         {
           "name": "SetDynamicPower",
-          "line": 10649,
+          "line": 10668,
           "kind": "struct",
           "field_names": [
             "value"
@@ -4193,7 +4193,7 @@
         },
         {
           "name": "SetDynamicToughness",
-          "line": 10653,
+          "line": 10672,
           "kind": "struct",
           "field_names": [
             "value"
@@ -4203,7 +4203,7 @@
         },
         {
           "name": "SetPowerDynamic",
-          "line": 10660,
+          "line": 10679,
           "kind": "struct",
           "field_names": [
             "value"
@@ -4215,7 +4215,7 @@
         },
         {
           "name": "SetToughnessDynamic",
-          "line": 10665,
+          "line": 10684,
           "kind": "struct",
           "field_names": [
             "value"
@@ -4227,7 +4227,7 @@
         },
         {
           "name": "AddDynamicPower",
-          "line": 10669,
+          "line": 10688,
           "kind": "struct",
           "field_names": [
             "value"
@@ -4239,7 +4239,7 @@
         },
         {
           "name": "AddDynamicToughness",
-          "line": 10673,
+          "line": 10692,
           "kind": "struct",
           "field_names": [
             "value"
@@ -4251,7 +4251,7 @@
         },
         {
           "name": "AddDynamicKeyword",
-          "line": 10678,
+          "line": 10697,
           "kind": "struct",
           "field_names": [
             "kind",
@@ -4264,7 +4264,7 @@
         },
         {
           "name": "AddAllCreatureTypes",
-          "line": 10684,
+          "line": 10703,
           "kind": "unit",
           "field_names": [],
           "doc": "Grants every creature type (Changeling CDA). Expanded at runtime using `GameState::all_creature_types`.",
@@ -4272,7 +4272,7 @@
         },
         {
           "name": "AddAllBasicLandTypes",
-          "line": 10687,
+          "line": 10706,
           "kind": "unit",
           "field_names": [],
           "doc": "CR 305.6 + CR 305.7: Adds all five basic land types in addition to existing types. Used by Prismatic Omen, Dryad of the Ilysian Grove.",
@@ -4283,7 +4283,7 @@
         },
         {
           "name": "AddChosenSubtype",
-          "line": 10690,
+          "line": 10709,
           "kind": "struct",
           "field_names": [
             "kind"
@@ -4293,7 +4293,7 @@
         },
         {
           "name": "AddChosenColor",
-          "line": 10695,
+          "line": 10714,
           "kind": "unit",
           "field_names": [],
           "doc": "CR 105.3: Set the object's color to the chosen color. Reads from `chosen_attributes` at layer evaluation time.",
@@ -4303,7 +4303,7 @@
         },
         {
           "name": "RemoveChosenKeyword",
-          "line": 10702,
+          "line": 10721,
           "kind": "unit",
           "field_names": [],
           "doc": "CR 608.2d + CR 613.1f: Strip the chosen keyword (read from the granting source's `chosen_attributes`) from the affected object. Mirrors `RemoveKeyword`'s discriminant-based stripping so parameterized keywords (e.g., `Landwalk(\"Swamp\")`) lose every variant sharing the same discriminant. Used by Urborg / Walking Sponge: \"target creature loses [chosen ability] until end of turn\".",
@@ -4314,7 +4314,7 @@
         },
         {
           "name": "SetColor",
-          "line": 10703,
+          "line": 10722,
           "kind": "struct",
           "field_names": [
             "colors"
@@ -4324,7 +4324,7 @@
         },
         {
           "name": "AddColor",
-          "line": 10706,
+          "line": 10725,
           "kind": "struct",
           "field_names": [
             "color"
@@ -4334,7 +4334,7 @@
         },
         {
           "name": "AddStaticMode",
-          "line": 10711,
+          "line": 10730,
           "kind": "struct",
           "field_names": [
             "mode"
@@ -4344,7 +4344,7 @@
         },
         {
           "name": "GrantStaticAbility",
-          "line": 10725,
+          "line": 10744,
           "kind": "struct",
           "field_names": [
             "definition"
@@ -4359,7 +4359,7 @@
         },
         {
           "name": "SwitchPowerToughness",
-          "line": 10729,
+          "line": 10748,
           "kind": "unit",
           "field_names": [],
           "doc": "CR 613.4d: Switch power and toughness. Applied in layer 7d.",
@@ -4369,7 +4369,7 @@
         },
         {
           "name": "AssignDamageFromToughness",
-          "line": 10732,
+          "line": 10751,
           "kind": "unit",
           "field_names": [],
           "doc": "CR 510.1c: This creature assigns combat damage equal to its toughness rather than its power.",
@@ -4379,7 +4379,7 @@
         },
         {
           "name": "AssignDamageAsThoughUnblocked",
-          "line": 10734,
+          "line": 10753,
           "kind": "unit",
           "field_names": [],
           "doc": "CR 510.1c: This creature assigns combat damage as though it weren't blocked.",
@@ -4389,7 +4389,7 @@
         },
         {
           "name": "AssignNoCombatDamage",
-          "line": 10736,
+          "line": 10755,
           "kind": "unit",
           "field_names": [],
           "doc": "CR 510.1a: This creature assigns no combat damage.",
@@ -4399,7 +4399,7 @@
         },
         {
           "name": "ChangeController",
-          "line": 10739,
+          "line": 10758,
           "kind": "unit",
           "field_names": [],
           "doc": "CR 613.2 (Layer 2): Change the controller of the affected object to the controller of the source permanent (e.g., Control Magic auras).",
@@ -4409,7 +4409,7 @@
         },
         {
           "name": "SetBasicLandType",
-          "line": 10742,
+          "line": 10761,
           "kind": "struct",
           "field_names": [
             "land_type"
@@ -4421,7 +4421,7 @@
         },
         {
           "name": "RetainPrintedTriggerFromSource",
-          "line": 10756,
+          "line": 10775,
           "kind": "struct",
           "field_names": [
             "source_trigger_index"
@@ -4433,7 +4433,7 @@
         },
         {
           "name": "AddSupertype",
-          "line": 10764,
+          "line": 10783,
           "kind": "struct",
           "field_names": [
             "supertype"
@@ -4448,7 +4448,7 @@
         },
         {
           "name": "RemoveSupertype",
-          "line": 10773,
+          "line": 10792,
           "kind": "struct",
           "field_names": [
             "supertype"
@@ -4463,7 +4463,7 @@
         },
         {
           "name": "AddCounterOnEnter",
-          "line": 10787,
+          "line": 10806,
           "kind": "struct",
           "field_names": [
             "counter_type",
@@ -5367,7 +5367,7 @@
     },
     "DamageModification": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10036,
+      "line": 10055,
       "doc": "CR 614.1a: Damage modification formula for replacement effects.",
       "cr_refs": [
         "CR 614.1a"
@@ -5375,7 +5375,7 @@
       "variants": [
         {
           "name": "Double",
-          "line": 10038,
+          "line": 10057,
           "kind": "unit",
           "field_names": [],
           "doc": "amount * 2 (e.g. Furnace of Rath)",
@@ -5383,7 +5383,7 @@
         },
         {
           "name": "Triple",
-          "line": 10040,
+          "line": 10059,
           "kind": "unit",
           "field_names": [],
           "doc": "amount * 3 (e.g. Fiery Emancipation)",
@@ -5391,7 +5391,7 @@
         },
         {
           "name": "Plus",
-          "line": 10042,
+          "line": 10061,
           "kind": "struct",
           "field_names": [
             "value"
@@ -5401,7 +5401,7 @@
         },
         {
           "name": "Minus",
-          "line": 10049,
+          "line": 10068,
           "kind": "struct",
           "field_names": [
             "value"
@@ -5414,7 +5414,7 @@
         },
         {
           "name": "SetToSourcePower",
-          "line": 10053,
+          "line": 10072,
           "kind": "unit",
           "field_names": [],
           "doc": "CR 614.1a: Conditional — if amount < source's power, set amount = source's power. References the replacement source's (not the damage source's) current post-layer power. Used by Ojer Axonil: \"deals damage equal to ~'s power instead.\"",
@@ -5424,7 +5424,7 @@
         },
         {
           "name": "SetTo",
-          "line": 10059,
+          "line": 10078,
           "kind": "struct",
           "field_names": [
             "value"
@@ -5436,7 +5436,7 @@
         },
         {
           "name": "LifeFloor",
-          "line": 10065,
+          "line": 10084,
           "kind": "struct",
           "field_names": [
             "minimum"
@@ -5516,7 +5516,7 @@
     },
     "DamageTargetFilter": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10147,
+      "line": 10166,
       "doc": "CR 614.1a: Restricts which damage targets a replacement applies to. Dedicated enum because `TargetRef` can be `Player` (not handled by `matches_target_filter`).",
       "cr_refs": [
         "CR 614.1a"
@@ -5524,7 +5524,7 @@
       "variants": [
         {
           "name": "CreatureOnly",
-          "line": 10149,
+          "line": 10168,
           "kind": "unit",
           "field_names": [],
           "doc": "\"to a creature\" / \"to that creature\"",
@@ -5532,7 +5532,7 @@
         },
         {
           "name": "Player",
-          "line": 10151,
+          "line": 10170,
           "kind": "struct",
           "field_names": [
             "player"
@@ -5542,7 +5542,7 @@
         },
         {
           "name": "PlayerOrPermanentsControlledBy",
-          "line": 10154,
+          "line": 10173,
           "kind": "struct",
           "field_names": [
             "player"
@@ -5555,7 +5555,7 @@
     },
     "DamageTargetPlayerScope": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10135,
+      "line": 10154,
       "doc": "CR 614.1a: Player axis for damage-recipient replacement filters.",
       "cr_refs": [
         "CR 614.1a"
@@ -5563,7 +5563,7 @@
       "variants": [
         {
           "name": "Any",
-          "line": 10136,
+          "line": 10155,
           "kind": "unit",
           "field_names": [],
           "doc": "",
@@ -5571,7 +5571,7 @@
         },
         {
           "name": "Opponent",
-          "line": 10137,
+          "line": 10156,
           "kind": "unit",
           "field_names": [],
           "doc": "",
@@ -5579,7 +5579,7 @@
         },
         {
           "name": "Controller",
-          "line": 10140,
+          "line": 10159,
           "kind": "unit",
           "field_names": [],
           "doc": "The controller of the replacement source. Used by Worship: \"damage that would reduce *your* life total to less than 1\".",
@@ -5587,7 +5587,7 @@
         },
         {
           "name": "Specific",
-          "line": 10141,
+          "line": 10160,
           "kind": "tuple",
           "field_names": [],
           "doc": "",
@@ -8471,13 +8471,13 @@
     },
     "EffectError": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 11216,
+      "line": 11235,
       "doc": "Error type for effect handler failures.",
       "cr_refs": [],
       "variants": [
         {
           "name": "MissingParam",
-          "line": 11218,
+          "line": 11237,
           "kind": "tuple",
           "field_names": [],
           "doc": "",
@@ -8485,7 +8485,7 @@
         },
         {
           "name": "InvalidParam",
-          "line": 11220,
+          "line": 11239,
           "kind": "tuple",
           "field_names": [],
           "doc": "",
@@ -8493,7 +8493,7 @@
         },
         {
           "name": "PlayerNotFound",
-          "line": 11222,
+          "line": 11241,
           "kind": "unit",
           "field_names": [],
           "doc": "",
@@ -8501,7 +8501,7 @@
         },
         {
           "name": "ObjectNotFound",
-          "line": 11224,
+          "line": 11243,
           "kind": "tuple",
           "field_names": [],
           "doc": "",
@@ -8509,7 +8509,7 @@
         },
         {
           "name": "ChainTooDeep",
-          "line": 11226,
+          "line": 11245,
           "kind": "unit",
           "field_names": [],
           "doc": "",
@@ -8517,7 +8517,7 @@
         },
         {
           "name": "Unregistered",
-          "line": 11228,
+          "line": 11247,
           "kind": "tuple",
           "field_names": [],
           "doc": "",
@@ -15319,7 +15319,7 @@
     },
     "KeywordAction": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10822,
+      "line": 10841,
       "doc": "Typed payload for activated keyword abilities resolved from the stack.  CR 113.3b requires activated abilities to go on the stack. CR 113.7a requires last-known-information carry-through when the source leaves its zone. Cost-payment snapshots (e.g. `Station::snapshot_power`) are captured at announcement time so resolution is safe even if the paid creature leaves the battlefield.",
       "cr_refs": [
         "CR 113.3b",
@@ -15328,7 +15328,7 @@
       "variants": [
         {
           "name": "Equip",
-          "line": 10824,
+          "line": 10843,
           "kind": "struct",
           "field_names": [
             "equipment_id",
@@ -15341,7 +15341,7 @@
         },
         {
           "name": "Crew",
-          "line": 10830,
+          "line": 10849,
           "kind": "struct",
           "field_names": [
             "vehicle_id",
@@ -15354,7 +15354,7 @@
         },
         {
           "name": "Saddle",
-          "line": 10836,
+          "line": 10855,
           "kind": "struct",
           "field_names": [
             "mount_id",
@@ -15367,7 +15367,7 @@
         },
         {
           "name": "Station",
-          "line": 10844,
+          "line": 10863,
           "kind": "struct",
           "field_names": [
             "spacecraft_id",
@@ -17636,7 +17636,7 @@
     },
     "ManaModification": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10106,
+      "line": 10125,
       "doc": "CR 106.3 + CR 614.1a: Mana-production replacement payload. Used by `ReplacementEvent::ProduceMana` to describe HOW the produced mana should be modified before entering the player's mana pool.",
       "cr_refs": [
         "CR 106.3",
@@ -17645,7 +17645,7 @@
       "variants": [
         {
           "name": "ReplaceWith",
-          "line": 10109,
+          "line": 10128,
           "kind": "struct",
           "field_names": [
             "mana_type"
@@ -17657,7 +17657,7 @@
         },
         {
           "name": "Multiply",
-          "line": 10112,
+          "line": 10131,
           "kind": "struct",
           "field_names": [
             "factor"
@@ -17903,7 +17903,7 @@
     },
     "ManaReplacementScope": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10118,
+      "line": 10137,
       "doc": "CR 106.12b + CR 614.1a: Event scope for mana-production replacements.",
       "cr_refs": [
         "CR 106.12b",
@@ -17912,7 +17912,7 @@
       "variants": [
         {
           "name": "Any",
-          "line": 10121,
+          "line": 10140,
           "kind": "unit",
           "field_names": [],
           "doc": "Applies to any mana-production event.",
@@ -17920,7 +17920,7 @@
         },
         {
           "name": "TappedForMana",
-          "line": 10123,
+          "line": 10142,
           "kind": "unit",
           "field_names": [],
           "doc": "Applies only when a permanent is tapped for mana.",
@@ -20388,7 +20388,7 @@
     },
     "PostReplacementContinuation": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10220,
+      "line": 10239,
       "doc": "CR 614.12a + CR 615.5: Continuation effect that runs after a replacement effect's modifications complete. Stashed by the replacement pipeline, drained by callers (`engine_replacement`, `stack`, `deal_damage`, `engine`).  Two binding states share one slot: - `Template`: an `AbilityDefinition` AST that needs the replacement   source for resolution context (e.g. \"As ~ enters, choose a basic land   type\" — controller and source come from the resolving permanent). - `Resolved`: a `ResolvedAbility` that already carries selected targets   and resolution-time context, ready for direct dispatch (e.g. Phyrexian   Hydra's prevented-damage follow-up captures the source and counter   quantity from the resolution that created the prevention shield).",
       "cr_refs": [
         "CR 614.12a",
@@ -20397,7 +20397,7 @@
       "variants": [
         {
           "name": "Template",
-          "line": 10221,
+          "line": 10240,
           "kind": "tuple",
           "field_names": [],
           "doc": "",
@@ -20405,7 +20405,7 @@
         },
         {
           "name": "Resolved",
-          "line": 10222,
+          "line": 10241,
           "kind": "tuple",
           "field_names": [],
           "doc": "",
@@ -21167,7 +21167,7 @@
     },
     "QuantityModification": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10072,
+      "line": 10091,
       "doc": "CR 614.1a: Quantity modification for replacement effects (tokens, counters). Modeled after DamageModification but for non-damage quantities.",
       "cr_refs": [
         "CR 614.1a"
@@ -21175,7 +21175,7 @@
       "variants": [
         {
           "name": "Double",
-          "line": 10074,
+          "line": 10093,
           "kind": "unit",
           "field_names": [],
           "doc": "count * 2 — Primal Vigor, Doubling Season, Parallel Lives, Anointed Procession",
@@ -21183,7 +21183,7 @@
         },
         {
           "name": "Plus",
-          "line": 10076,
+          "line": 10095,
           "kind": "struct",
           "field_names": [
             "value"
@@ -21193,7 +21193,7 @@
         },
         {
           "name": "Minus",
-          "line": 10078,
+          "line": 10097,
           "kind": "struct",
           "field_names": [
             "value"
@@ -21203,7 +21203,7 @@
         },
         {
           "name": "Prevent",
-          "line": 10098,
+          "line": 10117,
           "kind": "unit",
           "field_names": [],
           "doc": "CR 113.6i + CR 614.17 + CR 614.6 + CR 614.7 + CR 122.1: Fully replace the quantity event with nothing — the proposed `AddCounter` / `CreateToken` event \"never happens\" (CR 614.6).  CR 113.6i is the *authorizing* rule for permanent-scoped counter prohibitions (\"an object's ability that states counters can't be put on that object functions as that object is entering the battlefield in addition to functioning while that object is on the battlefield\"). CR 614.17 is the framework for \"can't\" effects — they aren't replacement effects but follow similar rules — which is why we model the prohibition through the replacement pipeline. CR 122.1 (\"a counter is a marker placed on an object or player\") identifies the placement event the prohibition suppresses; CR 614.6/614.7 govern the resulting \"event never happens\" outcome.  Used by self-targeted counter-prohibition replacements (\"~ can't have counters put on it.\" — Melira's Keepers). Composes with `valid_card: SelfRef` for permanent-scoped protection and with player-scope filters for the future Solemnity-class global variant.",
@@ -22766,13 +22766,13 @@
     },
     "ReplacementMode": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10186,
+      "line": 10205,
       "doc": "Whether a replacement effect is mandatory or offers the affected player a choice.",
       "cr_refs": [],
       "variants": [
         {
           "name": "Mandatory",
-          "line": 10189,
+          "line": 10208,
           "kind": "unit",
           "field_names": [],
           "doc": "Always applies (default). Used for \"enters tapped\", \"prevent damage\", etc.",
@@ -22780,7 +22780,7 @@
         },
         {
           "name": "Optional",
-          "line": 10191,
+          "line": 10210,
           "kind": "struct",
           "field_names": [
             "decline"
@@ -22790,7 +22790,7 @@
         },
         {
           "name": "MayCost",
-          "line": 10198,
+          "line": 10217,
           "kind": "struct",
           "field_names": [
             "cost",
@@ -22807,7 +22807,7 @@
     },
     "ReplacementPlayerScope": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10174,
+      "line": 10193,
       "doc": "CR 614.1a: Which player(s) a replacement effect applies to, scoped relative to the replacement source's controller. `valid_player: None` keeps the controller-only default; `Some(You)` is the explicit controller scope, `Some(Opponent)` an opponent-scoped replacement (Tainted Remedy), and `Some(AnyPlayer)` a global all-players replacement (Rain of Gore).  Serialized as a bare string (no `#[serde(tag)]`) to match the prior `Option<ControllerRef>` field encoding — existing persisted / in-flight `valid_player` values (`\"You\"` / `\"Opponent\"`) deserialize unchanged.",
       "cr_refs": [
         "CR 614.1a"
@@ -22815,7 +22815,7 @@
       "variants": [
         {
           "name": "You",
-          "line": 10176,
+          "line": 10195,
           "kind": "unit",
           "field_names": [],
           "doc": "The replacement source's controller.",
@@ -22823,7 +22823,7 @@
         },
         {
           "name": "Opponent",
-          "line": 10178,
+          "line": 10197,
           "kind": "unit",
           "field_names": [],
           "doc": "Any opponent of the replacement source's controller.",
@@ -22831,7 +22831,7 @@
         },
         {
           "name": "AnyPlayer",
-          "line": 10180,
+          "line": 10199,
           "kind": "unit",
           "field_names": [],
           "doc": "Every player in the game, regardless of who controls the source.",
@@ -25671,13 +25671,13 @@
     },
     "TargetRef": {
       "file": "crates/engine/src/types/ability.rs",
-      "line": 10804,
+      "line": 10823,
       "doc": "Unified target reference for creatures and players.",
       "cr_refs": [],
       "variants": [
         {
           "name": "Object",
-          "line": 10805,
+          "line": 10824,
           "kind": "tuple",
           "field_names": [],
           "doc": "",
@@ -25685,7 +25685,7 @@
         },
         {
           "name": "Player",
-          "line": 10806,
+          "line": 10825,
           "kind": "tuple",
           "field_names": [],
           "doc": "",

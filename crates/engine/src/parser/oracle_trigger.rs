@@ -32,10 +32,10 @@ use super::oracle_util::{
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, AttachmentKind, CastVariantPaid,
-    CoinFlipResult, Comparator, ControllerRef, CounterTriggerFilter, DamageKindFilter, Effect,
-    FilterProp, OriginConstraint, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef,
-    StaticCondition, TargetFilter, TriggerCondition, TriggerConstraint, TriggerDefinition,
-    TypeFilter, TypedFilter, UnlessPayModifier, ZoneChangeClause,
+    CoinFlipResult, Comparator, ControllerRef, CounterTriggerFilter, DamageKindFilter,
+    DestinationConstraint, Effect, FilterProp, OriginConstraint, PlayerFilter, PlayerScope,
+    QuantityExpr, QuantityRef, StaticCondition, TargetFilter, TriggerCondition, TriggerConstraint,
+    TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier, ZoneChangeClause,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::parse_counter_type;
@@ -4725,6 +4725,7 @@ fn try_parse_event(
                         def.zone_change_clauses.push(ZoneChangeClause {
                             origin: rich,
                             destination: Some(Zone::Battlefield),
+                            destination_constraint: DestinationConstraint::Any,
                             valid_card: Some(subject.clone()),
                         });
                         matched_clause = true;
@@ -4895,27 +4896,37 @@ fn try_parse_event(
     }
 
     // "leaves the battlefield" / "leaves"
-    if alt((
+    let leaves_tail = alt((
         value((), tag::<_, _, OracleError<'_>>("leaves the battlefield")),
         value((), tag("leaves")),
     ))
     .parse(rest)
-    .is_ok()
-    {
-        let mut def = make_base();
-        def.mode = TriggerMode::LeavesBattlefield;
-        def.valid_card = Some(subject.clone());
-        // CR 113.6k + CR 603.10: Self-referential LTB triggers (e.g. Oblivion Ring,
-        // "when ~ leaves the battlefield") must continue to function after the
-        // source has moved to graveyard/exile, because the trigger ability is tied
-        // to the object that left. Non-self-referential LTB triggers (e.g. "whenever
-        // a creature you control leaves the battlefield") live on a permanent that
-        // is still on the battlefield, so `trigger_zones` stays empty (battlefield
-        // default).
-        if filter_references_self(subject) {
-            def.trigger_zones = vec![Zone::Battlefield, Zone::Graveyard, Zone::Exile];
+    .ok()
+    .map(|(tail, _)| tail);
+    if let Some(tail) = leaves_tail {
+        let tail = tail.trim_start();
+        let without_dying = all_consuming(tag::<_, _, OracleError<'_>>("without dying"))
+            .parse(tail)
+            .is_ok();
+        if tail.is_empty() || without_dying {
+            let mut def = make_base();
+            def.mode = TriggerMode::LeavesBattlefield;
+            def.valid_card = Some(subject.clone());
+            if without_dying {
+                def.destination_constraint = DestinationConstraint::NotEquals(Zone::Graveyard);
+            }
+            // CR 113.6k + CR 603.10: Self-referential LTB triggers (e.g. Oblivion Ring,
+            // "when ~ leaves the battlefield") must continue to function after the
+            // source has moved to graveyard/exile, because the trigger ability is tied
+            // to the object that left. Non-self-referential LTB triggers (e.g. "whenever
+            // a creature you control leaves the battlefield") live on a permanent that
+            // is still on the battlefield, so `trigger_zones` stays empty (battlefield
+            // default).
+            if filter_references_self(subject) {
+                def.trigger_zones = vec![Zone::Battlefield, Zone::Graveyard, Zone::Exile];
+            }
+            return Some((TriggerMode::LeavesBattlefield, def));
         }
-        return Some((TriggerMode::LeavesBattlefield, def));
     }
 
     // CR 700.4: "is put into a graveyard from [zone]" / "is put into [possessive] graveyard [from zone]"
@@ -8600,6 +8611,7 @@ fn parse_zone_change_clause(subject: &TargetFilter, rest: &str) -> Option<ZoneCh
         return Some(ZoneChangeClause {
             origin: OriginConstraint::Equals(Zone::Battlefield),
             destination: Some(Zone::Graveyard),
+            destination_constraint: DestinationConstraint::Any,
             valid_card: Some(subject.clone()),
         });
     }
@@ -8625,6 +8637,7 @@ fn parse_zone_change_clause(subject: &TargetFilter, rest: &str) -> Option<ZoneCh
         return Some(ZoneChangeClause {
             origin,
             destination: Some(Zone::Graveyard),
+            destination_constraint: DestinationConstraint::Any,
             valid_card,
         });
     }
@@ -8642,6 +8655,7 @@ fn parse_zone_change_clause(subject: &TargetFilter, rest: &str) -> Option<ZoneCh
         return Some(ZoneChangeClause {
             origin: OriginConstraint::Equals(Zone::Graveyard),
             destination: None,
+            destination_constraint: DestinationConstraint::Any,
             valid_card: Some(add_controller(subject.clone(), ControllerRef::You)),
         });
     }
@@ -12124,6 +12138,19 @@ mod tests {
         assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
         assert!(def.trigger_zones.contains(&Zone::Graveyard));
         assert!(def.trigger_zones.contains(&Zone::Exile));
+    }
+
+    #[test]
+    fn trigger_leaves_battlefield_without_dying_excludes_graveyard_destination() {
+        let def = parse_trigger_line(
+            "Whenever this creature or another creature you control leaves the battlefield without dying, put a +1/+1 counter on target creature you control.",
+            "Three Tree Scribe",
+        );
+        assert_eq!(def.mode, TriggerMode::LeavesBattlefield);
+        assert_eq!(
+            def.destination_constraint,
+            DestinationConstraint::NotEquals(Zone::Graveyard)
+        );
     }
 
     #[test]

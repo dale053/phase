@@ -9673,6 +9673,8 @@ impl OriginConstraint {
     }
 }
 
+pub type DestinationConstraint = OriginConstraint;
+
 /// CR 603.6 + CR 603.2: one clause of a disjunctive zone-change trigger.
 /// A zone-change event satisfies the trigger if it matches ANY clause
 /// (CR 603.2 — a game event matching the trigger condition fires the ability).
@@ -9684,6 +9686,14 @@ pub struct ZoneChangeClause {
     /// (CR 603.10a) where the destination is unconstrained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<Zone>,
+    /// CR 700.4: destination-zone predicate for LTB forms such as
+    /// "without dying" (`NotEquals(Graveyard)`). `destination` remains the
+    /// compact exact-match field for existing JSON and builder call sites.
+    #[serde(
+        default = "OriginConstraint::any_default",
+        skip_serializing_if = "OriginConstraint::is_any"
+    )]
+    pub destination_constraint: DestinationConstraint,
     /// Filter the moved card must satisfy for this clause to match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_card: Option<TargetFilter>,
@@ -9738,6 +9748,14 @@ pub struct TriggerDefinition {
     pub zone_change_clauses: Vec<ZoneChangeClause>,
     #[serde(default)]
     pub destination: Option<Zone>,
+    /// CR 700.4: destination-zone predicate for zone-change triggers whose
+    /// destination is described by exclusion, e.g. "leaves the battlefield
+    /// without dying" = leaves battlefield to a non-graveyard zone.
+    #[serde(
+        default = "OriginConstraint::any_default",
+        skip_serializing_if = "OriginConstraint::is_any"
+    )]
+    pub destination_constraint: DestinationConstraint,
     #[serde(default)]
     pub trigger_zones: Vec<Zone>,
     #[serde(default)]
@@ -9817,6 +9835,7 @@ impl TriggerDefinition {
             origin_zones: vec![],
             zone_change_clauses: vec![],
             destination: None,
+            destination_constraint: DestinationConstraint::Any,
             trigger_zones: vec![],
             phase: None,
             optional: false,
@@ -11851,6 +11870,7 @@ mod tests {
             origin_zones: vec![],
             zone_change_clauses: vec![],
             destination: Some(Zone::Graveyard),
+            destination_constraint: DestinationConstraint::Any,
             trigger_zones: vec![Zone::Battlefield],
             phase: None,
             optional: false,
