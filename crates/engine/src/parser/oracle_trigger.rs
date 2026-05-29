@@ -398,8 +398,10 @@ pub(crate) fn parse_trigger_lines_at_index_ir(
         return results;
     }
 
-    // Pattern 2: "whenever ~ [event1] or [event2]" — compound events sharing a subject.
-    if let Some(halves) = split_or_event_compound(&cond_lower, &condition) {
+    // Pattern 2: disjunctive shared-subject event list — "whenever ~ A, B, or C"
+    // (N-way serial) or "whenever ~ A or B" (2-way). CR 603.1: each listed event
+    // is its own trigger condition, all sharing the one subject.
+    if let Some(halves) = split_shared_subject_event_list(&cond_lower, &condition) {
         let mut results = Vec::with_capacity(halves.len());
         for (i, cond) in halves.into_iter().enumerate() {
             let trigger_text = if effect.is_empty() {
@@ -3619,6 +3621,86 @@ fn normalize_compound_pronouns(text: &str) -> String {
     result
 }
 
+/// Split a disjunctive shared-subject event trigger into one reconstructed
+/// trigger line per event, with the subject shared across all of them. This is
+/// the single entry point for the whole class: the N-way serial form
+/// ("Whenever ~ A, B, or C") and the 2-way "or" form ("Whenever ~ A or B") are
+/// its two branches. CR 603.1: each listed event is an independent trigger
+/// condition. Dedicated 2-way compound `TriggerMode` variants (AttacksOrBlocks,
+/// EntersOrAttacks) are intentionally left unsplit by `split_or_event_compound`.
+///
+/// Serial is tried first so a comma list ("A, B, or C") is not mis-split by the
+/// 2-way scanner; this preserves the prior dispatch order exactly.
+fn split_shared_subject_event_list(cond_lower: &str, condition: &str) -> Option<Vec<String>> {
+    split_serial_event_compound(cond_lower, condition)
+        .or_else(|| split_or_event_compound(cond_lower, condition))
+}
+
+/// Split serial compound events sharing one subject — the N-way branch of
+/// [`split_shared_subject_event_list`].
+///
+/// Example: "Whenever ~ attacks, blocks, or becomes the target of a spell"
+/// becomes three trigger conditions, each reusing the same subject.
+fn split_serial_event_compound(cond_lower: &str, condition: &str) -> Option<Vec<String>> {
+    use super::oracle_nom::primitives::split_once_on;
+
+    // Split the original and lowercase forms in lockstep on the same ASCII
+    // delimiters rather than slicing `condition` with byte offsets taken from
+    // `cond_lower`. `str::to_lowercase()` is not byte-position-preserving for
+    // non-ASCII input (e.g. `İ` grows, `ẞ` shrinks), so a lowercase-derived
+    // offset could land mid-`char` in the original and panic. The delimiters
+    // (`", or "`, `", "`) are pure punctuation and identical in both views, so
+    // parallel splits keep the two aligned without cross-case byte arithmetic.
+    let Ok((_, (before_or_lower, after_or_lower))) = split_once_on(cond_lower, ", or ") else {
+        return None;
+    };
+    let Ok((_, (before_or, after_or))) = split_once_on(condition, ", or ") else {
+        return None;
+    };
+    if parse_event_verb_start(after_or_lower.trim_start()).is_err() {
+        return None;
+    }
+
+    let Ok((_, (first_lower, rest_events_lower))) = split_once_on(before_or_lower, ", ") else {
+        return None;
+    };
+    let Ok((_, (first_original, rest_events_original))) = split_once_on(before_or, ", ") else {
+        return None;
+    };
+    let keyword_and_subject = extract_keyword_and_subject(first_lower.trim());
+    let mut results = vec![first_original.trim().to_string()];
+
+    let mut remaining_lower = rest_events_lower;
+    let mut remaining_original = rest_events_original;
+    loop {
+        if let Ok((_, (event_lower, tail_lower))) = split_once_on(remaining_lower, ", ") {
+            let Ok((_, (event_original, tail_original))) = split_once_on(remaining_original, ", ")
+            else {
+                return None;
+            };
+            if parse_event_verb_start(event_lower.trim()).is_err() {
+                return None;
+            }
+            results.push(format!("{keyword_and_subject} {}", event_original.trim()));
+            remaining_lower = tail_lower;
+            remaining_original = tail_original;
+        } else {
+            if parse_event_verb_start(remaining_lower.trim()).is_err() {
+                return None;
+            }
+            results.push(format!(
+                "{keyword_and_subject} {}",
+                remaining_original.trim()
+            ));
+            break;
+        }
+    }
+
+    results.push(format!("{keyword_and_subject} {}", after_or.trim()));
+
+    Some(results)
+}
+
 /// Split compound conditions where "or" joins two event verbs sharing the same subject.
 /// Returns `Some(vec![first_trigger, second_trigger])` with reconstructed trigger lines,
 /// or `None` if no compound event "or" is found.
@@ -3767,6 +3849,10 @@ fn parse_event_verb_start(input: &str) -> OracleResult<'_, ()> {
         parse_event_word("exploits"),
         parse_event_word("mutates"),
         parse_event_word("transforms"),
+        parse_event_phrase("becomes the target of a spell or ability"),
+        parse_event_phrase("become the target of a spell or ability"),
+        parse_event_phrase("becomes the target of an aura spell"),
+        parse_event_phrase("becomes the target of a spell"),
     ));
     let player_actions = alt((
         passive_player_actions,
@@ -3912,6 +3998,7 @@ fn find_effect_boundary(lower: &str) -> Option<usize> {
         let comma_pos = search_start + before.len();
         if !continues_player_action_list(after)
             && !continues_disjunctive_zone_change_condition(after)
+            && !continues_serial_event_condition(after)
         {
             return Some(comma_pos);
         }
@@ -3939,6 +4026,21 @@ fn continues_disjunctive_zone_change_condition(after_comma: &str) -> bool {
     let mut ctx = ParseContext::default();
     let (subject, verb) = parse_trigger_subject(clause.trim(), &mut ctx);
     parse_zone_change_clause(&subject, verb).is_some()
+}
+
+fn continues_serial_event_condition(after_comma: &str) -> bool {
+    use super::oracle_nom::primitives::split_once_on;
+
+    let trimmed = after_comma.trim_start();
+    if let Ok((after_or, ())) = value((), tag::<_, _, OracleError<'_>>("or ")).parse(trimmed) {
+        return parse_event_verb_start(after_or.trim_start()).is_ok();
+    }
+
+    let Ok((_, (first_event, after_or))) = split_once_on(trimmed, ", or ") else {
+        return false;
+    };
+    parse_event_verb_start(first_event.trim()).is_ok()
+        && parse_event_verb_start(after_or.trim_start()).is_ok()
 }
 
 fn continues_player_action_list(after_comma: &str) -> bool {
@@ -10106,6 +10208,74 @@ mod tests {
     // so it only fires when the ETB-tapped replacement did NOT apply. For a
     // SelfRef trigger the entering object IS the source, so the evaluator's
     // `source_id` fallback resolves to the same permanent.
+    #[test]
+    fn parse_serial_attack_block_target_compound() {
+        let defs = parse_trigger_lines(
+            "Whenever this creature attacks, blocks, or becomes the target of a spell, \
+             it deals damage equal to its power to each opponent.",
+            "Giggling Skitterspike",
+        );
+
+        assert_eq!(defs.len(), 3, "expected three trigger branches: {defs:?}");
+        assert_eq!(defs[0].mode, TriggerMode::Attacks);
+        assert_eq!(defs[0].valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(defs[1].mode, TriggerMode::Blocks);
+        assert_eq!(defs[1].valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(defs[2].mode, TriggerMode::BecomesTarget);
+        assert_eq!(defs[2].valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(defs[2].valid_source, Some(TargetFilter::StackSpell));
+
+        fn has_damage_each_player(ability: &AbilityDefinition) -> bool {
+            matches!(*ability.effect, Effect::DamageEachPlayer { .. })
+                || ability
+                    .sub_ability
+                    .as_ref()
+                    .is_some_and(|s| has_damage_each_player(s))
+        }
+        fn has_unimplemented(ability: &AbilityDefinition) -> bool {
+            matches!(*ability.effect, Effect::Unimplemented { .. })
+                || ability
+                    .sub_ability
+                    .as_ref()
+                    .is_some_and(|s| has_unimplemented(s))
+        }
+        fn damage_each_player_amount(ability: &AbilityDefinition) -> Option<&QuantityExpr> {
+            match ability.effect.as_ref() {
+                Effect::DamageEachPlayer { amount, .. } => Some(amount),
+                _ => ability
+                    .sub_ability
+                    .as_ref()
+                    .and_then(|s| damage_each_player_amount(s)),
+            }
+        }
+
+        for def in &defs {
+            let execute = def.execute.as_ref().expect("execute ability");
+            assert!(
+                has_damage_each_player(execute),
+                "expected DamageEachPlayer effect, got {:?}",
+                execute.effect
+            );
+            assert!(
+                !has_unimplemented(execute),
+                "effect chain leaked Unimplemented: {:?}",
+                execute
+            );
+            assert!(
+                matches!(
+                    damage_each_player_amount(execute),
+                    Some(QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: crate::types::ability::ObjectScope::Source
+                        }
+                    })
+                ),
+                "expected damage amount to use source power, got {:?}",
+                damage_each_player_amount(execute)
+            );
+        }
+    }
+
     #[test]
     fn trigger_etb_self_enters_untapped_attaches_condition() {
         let def = parse_trigger_line(
