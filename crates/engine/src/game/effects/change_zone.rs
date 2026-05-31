@@ -479,7 +479,12 @@ pub fn resolve(
         // expressed via `multi_target.min = 0` (per-opponent fanout) must also
         // short-circuit here, not reach the zone-scan and spuriously set
         // `cost_payment_failed_flag`.
-        if ability.targeting_is_optional() {
+        // Exception: when `target_choice_timing == Resolution` the player has not
+        // yet had a chance to choose — targets are empty by design and the zone-scan
+        // path must be reached so `EffectZoneChoice` can be issued.
+        if ability.targeting_is_optional()
+            && !matches!(ability.target_choice_timing, TargetChoiceTiming::Resolution)
+        {
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),
                 source_id: ability.source_id,
