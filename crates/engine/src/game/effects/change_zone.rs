@@ -475,7 +475,11 @@ pub fn resolve(
         // targeting, the effect resolves doing nothing. Don't fall through to the
         // untargeted zone-scan path (which is for genuinely untargeted effects like
         // "sacrifice a creature" where the choice happens at resolution).
-        if ability.optional_targeting {
+        // Use `targeting_is_optional()` not `optional_targeting`: "up to one"
+        // expressed via `multi_target.min = 0` (per-opponent fanout) must also
+        // short-circuit here, not reach the zone-scan and spuriously set
+        // `cost_payment_failed_flag`.
+        if ability.targeting_is_optional() {
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),
                 source_id: ability.source_id,
