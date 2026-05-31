@@ -2277,8 +2277,9 @@ fn collect_per_opponent_target_fanout_specs(
     };
 
     for opponent in per_opponent_fanout_players(state, ability.controller) {
-        // Mirror the slot-builder: skip opponents whose creature pool is empty
-        // when targeting is optional so specs and slots stay in lockstep.
+        // CR 115.1 + CR 603.3d: Mirror the slot-builder: skip opponents whose
+        // creature pool is empty when targeting is optional so specs and slots
+        // stay in lockstep.
         if ability.targeting_is_optional()
             && targeting::find_legal_targets(state, &object_filter, opponent, ability.source_id)
                 .is_empty()
