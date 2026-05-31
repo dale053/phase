@@ -2467,9 +2467,10 @@ fn apply_action(
             let convoke_mode = *convoke_mode;
             if let Some(pending) = state.pending_cast.as_ref() {
                 if pending.deferred_target_selection {
-                    // CR 601.2c + CR 601.2f: A chosen X that determines target
-                    // count must have a legal target assignment before it is
-                    // locked into the pending cast.
+                    // CR 601.2c: A chosen X that determines target count must
+                    // have a legal target assignment before it is locked into
+                    // the pending cast.
+                    // CR 601.2f: The same X value then determines the total cost.
                     let mut trial = pending.as_ref().clone();
                     trial.ability.set_chosen_x_recursive(value);
                     trial.cost.concretize_x(value);
@@ -13819,6 +13820,126 @@ mod exile_return_tests {
         );
     }
 
+    /// CR 607.1 + CR 610.3 + #881: Haytham Kenway — per-opponent multi-target exile
+    /// with Duration::UntilHostLeavesPlay. Exiles one creature per opponent using
+    /// the per-opponent fanout targeting mechanism; ExileLinks are created for each;
+    /// all return when the source leaves the battlefield.
+    #[test]
+    fn haytham_kenway_per_opponent_exile_returns_when_source_leaves() {
+        use crate::game::ability_utils::build_resolved_from_def;
+        use crate::game::scenario::{GameScenario, P0, P1};
+        use crate::types::ability::TargetRef;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+
+        // Haytham Kenway on P0's battlefield with his real parsed oracle text.
+        let haytham_id = scenario
+            .add_creature(P0, "Haytham Kenway", 3, 3)
+            .from_oracle_text(
+                "When this creature enters, for each opponent, exile up to one target \
+                 creature that player controls until this creature leaves the battlefield.",
+            )
+            .id();
+
+        // Opponent's creature to be exiled.
+        let victim_id = scenario.add_creature(P1, "Opponent Creature", 2, 2).id();
+
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        // Verify parser: ETB trigger must have UntilHostLeavesPlay on the exile execute.
+        let haytham = state
+            .objects
+            .get(&haytham_id)
+            .expect("Haytham on battlefield");
+        let etb = haytham
+            .trigger_definitions
+            .iter_all()
+            .find(|t| {
+                matches!(t.mode, crate::types::TriggerMode::ChangesZone)
+                    && t.destination == Some(Zone::Battlefield)
+            })
+            .expect("Haytham must have ETB trigger");
+        let execute_def = etb.execute.as_deref().expect("ETB must have execute");
+        assert_eq!(
+            execute_def.duration,
+            Some(crate::types::ability::Duration::UntilHostLeavesPlay),
+            "Haytham ETB exile must carry UntilHostLeavesPlay"
+        );
+
+        // Build the resolved exile effect with the opponent's creature as a target.
+        // The per-opponent fanout produces [Player(P1), Object(victim)] target pairs;
+        // we simulate the post-selection ability.targets state.
+        let mut resolved = build_resolved_from_def(execute_def, haytham_id, PlayerId(0));
+        resolved.targets = vec![TargetRef::Player(PlayerId(1)), TargetRef::Object(victim_id)];
+
+        // Push and resolve the trigger.
+        let stack_id = ObjectId(9_000_001);
+        state.stack.push_back(crate::types::game_state::StackEntry {
+            id: stack_id,
+            source_id: haytham_id,
+            controller: PlayerId(0),
+            kind: crate::types::game_state::StackEntryKind::TriggeredAbility {
+                source_id: haytham_id,
+                ability: Box::new(resolved),
+                description: Some("When Haytham enters...".to_string()),
+                condition: None,
+                trigger_event: None,
+                source_name: String::new(),
+                subject_match_count: None,
+            },
+        });
+
+        let mut events = Vec::new();
+        crate::game::stack::resolve_top(state, &mut events);
+
+        assert!(
+            state.exile.contains(&victim_id),
+            "creature must be in exile"
+        );
+        let has_link = state.exile_links.iter().any(|link| {
+            link.exiled_id == victim_id
+                && link.source_id == haytham_id
+                && matches!(
+                    link.kind,
+                    crate::types::game_state::ExileLinkKind::UntilSourceLeaves {
+                        return_zone: Zone::Battlefield
+                    }
+                )
+        });
+        assert!(
+            has_link,
+            "UntilSourceLeaves exile link must be created; exile_links={:?}",
+            state.exile_links
+        );
+
+        // Haytham Kenway leaves the battlefield (dies, bounced, etc.).
+        let mut events: Vec<GameEvent> = Vec::new();
+        crate::game::zones::move_to_zone(state, haytham_id, Zone::Graveyard, &mut events);
+        crate::game::engine_priority::run_post_action_pipeline(
+            state,
+            &mut events,
+            &WaitingFor::Priority {
+                player: PlayerId(0),
+            },
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            state.battlefield.contains(&victim_id),
+            "exiled creature must return when Haytham Kenway leaves the battlefield"
+        );
+        assert!(!state.exile.contains(&victim_id));
+        assert!(state.exile_links.is_empty(), "exile link must be consumed");
+    }
+
     /// CR 607.2a + CR 610.3: Two-trigger exile-return cards link the ETB
     /// exile to the LTB return text. Journey to Nowhere has no explicit
     /// "until" text on the ETB trigger, so the parser synthesis must still
@@ -15263,6 +15384,88 @@ mod phase_trigger_regression_tests {
             }
         ));
         assert!(state.pending_continuation.is_some());
+    }
+
+    /// CR 610.3 + #783: When a permanent that exiled something "until it
+    /// leaves the battlefield" (Static Prison) sacrifices itself through a
+    /// "sacrifice unless you pay {E}" trigger, the exiled permanent must
+    /// return. The unless-payment decline path resolves the sacrifice but
+    /// historically skipped the post-action pipeline, so the exile return
+    /// never fired.
+    #[test]
+    fn static_prison_unless_pay_sacrifice_returns_exiled_permanent() {
+        use crate::types::game_state::{ExileLink, ExileLinkKind};
+
+        let mut state = setup_game_at_main_phase();
+
+        let prison = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Static Prison".to_string(),
+            Zone::Battlefield,
+        );
+
+        // The exiled victim already sits in exile, linked to Static Prison.
+        let victim = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Exiled Permanent".to_string(),
+            Zone::Exile,
+        );
+        state
+            .objects
+            .get_mut(&victim)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        state.exile_links.push(ExileLink {
+            exiled_id: victim,
+            source_id: prison,
+            kind: ExileLinkKind::UntilSourceLeaves {
+                return_zone: Zone::Battlefield,
+            },
+        });
+
+        // The "sacrifice this enchantment unless you pay {E}" trigger has
+        // resolved into an UnlessPayment prompt. P0 has no energy to pay.
+        let sacrifice = ResolvedAbility::new(
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            },
+            vec![],
+            prison,
+            PlayerId(0),
+        );
+        state.waiting_for = WaitingFor::UnlessPayment {
+            player: PlayerId(0),
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 1 },
+            },
+            pending_effect: Box::new(sacrifice),
+            trigger_event: None,
+            effect_description: None,
+            remaining: Vec::new(),
+        };
+
+        apply_as_current(&mut state, GameAction::PayUnlessCost { pay: false }).unwrap();
+
+        assert!(
+            !state.battlefield.contains(&prison),
+            "Static Prison should be sacrificed"
+        );
+        assert!(
+            state.battlefield.contains(&victim),
+            "exiled permanent must return when Static Prison sacrifices itself"
+        );
+        assert!(
+            !state.exile.contains(&victim),
+            "exiled permanent must no longer be in exile"
+        );
     }
 
     /// CR 118.12 + CR 118.12a: "[Effect] unless [player] pays [cost]. If they do,

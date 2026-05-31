@@ -714,6 +714,74 @@ fn try_parse_die_exile_rider(lower: &str, kind: AbilityKind) -> Option<AbilityDe
     ))
 }
 
+fn parse_leave_battlefield_rider_ref(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag("it"),
+            tag("the card"),
+            tag("the creature"),
+            tag("the permanent"),
+            tag("that card"),
+            tag("that creature"),
+            tag("that land"),
+            tag("that permanent"),
+            tag("this card"),
+            tag("this creature"),
+            tag("this land"),
+            tag("this permanent"),
+        )),
+    )
+    .parse(input)
+}
+
+/// CR 614.1a + CR 614.6: Detect "If it would leave the battlefield, exile it
+/// instead of putting it anywhere else." riders attached to a previously
+/// selected object. The carried `ReplacementDefinition` is installed on the
+/// parent target, where `valid_card: SelfRef` binds to that host object.
+fn try_parse_leave_battlefield_exile_replacement(lower: &str) -> Option<Effect> {
+    let (rest, _) = nom::combinator::opt(tag::<_, _, OracleError<'_>>("if "))
+        .parse(lower)
+        .ok()?;
+    let (rest, _) = parse_leave_battlefield_rider_ref(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" would leave the battlefield, ")
+        .parse(rest)
+        .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>("exile ").parse(rest).ok()?;
+    let (rest, _) = parse_leave_battlefield_rider_ref(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" instead of putting ")
+        .parse(rest)
+        .ok()?;
+    let (rest, _) = parse_leave_battlefield_rider_ref(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" anywhere else")
+        .parse(rest)
+        .ok()?;
+    parse_optional_period_and_end(rest)?;
+
+    let replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+        .valid_card(TargetFilter::SelfRef)
+        .execute(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                origin: Some(Zone::Battlefield),
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: false,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+            },
+        ));
+
+    Some(Effect::AddTargetReplacement {
+        replacement: Box::new(replacement),
+        target: TargetFilter::Any,
+    })
+}
+
 fn parse_optional_period_and_end(input: &str) -> Option<()> {
     let (rest, _) = nom::combinator::opt(tag::<_, _, OracleError<'_>>("."))
         .parse(input)
@@ -3448,6 +3516,9 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         return parsed_clause(effect);
     }
     if let Some(effect) = try_parse_next_time_source_damage_replacement(&lower) {
+        return parsed_clause(effect);
+    }
+    if let Some(effect) = try_parse_leave_battlefield_exile_replacement(&lower) {
         return parsed_clause(effect);
     }
     // CR 614.1a + CR 514.2: Global "If [source] would deal damage this turn,
@@ -9679,6 +9750,25 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         } if *fight_subject == TargetFilter::SelfRef => {
             *fight_subject = subject_filter;
         }
+        // CR 613.3 + CR 110.2: "[Player] gains control of [object]" — when the
+        // acting subject is a non-controller player (e.g. "an opponent of your
+        // choice gains control of it"), the semantics are GIVE (the current
+        // controller transfers the object to that player), not TAKE (the
+        // current controller steals). Rewrite GainControl → GiveControl with
+        // the subject as the recipient and keep the original target intact.
+        // This covers Khârn the Betrayer's damage replacement and any other
+        // "opponent/player gains control of [target]" oracle text.
+        Effect::GainControl { target }
+            if !matches!(
+                subject_filter,
+                TargetFilter::Controller | TargetFilter::SelfRef
+            ) =>
+        {
+            *effect = Effect::GiveControl {
+                target: target.clone(),
+                recipient: subject_filter,
+            };
+        }
         // Object-targeting effects: inject subject filter only when the sentinel
         // is `TargetFilter::Any` (not Controller — these target objects, not players).
         // Note: DealDamage is intentionally excluded — the damage parser always parses
@@ -9696,7 +9786,6 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         | Effect::Sacrifice { target, .. }
         | Effect::DiscardCard { target, .. }
         | Effect::ChangeZone { target, .. }
-        | Effect::GainControl { target, .. }
         | Effect::ControlNextTurn { target, .. }
         | Effect::Attach { target, .. }
         | Effect::UnattachAll { target, .. }
@@ -11788,55 +11877,58 @@ pub(crate) fn each_target_filter_mut(effect: &mut Effect, f: &mut impl FnMut(&mu
 /// hand, then sacrifices half the permanents they control") picks up the
 /// rewrite uniformly. Only reached when the top-level `def.player_scope` is
 /// set, so non-scoped abilities keep the target-scoped resolution path.
-fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
-    fn rewrite_filter_controller_to_scoped(filter: &mut TargetFilter) {
-        match filter {
-            TargetFilter::Typed(typed) if typed.controller == Some(ControllerRef::You) => {
-                typed.controller = Some(ControllerRef::ScopedPlayer);
+fn rewrite_filter_controller_to_scoped(filter: &mut TargetFilter) {
+    match filter {
+        TargetFilter::Typed(typed) if typed.controller == Some(ControllerRef::You) => {
+            typed.controller = Some(ControllerRef::ScopedPlayer);
+        }
+        TargetFilter::Not { filter } => rewrite_filter_controller_to_scoped(filter),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            for filter in filters {
+                rewrite_filter_controller_to_scoped(filter);
             }
-            TargetFilter::Not { filter } => rewrite_filter_controller_to_scoped(filter),
-            TargetFilter::Or { filters } | TargetFilter::And { filters } => {
-                for filter in filters {
-                    rewrite_filter_controller_to_scoped(filter);
-                }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_condition_quantity_expr(expr: &mut QuantityExpr) {
+    match expr {
+        QuantityExpr::Ref { qty } => match qty {
+            QuantityRef::LifeTotal { player }
+            | QuantityRef::HandSize { player }
+            | QuantityRef::LifeLostThisTurn { player }
+            | QuantityRef::LifeGainedThisTurn { player }
+            | QuantityRef::PartySize { player }
+                if *player == PlayerScope::Controller =>
+            {
+                *player = PlayerScope::ScopedPlayer;
+            }
+            QuantityRef::ObjectCount { filter }
+            | QuantityRef::ObjectCountBySharedQuality { filter, .. } => {
+                rewrite_filter_controller_to_scoped(filter)
             }
             _ => {}
-        }
-    }
-
-    fn rewrite_condition_quantity_expr(expr: &mut QuantityExpr) {
-        match expr {
-            QuantityExpr::Ref { qty } => match qty {
-                QuantityRef::LifeTotal { player }
-                | QuantityRef::HandSize { player }
-                | QuantityRef::LifeLostThisTurn { player }
-                | QuantityRef::LifeGainedThisTurn { player }
-                | QuantityRef::PartySize { player }
-                    if *player == PlayerScope::Controller =>
-                {
-                    *player = PlayerScope::ScopedPlayer;
-                }
-                QuantityRef::ObjectCount { filter } => rewrite_filter_controller_to_scoped(filter),
-                _ => {}
-            },
-            QuantityExpr::DivideRounded { inner, .. }
-            | QuantityExpr::Multiply { inner, .. }
-            | QuantityExpr::Offset { inner, .. } => rewrite_condition_quantity_expr(inner),
-            QuantityExpr::Sum { exprs } => {
-                for inner in exprs {
-                    rewrite_condition_quantity_expr(inner);
-                }
+        },
+        QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::Multiply { inner, .. }
+        | QuantityExpr::Offset { inner, .. } => rewrite_condition_quantity_expr(inner),
+        QuantityExpr::Sum { exprs } => {
+            for inner in exprs {
+                rewrite_condition_quantity_expr(inner);
             }
-            QuantityExpr::UpTo { max } => rewrite_condition_quantity_expr(max),
-            QuantityExpr::Power { exponent, .. } => rewrite_condition_quantity_expr(exponent),
-            QuantityExpr::Difference { left, right } => {
-                rewrite_condition_quantity_expr(left);
-                rewrite_condition_quantity_expr(right);
-            }
-            QuantityExpr::Fixed { .. } => {}
         }
+        QuantityExpr::UpTo { max } => rewrite_condition_quantity_expr(max),
+        QuantityExpr::Power { exponent, .. } => rewrite_condition_quantity_expr(exponent),
+        QuantityExpr::Difference { left, right } => {
+            rewrite_condition_quantity_expr(left);
+            rewrite_condition_quantity_expr(right);
+        }
+        QuantityExpr::Fixed { .. } => {}
     }
+}
 
+fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
     fn rewrite_condition(condition: &mut AbilityCondition) {
         match condition {
             AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
@@ -19960,8 +20052,8 @@ mod tests {
         ControllerRef, CopyRetargetPermission, CountScope, DoublePTMode, Duration, FilterProp,
         GainLifePlayer, LibraryPosition, LinkedExileScope, ManaContribution, ManaProduction,
         ObjectProperty, ObjectScope, PaymentCost, PermissionGrantee, PtStat, PtValueScope,
-        QuantityExpr, QuantityRef, SearchSelectionConstraint, TargetChoiceTiming, TypeFilter,
-        TypedFilter, ZoneRef,
+        QuantityExpr, QuantityRef, SearchSelectionConstraint, SharedQuality, TargetChoiceTiming,
+        TypeFilter, TypedFilter, ZoneRef,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
@@ -19980,6 +20072,36 @@ mod tests {
             TargetFilter::Not { filter } => target_filter_contains_nonland(filter),
             _ => false,
         }
+    }
+
+    #[test]
+    fn rewrite_condition_quantity_expr_scopes_shared_quality_count_filter() {
+        let mut expr = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCountBySharedQuality {
+                filter: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: Some(ControllerRef::You),
+                    properties: Vec::new(),
+                }),
+                quality: SharedQuality::CreatureType,
+                aggregate: AggregateFunction::Max,
+            },
+        };
+
+        rewrite_condition_quantity_expr(&mut expr);
+
+        assert!(matches!(
+            expr,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCountBySharedQuality {
+                    filter: TargetFilter::Typed(TypedFilter {
+                        controller: Some(ControllerRef::ScopedPlayer),
+                        ..
+                    }),
+                    ..
+                }
+            }
+        ));
     }
 
     /// Build a typed Cat trigger subject ("one or more other Cats you
@@ -36540,6 +36662,39 @@ mod tests {
         );
     }
 
+    /// CR 613.3 + CR 110.2 + #1522: "an opponent of your choice gains control of it"
+    /// — Khârn the Betrayer's damage replacement. The subject is an opponent (player),
+    /// and the predicate "gains control of it" targets Khârn (ParentTarget/SelfRef).
+    /// The injector must recognise that a non-controller player subject means GIVE
+    /// (not TAKE) and rewrite GainControl → GiveControl with the subject as recipient.
+    #[test]
+    fn opponent_gains_control_rewrites_to_give_control() {
+        let def = parse_effect_chain(
+            "an opponent of your choice gains control of it",
+            AbilityKind::Spell,
+        );
+        match &*def.effect {
+            Effect::GiveControl { target, recipient } => {
+                assert_eq!(
+                    *target,
+                    TargetFilter::ParentTarget,
+                    "target must be ParentTarget ('it' = the damaged object)"
+                );
+                match recipient {
+                    TargetFilter::Typed(tf) => {
+                        assert_eq!(
+                            tf.controller,
+                            Some(ControllerRef::Opponent),
+                            "recipient must be an opponent"
+                        );
+                    }
+                    other => panic!("expected Typed(Opponent), got {other:?}"),
+                }
+            }
+            other => panic!("expected GiveControl, got {other:?}"),
+        }
+    }
+
     #[test]
     fn effect_for_each_opponent_gain_control_uses_per_opponent_target_fanout() {
         let def = parse_effect_chain(
@@ -39970,6 +40125,79 @@ mod tests {
             TargetFilter::LastCreated,
             "ChangeZone target must be rewritten from ParentTarget to LastCreated"
         );
+    }
+
+    /// CR 614.1a + CR 614.6: Whip-style "If it would leave the battlefield,
+    /// exile it instead of putting it anywhere else" is a replacement effect
+    /// installed on the returned object, not an immediate follow-up exile.
+    #[test]
+    fn leave_battlefield_exile_rider_adds_replacement() {
+        fn contains_direct_parent_target_exile(def: &AbilityDefinition) -> bool {
+            if matches!(
+                &*def.effect,
+                Effect::ChangeZone {
+                    destination: Zone::Exile,
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            ) {
+                return true;
+            }
+            def.sub_ability
+                .as_deref()
+                .is_some_and(contains_direct_parent_target_exile)
+        }
+
+        fn find_added_replacement(def: &AbilityDefinition) -> Option<&ReplacementDefinition> {
+            if let Effect::AddTargetReplacement {
+                replacement,
+                target,
+            } = &*def.effect
+            {
+                assert_eq!(*target, TargetFilter::Any);
+                return Some(replacement);
+            }
+            def.sub_ability.as_deref().and_then(find_added_replacement)
+        }
+
+        for rider in [
+            "if it would leave the battlefield, exile it instead of putting it anywhere else",
+            "if that creature would leave the battlefield, exile that creature instead of putting that creature anywhere else",
+            "if this permanent would leave the battlefield, exile this permanent instead of putting this permanent anywhere else",
+        ] {
+            let text = format!(
+                "return target creature card from your graveyard to the battlefield. it gains haste. exile it at the beginning of the next end step. {rider}"
+            );
+            let ability = parse_effect_chain(&text, AbilityKind::Activated);
+
+            assert!(
+                !contains_direct_parent_target_exile(&ability),
+                "{rider} must not parse as an immediate exile"
+            );
+            let replacement =
+                find_added_replacement(&ability).expect("expected exile replacement");
+            assert_eq!(replacement.event, ReplacementEvent::Moved);
+            assert_eq!(replacement.valid_card, Some(TargetFilter::SelfRef));
+            assert_eq!(replacement.destination_zone, None);
+
+            let execute = replacement
+                .execute
+                .as_deref()
+                .expect("replacement should carry redirect effect");
+            match &*execute.effect {
+                Effect::ChangeZone {
+                    origin,
+                    destination,
+                    target,
+                    ..
+                } => {
+                    assert_eq!(*origin, Some(Zone::Battlefield));
+                    assert_eq!(*destination, Zone::Exile);
+                    assert_eq!(*target, TargetFilter::SelfRef);
+                }
+                other => panic!("expected ChangeZone redirect, got {other:?}"),
+            }
+        }
     }
 
     /// CR 701.57a + CR 702.85a: `Effect::ExileFromTopUntil` must accept the

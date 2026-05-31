@@ -2109,6 +2109,20 @@ fn substitute_another_in_expr(expr: &QuantityExpr) -> QuantityExpr {
                 qualities: qualities.clone(),
             },
         },
+        QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCountBySharedQuality {
+                    filter,
+                    quality,
+                    aggregate,
+                },
+        } => QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCountBySharedQuality {
+                filter: substitute_another_in_filter(filter),
+                quality: quality.clone(),
+                aggregate: *aggregate,
+            },
+        },
         // CR 603.4 + CR 109.3: Aggregate populations are also "object
         // populations" in the same sense as ObjectCount — when an
         // intervening-if references an aggregate over "each other <type>",
@@ -7912,6 +7926,27 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         }
     }
 
+    // CR 603.2 + CR 613.3: "When you lose control of ~" — fires after a
+    // controller change on the source object. Maps to ChangesController so
+    // the trigger fires on the GainControl/GiveControl effect-resolved event.
+    // valid_card = SelfRef gates the trigger to changes on this specific object.
+    // The trigger controller is the previous controller (still Khârn's holder
+    // at trigger-scan time, because layer re-evaluation runs after trigger
+    // collection in the post-action pipeline).
+    fn parse_you_lose_control_of_self(i: &str) -> OracleResult<'_, ()> {
+        all_consuming(preceded(
+            alt((tag("when "), tag("whenever "))),
+            value((), tag("you lose control of ~")),
+        ))
+        .parse(i)
+    }
+    if parse_you_lose_control_of_self(lower).is_ok() {
+        let mut def = make_base();
+        def.mode = TriggerMode::ChangesController;
+        def.valid_card = Some(TargetFilter::SelfRef);
+        return Some((TriggerMode::ChangesController, def));
+    }
+
     if matches!(lower, "whenever you lose life" | "when you lose life") {
         let mut def = make_base();
         def.mode = TriggerMode::LifeLost;
@@ -10217,7 +10252,7 @@ mod tests {
         CastingPermission, Comparator, ContinuousModification, ControllerRef, CountScope,
         DamageModification, DelayedTriggerCondition, Duration, Effect, FilterProp,
         ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope,
-        QuantityExpr, QuantityRef, TargetFilter, TypeFilter, TypedFilter,
+        QuantityExpr, QuantityRef, SharedQuality, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::replacements::ReplacementEvent;
@@ -13366,6 +13401,22 @@ mod tests {
             !def.trigger_zones.contains(&Zone::Exile),
             "non-self-ref LTB must not extend to exile"
         );
+    }
+
+    /// CR 603.2 + CR 613.3 + #1522: "When you lose control of ~" — Sigil of
+    /// Corruption ability on Khârn the Betrayer. Maps to ChangesController with
+    /// valid_card = SelfRef so the trigger fires only when this specific permanent
+    /// changes controller. Execute draws 2 for the previous controller (the trigger
+    /// fires before layer re-evaluation, so the previous controller still holds Khârn
+    /// at trigger-scan time).
+    #[test]
+    fn trigger_when_you_lose_control_maps_to_changes_controller() {
+        let def = parse_trigger_line(
+            "When you lose control of ~, draw two cards.",
+            "Khârn the Betrayer",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesController);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
     }
 
     /// CR 603.2c: Batched "one or more permanents … leave the battlefield" uses the plural
@@ -22621,6 +22672,34 @@ mod tests {
              clause-level condition, got {:?}",
             execute.condition,
         );
+    }
+
+    #[test]
+    fn substitute_another_rewrites_shared_quality_count_filter() {
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCountBySharedQuality {
+                filter: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: Some(ControllerRef::You),
+                    properties: vec![FilterProp::Another],
+                }),
+                quality: SharedQuality::CreatureType,
+                aggregate: AggregateFunction::Max,
+            },
+        };
+
+        let rewritten = substitute_another_in_expr(&expr);
+        let QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCountBySharedQuality { filter, .. },
+        } = rewritten
+        else {
+            panic!("expected ObjectCountBySharedQuality, got {rewritten:?}");
+        };
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert!(tf.properties.contains(&FilterProp::OtherThanTriggerObject));
+        assert!(!tf.properties.contains(&FilterProp::Another));
     }
 
     /// Issue #444 — Odric, Lunarch Marshal. The full trigger parses to a
