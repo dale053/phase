@@ -2919,19 +2919,27 @@ async fn handle_client_message(
             // LobbyGameAdded fan-out (in order). Deck data, AI seats, and
             // format-legality are host-authoritative and irrelevant here.
             if matches!(mode, ServerMode::LobbyOnly) {
+                // Validate deck bounds before cloning to reject oversized decks early
+                if let Err(reason) = lobby_broker::validate_deck_payload("deck", &deck) {
+                    let msg = ServerMessage::Error { message: reason };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = socket.send(Message::text(json)).await;
+                    }
+                    return;
+                }
                 dispatch_broker_msg(
                     lobby_broker::LobbyClientMessage::CreateGameWithSettings {
-                        deck: deck.clone(),
-                        display_name: display_name.clone(),
+                        deck,
+                        display_name,
                         public,
-                        password: password.clone(),
+                        password,
                         timer_seconds,
                         player_count: requested_player_count,
                         match_config,
-                        format_config: format_config.clone(),
-                        room_name: room_name.clone(),
-                        host_peer_id: host_peer_id.clone(),
-                        draft_metadata: draft_metadata.clone(),
+                        format_config,
+                        room_name,
+                        host_peer_id,
+                        draft_metadata,
                         start_when_full,
                         ranked,
                     },
@@ -3624,13 +3632,21 @@ async fn handle_client_message(
             // is created server-side. The deck is ignored — the host validates
             // guest decks over P2P once the connection is up.
             if matches!(mode, ServerMode::LobbyOnly) {
+                // Validate deck bounds before cloning to reject oversized decks early
+                if let Err(reason) = lobby_broker::validate_deck_payload("deck", &deck) {
+                    let msg = ServerMessage::Error { message: reason };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = socket.send(Message::text(json)).await;
+                    }
+                    return;
+                }
                 dispatch_broker_msg(
                     lobby_broker::LobbyClientMessage::JoinGameWithPassword {
-                        game_code: game_code.clone(),
-                        deck: deck.clone(),
-                        display_name: display_name.clone(),
-                        password: password.clone(),
-                        reservation_token: reservation_token.clone(),
+                        game_code,
+                        deck,
+                        display_name,
+                        password,
+                        reservation_token,
                     },
                     lobby,
                     lobby_subscribers,
