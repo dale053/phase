@@ -5611,6 +5611,7 @@ fn oracle_line_mentions_counter_type(lower: &str, counter_type: &CounterType) ->
         | CounterType::Stun
         | CounterType::Lore
         | CounterType::Time
+        | CounterType::Fade
         | CounterType::Age
         | CounterType::Shield
         | CounterType::Generic(_) => {
