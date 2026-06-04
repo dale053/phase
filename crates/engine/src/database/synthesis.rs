@@ -219,6 +219,7 @@ impl KeywordTriggerInstaller {
             // instance triggers separately, so one trigger is emitted per
             // `Keyword::Afterlife(_)` on the face.
             Keyword::Afterlife(n) => vec![build_afterlife_trigger(*n)],
+            Keyword::Soulshift(n) => vec![build_soulshift_trigger(*n)],
             Keyword::Annihilator(n) => vec![build_annihilator_trigger(*n)],
             Keyword::Renown(n) => vec![build_renown_trigger(*n)],
             Keyword::Mentor => vec![build_mentor_trigger()],
@@ -274,6 +275,7 @@ impl KeywordTriggerInstaller {
                 is_dies_return_with_counter_trigger(trigger, &CounterType::Minus1Minus1)
             }
             Keyword::Afterlife(n) => is_afterlife_trigger_for_count(trigger, *n),
+            Keyword::Soulshift(n) => is_soulshift_trigger_for_n(trigger, *n),
             Keyword::Annihilator(_) => is_annihilator_attack_trigger(trigger),
             Keyword::Renown(_) => is_renown_trigger(trigger),
             Keyword::Mentor => is_mentor_trigger(trigger),
@@ -2610,6 +2612,121 @@ pub fn synthesize_persist(face: &mut CardFace) {
 /// face.
 pub fn synthesize_afterlife(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Afterlife(_)));
+}
+
+/// CR 702.46a: Soulshift N — when this permanent is put into a graveyard from
+/// the battlefield, you may return target Spirit card with mana value N or less
+/// from your graveyard to your hand.
+/// CR 702.46b: each instance triggers separately.
+pub fn synthesize_soulshift(face: &mut CardFace) {
+    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Soulshift(_)));
+}
+
+/// CR 702.46a: Dies trigger returning a Spirit from the controller's graveyard.
+fn build_soulshift_trigger(n: u32) -> TriggerDefinition {
+    let spirit_target = soulshift_spirit_target_filter(n);
+    let execute = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Hand,
+            target: spirit_target,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: false,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![],
+            face_down_profile: None,
+        },
+    )
+    .description(format!(
+        "Return target Spirit card with mana value {n} or less from your graveyard to your hand"
+    ))
+    // CR 603.5: "you may" — optional triggered ability.
+    .optional();
+
+    TriggerDefinition::new(TriggerMode::ChangesZone)
+        .origin(Zone::Battlefield)
+        .destination(Zone::Graveyard)
+        .valid_card(TargetFilter::SelfRef)
+        .execute(execute)
+        .description(format!(
+            "CR 702.46a: Soulshift {n} — when this permanent is put into a graveyard from the battlefield, you may return target Spirit card with mana value {n} or less from your graveyard to your hand."
+        ))
+}
+
+fn soulshift_spirit_target_filter(n: u32) -> TargetFilter {
+    TargetFilter::Typed(
+        TypedFilter::card()
+            .controller(ControllerRef::You)
+            .subtype("Spirit".to_string())
+            .properties(vec![
+                FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                },
+                FilterProp::Cmc {
+                    comparator: Comparator::LE,
+                    value: QuantityExpr::Fixed { value: n as i32 },
+                },
+            ]),
+    )
+}
+
+fn is_soulshift_trigger_for_n(t: &TriggerDefinition, n: u32) -> bool {
+    soulshift_trigger_n(t) == Some(n)
+}
+
+fn soulshift_trigger_n(t: &TriggerDefinition) -> Option<u32> {
+    if !matches!(t.mode, TriggerMode::ChangesZone)
+        || t.origin != Some(Zone::Battlefield)
+        || t.destination != Some(Zone::Graveyard)
+        || !matches!(t.valid_card, Some(TargetFilter::SelfRef))
+    {
+        return None;
+    }
+    let execute = t.execute.as_deref()?;
+    if !execute.optional {
+        return None;
+    }
+    let Effect::ChangeZone {
+        origin,
+        destination,
+        target,
+        ..
+    } = &*execute.effect
+    else {
+        return None;
+    };
+    if *origin != Some(Zone::Graveyard) || *destination != Zone::Hand {
+        return None;
+    }
+    let TargetFilter::Typed(tf) = target else {
+        return None;
+    };
+    if tf.get_subtype() != Some("Spirit") || tf.controller != Some(ControllerRef::You) {
+        return None;
+    }
+    let mut cmc_le = None;
+    let mut in_graveyard = false;
+    for prop in &tf.properties {
+        match prop {
+            FilterProp::InZone {
+                zone: Zone::Graveyard,
+            } => in_graveyard = true,
+            FilterProp::Cmc {
+                comparator: Comparator::LE,
+                value: QuantityExpr::Fixed { value },
+            } => cmc_le = u32::try_from(*value).ok(),
+            _ => {}
+        }
+    }
+    if in_graveyard {
+        cmc_le
+    } else {
+        None
+    }
 }
 
 /// Builds the CR 702.135a Afterlife dies trigger for `count` Spirit tokens.
@@ -5480,6 +5597,8 @@ pub fn synthesize_all(face: &mut CardFace) {
     // Spirit creature tokens with flying. Self-referential dies trigger shape
     // shared with Undying/Persist.
     synthesize_afterlife(face);
+    // CR 702.46a: Soulshift N — dies trigger returning a Spirit from graveyard.
+    synthesize_soulshift(face);
     // CR 702.112a: Renown N — combat damage to player trigger with
     // designation-setting resolution. CR 702.112c: each instance triggers
     // separately; the resolution-time designation guard suppresses later ones.
@@ -7826,6 +7945,101 @@ mod undying_persist_synthesis_tests {
         assert_eq!(counts, vec![1, 2]);
     }
 
+    /// CR 702.46a: Soulshift N synthesizes an optional dies trigger that returns
+    /// a Spirit from the controller's graveyard.
+    #[test]
+    fn synthesize_soulshift_adds_optional_dies_return_trigger() {
+        let mut face = face_with_keyword(Keyword::Soulshift(4));
+        synthesize_soulshift(&mut face);
+
+        let trigger = face
+            .triggers
+            .iter()
+            .find(|t| is_soulshift_trigger_for_n(t, 4))
+            .expect("soulshift should synthesize a dies trigger");
+
+        assert!(matches!(trigger.mode, TriggerMode::ChangesZone));
+        assert_eq!(trigger.origin, Some(Zone::Battlefield));
+        assert_eq!(trigger.destination, Some(Zone::Graveyard));
+        assert!(matches!(trigger.valid_card, Some(TargetFilter::SelfRef)));
+
+        let execute = trigger.execute.as_deref().expect("execute body required");
+        assert!(execute.optional);
+        let Effect::ChangeZone {
+            origin,
+            destination,
+            target,
+            ..
+        } = &*execute.effect
+        else {
+            panic!("soulshift execute should be Effect::ChangeZone");
+        };
+        assert_eq!(*origin, Some(Zone::Graveyard));
+        assert_eq!(*destination, Zone::Hand);
+        let TargetFilter::Typed(tf) = target else {
+            panic!("soulshift target should be TypedFilter");
+        };
+        assert_eq!(tf.get_subtype(), Some("Spirit"));
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(
+            tf.properties.iter().any(|p| {
+                matches!(
+                    p,
+                    FilterProp::Cmc {
+                        comparator: Comparator::LE,
+                        value: QuantityExpr::Fixed { value: 4 },
+                    }
+                )
+            }),
+            "expected CMC <= 4 filter, got {:?}",
+            tf.properties
+        );
+    }
+
+    #[test]
+    fn synthesize_soulshift_is_idempotent() {
+        let mut face = face_with_keyword(Keyword::Soulshift(3));
+        synthesize_soulshift(&mut face);
+        synthesize_soulshift(&mut face);
+        let count = face
+            .triggers
+            .iter()
+            .filter(|t| is_soulshift_trigger_for_n(t, 3))
+            .count();
+        assert_eq!(count, 1, "soulshift trigger should be deduped");
+    }
+
+    /// CR 702.46b: multiple Soulshift instances trigger separately.
+    #[test]
+    fn synthesize_soulshift_emits_one_trigger_per_instance() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Soulshift(2));
+        face.keywords.push(Keyword::Soulshift(2));
+        synthesize_soulshift(&mut face);
+        let count = face
+            .triggers
+            .iter()
+            .filter(|t| is_soulshift_trigger_for_n(t, 2))
+            .count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn synthesize_soulshift_keeps_distinct_n_values() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Soulshift(2));
+        face.keywords.push(Keyword::Soulshift(5));
+        synthesize_soulshift(&mut face);
+
+        let mut values: Vec<u32> = face
+            .triggers
+            .iter()
+            .filter_map(soulshift_trigger_n)
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, vec![2, 5]);
+    }
+
     /// The Afterlife matcher (Spirit-token effect) must not collide with the
     /// Undying/Persist return triggers, which share the Battlefield→Graveyard
     /// self-ref shape but carry an `Effect::ChangeZone`.
@@ -7910,6 +8124,8 @@ mod undying_persist_runtime_tests {
     use crate::game::printed_cards::apply_card_face_to_object;
     use crate::game::triggers::process_triggers;
     use crate::game::zones::{create_object, move_to_zone};
+    use crate::types::ability::TargetRef;
+    use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
     use crate::types::events::GameEvent;
@@ -7930,6 +8146,43 @@ mod undying_persist_runtime_tests {
         face.card_type.core_types.push(CoreType::Creature);
         synthesize_all(&mut face);
         face
+    }
+
+    fn spirit_card_face(name: &str, mana_value: u32) -> CardFace {
+        let mut face = CardFace {
+            name: name.to_string(),
+            mana_cost: ManaCost::generic(mana_value),
+            power: Some(PtValue::Fixed(1)),
+            toughness: Some(PtValue::Fixed(1)),
+            ..CardFace::default()
+        };
+        face.card_type.core_types.push(CoreType::Creature);
+        face.card_type.subtypes.push("Spirit".to_string());
+        face
+    }
+
+    fn creature_card_face(name: &str, mana_value: u32) -> CardFace {
+        let mut face = CardFace {
+            name: name.to_string(),
+            mana_cost: ManaCost::generic(mana_value),
+            power: Some(PtValue::Fixed(1)),
+            toughness: Some(PtValue::Fixed(1)),
+            ..CardFace::default()
+        };
+        face.card_type.core_types.push(CoreType::Creature);
+        face
+    }
+
+    fn create_face_object(
+        state: &mut GameState,
+        face: &CardFace,
+        owner: PlayerId,
+        zone: Zone,
+    ) -> ObjectId {
+        let card_id = CardId(state.next_object_id);
+        let id = create_object(state, card_id, owner, face.name.clone(), zone);
+        apply_card_face_to_object(state.objects.get_mut(&id).unwrap(), face);
+        id
     }
 
     /// Stand up a two-player state with `face` on the battlefield under
@@ -8127,6 +8380,82 @@ mod undying_persist_runtime_tests {
                 "Spirit token must have flying"
             );
         }
+    }
+
+    /// CR 702.46a runtime path: accepting Soulshift N returns target Spirit card
+    /// with mana value N or less from the controller's graveyard to their hand.
+    #[test]
+    fn soulshift_returns_eligible_spirit_card_from_graveyard() {
+        let face = creature_face_with_keyword("Kami of the Honored Dead", Keyword::Soulshift(4));
+        let (mut state, obj_id) = setup_with_creature(&face, PlayerId(0));
+        let legal_spirit = create_face_object(
+            &mut state,
+            &spirit_card_face("Petalmane Baku", 3),
+            PlayerId(0),
+            Zone::Graveyard,
+        );
+        let too_expensive_spirit = create_face_object(
+            &mut state,
+            &spirit_card_face("High-Cost Spirit", 5),
+            PlayerId(0),
+            Zone::Graveyard,
+        );
+        let non_spirit = create_face_object(
+            &mut state,
+            &creature_card_face("Ordinary Bear", 2),
+            PlayerId(0),
+            Zone::Graveyard,
+        );
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, obj_id, Zone::Graveyard, &mut events);
+        process_triggers(&mut state, &events);
+        if matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }) {
+            crate::game::engine::apply_as_current(
+                &mut state,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(legal_spirit)),
+                },
+            )
+            .expect("choose the only legal Soulshift target");
+        }
+
+        let mut resolve_events = Vec::new();
+        crate::game::stack::resolve_top(&mut state, &mut resolve_events);
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "Soulshift is optional and must ask before returning the Spirit"
+        );
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::DecideOptionalEffect { accept: true },
+        )
+        .expect("accept Soulshift");
+        if matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }) {
+            crate::game::engine::apply_as_current(
+                &mut state,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(legal_spirit)),
+                },
+            )
+            .expect("choose the legal Soulshift target after accepting");
+        }
+
+        assert_eq!(
+            state.objects[&legal_spirit].zone,
+            Zone::Hand,
+            "Soulshift must return the eligible Spirit card to hand"
+        );
+        assert_eq!(
+            state.objects[&too_expensive_spirit].zone,
+            Zone::Graveyard,
+            "Soulshift 4 must not return a Spirit card with mana value 5"
+        );
+        assert_eq!(
+            state.objects[&non_spirit].zone,
+            Zone::Graveyard,
+            "Soulshift must not return a non-Spirit card"
+        );
     }
 
     /// CR 603 multi-trigger semantics: a permanent that carries BOTH Undying
