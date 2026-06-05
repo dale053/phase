@@ -1308,7 +1308,9 @@ fn resolve_ref(
         QuantityRef::SelfManaValue => state
             .objects
             .get(&source_id)
-            .map(|obj| u32_to_i32_saturating(obj.mana_cost.mana_value_with_x(obj.cost_x_paid)))
+            .map(|obj| {
+                u32_to_i32_saturating(obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid))
+            })
             .or_else(|| {
                 state
                     .lki_cache
@@ -1345,7 +1347,7 @@ fn resolve_ref(
                     // CR 202.3e: include X when on the stack (cost_x_paid).
                     // Printed value is stable across zones, no LKI fallback needed.
                     ObjectProperty::ManaValue => Some(u32_to_i32_saturating(
-                        obj.mana_cost.mana_value_with_x(obj.cost_x_paid),
+                        obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid),
                     )),
                 });
                 live.or_else(|| {
@@ -2905,7 +2907,9 @@ fn resolve_object_mana_value(
         ObjectScope::Source => state
             .objects
             .get(&ctx.source)
-            .map(|obj| u32_to_i32_saturating(obj.mana_cost.mana_value_with_x(obj.cost_x_paid)))
+            .map(|obj| {
+                u32_to_i32_saturating(obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid))
+            })
             .or_else(|| {
                 state
                     .lki_cache
@@ -2919,10 +2923,14 @@ fn resolve_object_mana_value(
                 TargetRef::Object(id) => state.objects.get(id),
                 _ => None,
             })
-            .map(|obj| u32_to_i32_saturating(obj.mana_cost.mana_value_with_x(obj.cost_x_paid)))
+            .map(|obj| {
+                u32_to_i32_saturating(obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid))
+            })
             .unwrap_or(0),
         ObjectScope::Recipient => object_for_scope(state, ObjectScope::Recipient, ctx, targets)
-            .map(|obj| u32_to_i32_saturating(obj.mana_cost.mana_value_with_x(obj.cost_x_paid)))
+            .map(|obj| {
+                u32_to_i32_saturating(obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid))
+            })
             .unwrap_or(0),
         ObjectScope::EventSource => {
             let Some(object_id) =
@@ -2933,7 +2941,11 @@ fn resolve_object_mana_value(
             state
                 .objects
                 .get(&object_id)
-                .map(|obj| u32_to_i32_saturating(obj.mana_cost.mana_value_with_x(obj.cost_x_paid)))
+                .map(|obj| {
+                    u32_to_i32_saturating(
+                        obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid),
+                    )
+                })
                 .or_else(|| {
                     state
                         .lki_cache
@@ -3009,7 +3021,9 @@ fn resolve_object_mana_value(
                         .objects
                         .get(&id)
                         .map(|obj| {
-                            u32_to_i32_saturating(obj.mana_cost.mana_value_with_x(obj.cost_x_paid))
+                            u32_to_i32_saturating(
+                                obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid),
+                            )
                         })
                         .or_else(|| {
                             state

@@ -531,7 +531,7 @@ pub(crate) fn apply_damage_after_replacement(
             record.source_toughness = obj.toughness;
             record.source_colors = obj.color.clone();
             // CR 202.3e: include cost_x_paid for on-stack spells.
-            record.source_mana_value = obj.mana_cost.mana_value_with_x(obj.cost_x_paid);
+            record.source_mana_value = obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid);
             record.source_controller_snapshot = obj.controller;
             record.source_owner = obj.owner;
             // CR 608.2i: snapshot the source's zone (Stack for a spell,

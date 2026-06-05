@@ -3899,7 +3899,7 @@ fn validate_target_constraints(
                         TargetRef::Object(id) => state
                             .objects
                             .get(id)
-                            .map(|o| o.mana_cost.mana_value_with_x(o.cost_x_paid) as i32),
+                            .map(|o| o.mana_cost.mana_value_with_x(o.zone, o.cost_x_paid) as i32),
                         TargetRef::Player(_) => None,
                     })
                     .sum();

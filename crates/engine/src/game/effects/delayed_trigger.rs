@@ -370,7 +370,7 @@ fn snapshot_quantity_ref(
             let value = state
                 .objects
                 .get(&target_object_id)
-                .map(|obj| obj.mana_cost.mana_value_with_x(obj.cost_x_paid) as i32)
+                .map(|obj| obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid) as i32)
                 .or_else(|| {
                     state
                         .lki_cache

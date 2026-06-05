@@ -32,7 +32,7 @@ pub fn resolve(
     let source_mv = state
         .objects
         .get(&ability.source_id)
-        .map(|obj| obj.mana_cost.mana_value_with_x(obj.cost_x_paid))
+        .map(|obj| obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid))
         .unwrap_or(0);
 
     // CR 603.3a: Re-read the controller from the source spell at resolution
