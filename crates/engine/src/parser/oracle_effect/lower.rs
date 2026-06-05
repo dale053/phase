@@ -370,6 +370,10 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
         // `parse_target_with_ctx` during chunk parse. `Random` flips the engine
         // off the controller-choice path at target-selection time.
         def.target_selection_mode = clause_ir.target_selection_mode;
+        // CR 601.2c + CR 603.3d: copy the per-clause target chooser captured by
+        // `parse_target_with_ctx` during chunk parse, so a targeted "of their
+        // choice" routes target selection to the scoped (upkeep) player.
+        def.target_chooser = clause_ir.target_chooser.clone();
         let clause_sub = if is_target_only {
             def.sub_ability = clause_ir.parsed.sub_ability.clone();
             None
@@ -2325,6 +2329,56 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
         if lower.ends_with(suffix) {
             let end = text.len() - suffix.len();
             return (text[..end].trim_end_matches(',').trim(), Some(duration));
+        }
+    }
+
+    // CR 611.2a: Duration mid-clause before a trailing conjunct, variable
+    // definition, or alternative expiry. End-of-string durations are handled
+    // above. Do NOT treat " unless " as a boundary here — unless-pay parsers
+    // (`try_parse_unless_player_have_deal_damage`, `extract_resolution_unless_pay_modifier`)
+    // own that tail and must see the full phrase.
+    for (phrase, duration) in [
+        (" until end of turn", Duration::UntilEndOfTurn),
+        (" this turn", Duration::UntilEndOfTurn),
+        (" until end of combat", Duration::UntilEndOfCombat),
+        (
+            " until the end of your next turn",
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+        ),
+        (
+            " until the end of their next turn",
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+        ),
+        (
+            " until their next turn",
+            Duration::UntilNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+        ),
+        (
+            " until your next turn",
+            Duration::UntilNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+        ),
+        (
+            " until ~ leaves the battlefield",
+            Duration::UntilHostLeavesPlay,
+        ),
+        (
+            " until this creature leaves the battlefield",
+            Duration::UntilHostLeavesPlay,
+        ),
+    ] {
+        for delimiter in [", or ", ", where "] {
+            let pattern = format!("{phrase}{delimiter}");
+            if let Some(pos) = lower.find(&pattern) {
+                return (text[..pos].trim_end(), Some(duration));
+            }
         }
     }
 
@@ -4322,9 +4376,19 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
             } else {
                 inner
             };
-            return Some(QuantityExpr::Offset {
+            let offset = QuantityExpr::Offset {
                 inner: Box::new(inner),
                 offset: n as i32,
+            };
+            // CR 107.1b: "where X is N minus …" can resolve negative; damage
+            // and other effect-result quantities use zero instead (The Rack).
+            return Some(if sign < 0 {
+                QuantityExpr::ClampMin {
+                    inner: Box::new(offset),
+                    minimum: 0,
+                }
+            } else {
+                offset
             });
         }
     }

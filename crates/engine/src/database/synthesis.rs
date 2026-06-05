@@ -8857,6 +8857,64 @@ mod evoke_synthesis_tests {
         synthesize_evoke(&mut face);
         assert!(face.triggers.is_empty());
     }
+
+    /// Issue #580: MTGJSON's bare "Evoke" keyword must be replaced by the
+    /// parser-extracted non-mana cost from the Oracle evoke line.
+    #[test]
+    fn build_oracle_face_solitude_evoke_merges_to_non_mana() {
+        use crate::types::keywords::EvokeCost;
+
+        let mtgjson = AtomicCard {
+            name: "Solitude".to_string(),
+            mana_cost: Some("{3}{W}{W}".to_string()),
+            colors: vec!["W".to_string()],
+            color_identity: vec!["W".to_string()],
+            power: Some("3".to_string()),
+            toughness: Some("2".to_string()),
+            loyalty: None,
+            defense: None,
+            text: Some(
+                "Flash\nLifelink\nWhen this creature enters, exile up to one other target creature. That creature's controller gains life equal to its power.\nEvoke\u{2014}Exile a white card from your hand.".to_string(),
+            ),
+            layout: "normal".to_string(),
+            type_line: Some("Creature — Elemental Incarnation".to_string()),
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Elemental".to_string(), "Incarnation".to_string()],
+            supertypes: Vec::new(),
+            keywords: Some(vec![
+                "Flash".to_string(),
+                "Lifelink".to_string(),
+                "Evoke".to_string(),
+            ]),
+            side: None,
+            face_name: None,
+            mana_value: 5.0,
+            legalities: Default::default(),
+            leadership_skills: None,
+            printings: Vec::new(),
+            rulings: Vec::new(),
+            is_game_changer: false,
+            identifiers: crate::database::mtgjson::AtomicIdentifiers {
+                scryfall_id: None,
+                scryfall_oracle_id: None,
+            },
+            foreign_data: Vec::new(),
+        };
+
+        let face = build_oracle_face(&mtgjson, None);
+        let evoke = face
+            .keywords
+            .iter()
+            .find_map(|k| match k {
+                Keyword::Evoke(cost) => Some(cost),
+                _ => None,
+            })
+            .expect("Solitude must carry Evoke after synthesis");
+        assert!(
+            matches!(evoke, EvokeCost::NonMana(AbilityCost::Exile { .. })),
+            "MTGJSON bare Evoke must merge to NonMana(Exile), got {evoke:?}"
+        );
+    }
 }
 
 #[cfg(test)]
