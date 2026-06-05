@@ -1136,25 +1136,24 @@ fn lift_parent_target_to_triggering_source_in_ability(ability: &mut AbilityDefin
 /// and `Or`/`And` combinations of them); false for anaphoric/contextual refs
 /// (`ParentTarget`, `TriggeringSource`, `SelfRef`, …) and untargeted effects.
 ///
-/// `RevealTop` and `Dig { reveal: true }` also return `true`: these effects
-/// place result objects into `state.last_revealed_ids`, and sub-abilities that
-/// follow them bind `ParentTarget` to those revealed objects — NOT to the
+/// Effects that write `state.last_revealed_ids` also return `true`: sub-abilities
+/// that follow them bind `ParentTarget` to those revealed objects — NOT to the
 /// trigger event source. Allowing the lift to descend past a `RevealTop` would
 /// rewrite the sub-ability's `ChangeZone.target` from `ParentTarget` to
 /// `TriggeringSource`, causing the engine to put the *trigger source* (e.g.,
 /// Coiling Oracle) onto the battlefield instead of the revealed land card,
 /// which then re-emits a `ZoneChanged` event and loops the ETB trigger
-/// (CR 603.2: triggers fire only when their specific condition is met — the
+/// (CR 603.2g: triggers fire only when their specific event occurs — the
 /// trigger source must be the entering object).
 fn introduces_chosen_object_target(effect: &Effect) -> bool {
-    // CR 608.2c + CR 603.2: RevealTop/Dig(reveal) introduce objects via
-    // state.last_revealed_ids. Sub-ability ParentTarget binds to those
-    // revealed objects, not to the trigger event source. Stopping the lift
-    // here prevents TriggeringSource from overriding the injected
-    // last_revealed_ids targets in downstream ChangeZone sub-abilities.
+    // CR 608.2c + CR 603.2g: Effects that populate state.last_revealed_ids
+    // introduce revealed objects. Sub-ability ParentTarget binds to those
+    // objects, not to the trigger event source. Stopping the lift here prevents
+    // TriggeringSource from overriding the injected last_revealed_ids targets
+    // in downstream ChangeZone sub-abilities.
     if matches!(
         effect,
-        Effect::RevealTop { .. } | Effect::Dig { reveal: true, .. }
+        Effect::RevealTop { .. } | Effect::Dig { .. } | Effect::RevealUntil { .. } | Effect::Clash
     ) {
         return true;
     }
