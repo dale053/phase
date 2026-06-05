@@ -10,6 +10,8 @@ pub(crate) mod sequence;
 pub(crate) mod subject;
 pub(crate) mod token;
 
+pub(crate) use search::parse_search_name_reference_suffix;
+
 pub(crate) use lower::{
     capitalize, lower_effect_chain_ir, parse_controls_permanent_object,
     parse_counter_suffix_body_combinator, parse_with_counters_suffix, strip_trailing_duration,
@@ -2037,7 +2039,7 @@ fn try_parse_unless_player_have_deal_damage(
     ctx: &mut ParseContext,
 ) -> Option<ParsedEffectClause> {
     let (before_unless, _, after_unless) =
-        nom_primitives::scan_preceded(tp.lower, |i| tag(" unless a player has ").parse(i))?;
+        nom_primitives::scan_preceded(tp.lower, |i| tag("unless a player has ").parse(i))?;
     let cost = parse_unless_player_have_deal_damage_cost(after_unless)?;
     let cleaned = tp.original[..before_unless.trim_end().len()].trim();
     let diagnostics_snapshot = ctx.diagnostics.len();
@@ -2927,6 +2929,9 @@ fn parse_event_context_ref_with_ctx<'a>(
     let target = match (&target, ctx.relative_player_scope.as_ref()) {
         (TargetFilter::TriggeringPlayer, Some(ControllerRef::ScopedPlayer)) => {
             TargetFilter::ScopedPlayer
+        }
+        (TargetFilter::TriggeringPlayer, Some(ControllerRef::SourceChosenPlayer)) => {
+            TargetFilter::SourceChosenPlayer
         }
         (TargetFilter::TriggeringPlayer, Some(ControllerRef::ParentTargetController)) => {
             TargetFilter::ParentTargetController
@@ -8889,8 +8894,8 @@ fn try_parse_compound_shuffle(text: &str) -> Option<ParsedEffectClause> {
 /// <subject-B> each <body>" into an AbilityDefinition chain whose halves apply
 /// `<body>` to two different recipients.
 ///
-/// Recognized subject axes (each is one `alt()` call; permutations are never
-/// enumerated):
+/// Recognized static subject axes (each is one `alt()` call; permutations are
+/// never enumerated):
 /// - First subject: `you` → `OriginalController` (player axis), or `~` →
 ///   `SelfRef` (object axis — the ability source, e.g. Gogo).
 /// - Second subject: `that player` → `ScopedPlayer` (the iterated voter for
@@ -8918,33 +8923,93 @@ fn try_parse_compound_shuffle(text: &str) -> Option<ParsedEffectClause> {
 /// returned and the caller falls through to Unimplemented.
 /// CR 109.5 + CR 608.2c: Parse the compound-subject distribution prefix
 /// (`"<A> and <B> each "`), returning the two authoritatively-bound recipient
-/// filters and the remaining body text offset. Composed from independent
-/// dimensions (first-subject × second-subject × "each"); each axis is one
-/// `alt()` call so new compound forms extend without enumerating permutations.
+/// filters and the remaining body text offset. Static dimensions are composed
+/// from independent `alt()` axes; the dynamic controlled-creature subject is a
+/// fallback for type phrases such as "Drakes you control each".
 ///
 /// Shared by `try_parse_compound_subject_each` (which builds the distributed
 /// chain) and `text_is_compound_subject_distribution` (the chunk-loop guard
 /// that protects the bound recipients from post-distribution anaphoric
 /// re-targeting). Keeping the prefix grammar in one place ensures the guard
 /// and the distributor never drift.
-fn parse_compound_subject_prefix(lower: &str) -> Option<(usize, TargetFilter, TargetFilter)> {
-    let parser: nom::IResult<&str, (TargetFilter, TargetFilter), OracleError<'_>> = (
+/// Second-subject axis: "{type phrase} you control each " (Alandra, Sky Dreamer:
+/// "~ and Drakes you control each get +X/+X until end of turn").
+fn parse_controlled_creature_each_second_subject(rest: &str) -> Option<(usize, TargetFilter)> {
+    const SUFFIX: &str = " you control each ";
+    let (remaining, type_phrase) = terminated(
+        take_until::<_, _, OracleError<'_>>(SUFFIX),
+        tag::<_, _, OracleError<'_>>(SUFFIX),
+    )
+    .parse(rest)
+    .ok()?;
+    let type_phrase = type_phrase.trim();
+    if type_phrase.is_empty() || type_phrase_has_compound_conjunction(type_phrase) {
+        return None;
+    }
+    let normalized = format!("all {type_phrase} you control");
+    let (filter, remainder) = parse_target(&normalized);
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::None) {
+        return None;
+    }
+    Some((rest.len() - remaining.len(), filter))
+}
+
+fn type_phrase_has_compound_conjunction(type_phrase: &str) -> bool {
+    take_until::<_, _, OracleError<'_>>(" and ")
+        .parse(type_phrase)
+        .is_ok()
+}
+
+fn parse_static_compound_subject_prefix(
+    lower: &str,
+) -> Option<(usize, TargetFilter, TargetFilter)> {
+    let (remaining, (first_filter, second_filter)) = (
         alt((
-            value(TargetFilter::OriginalController, tag("you and ")),
+            value(
+                TargetFilter::OriginalController,
+                tag::<_, _, OracleError<'_>>("you and "),
+            ),
             value(TargetFilter::SelfRef, tag("~ and ")),
         )),
         alt((
-            value(TargetFilter::ScopedPlayer, tag("that player ")),
-            value(TargetFilter::Player, tag("target opponent ")),
-            value(TargetFilter::Player, tag("target player ")),
-            value(TargetFilter::ParentTarget, tag("that creature ")),
+            value(
+                TargetFilter::ScopedPlayer,
+                tag::<_, _, OracleError<'_>>("that player each "),
+            ),
+            value(TargetFilter::Player, tag("target opponent each ")),
+            value(TargetFilter::Player, tag("target player each ")),
+            value(TargetFilter::ParentTarget, tag("that creature each ")),
         )),
-        value((), tag("each ")),
     )
         .parse(lower)
-        .map(|(rest, (first, second, ()))| (rest, (first, second)));
-    let (lower_rest, (first_filter, second_filter)) = parser.ok()?;
-    Some((lower.len() - lower_rest.len(), first_filter, second_filter))
+        .ok()?;
+    Some((lower.len() - remaining.len(), first_filter, second_filter))
+}
+
+fn parse_dynamic_compound_subject_prefix(
+    lower: &str,
+) -> Option<(usize, TargetFilter, TargetFilter)> {
+    let (remaining, first_filter) = alt((
+        value(
+            TargetFilter::OriginalController,
+            tag::<_, _, OracleError<'_>>("you and "),
+        ),
+        value(TargetFilter::SelfRef, tag("~ and ")),
+    ))
+    .parse(lower)
+    .ok()?;
+    let (second_consumed, second_filter) =
+        parse_controlled_creature_each_second_subject(remaining)?;
+    Some((
+        lower.len() - remaining.len() + second_consumed,
+        first_filter,
+        second_filter,
+    ))
+}
+
+fn parse_compound_subject_prefix(lower: &str) -> Option<(usize, TargetFilter, TargetFilter)> {
+    parse_static_compound_subject_prefix(lower)
+        .or_else(|| parse_dynamic_compound_subject_prefix(lower))
 }
 
 /// CR 109.5 + CR 608.2c: True when `text` opens with a compound-subject
@@ -8963,11 +9028,9 @@ fn try_parse_compound_subject_each(
     ctx: &mut ParseContext,
 ) -> Option<ParsedEffectClause> {
     let lower = text.to_lowercase();
-    // Compose the prefix from independent dimensions via the shared
-    //   first-subject × " and " × second-subject × " each " × <body>
-    // grammar in `parse_compound_subject_prefix` (kept in lockstep with the
-    // chunk-loop guard `text_is_compound_subject_distribution`). Each axis is
-    // one alt() call; we never enumerate the permutations.
+    // Compose the prefix through the shared grammar in
+    // `parse_compound_subject_prefix` (kept in lockstep with the chunk-loop guard
+    // `text_is_compound_subject_distribution`).
     let (consumed_prefix, first_filter, second_filter) =
         parse_compound_subject_prefix(lower.as_str())?;
 
@@ -10503,7 +10566,7 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         } if *fight_subject == TargetFilter::SelfRef => {
             *fight_subject = subject_filter;
         }
-        // CR 613.3 + CR 110.2: "[Player] gains control of [object]" — when the
+        // CR 613.1b + CR 110.2: "[Player] gains control of [object]" — when the
         // acting subject is a non-controller player (e.g. "an opponent of your
         // choice gains control of it"), the semantics are GIVE (the current
         // controller transfers the object to that player), not TAKE (the
@@ -13017,6 +13080,72 @@ fn apply_player_scope_rewrites(def: &mut AbilityDefinition) {
 /// [`rewrite_player_scope_refs`] but is deliberately narrower — it touches only
 /// quantity refs, never `You`-scoped filters, so "you draw a card" on the same
 /// trigger still acts for the controller.
+/// CR 613.1 + CR 503.1a: Rebind possessive player quantities in a trigger
+/// whose condition names "the chosen player's" phase step (The Rack) to read
+/// the source's persisted `ChosenAttribute::Player`.
+pub(crate) fn rewrite_player_quantity_refs_to_source_chosen(def: &mut AbilityDefinition) {
+    use crate::types::ability::{CountScope, PlayerScope, QuantityRef, ZoneRef};
+
+    fn rewrite_qty(expr: &mut QuantityExpr) {
+        match expr {
+            QuantityExpr::Ref { qty } => match qty {
+                QuantityRef::LifeTotal { player }
+                | QuantityRef::HandSize { player }
+                | QuantityRef::LifeLostThisTurn { player }
+                | QuantityRef::LifeGainedThisTurn { player }
+                | QuantityRef::PartySize { player }
+                    if matches!(
+                        *player,
+                        PlayerScope::Target | PlayerScope::ScopedPlayer | PlayerScope::Controller
+                    ) =>
+                {
+                    *player = PlayerScope::SourceChosenPlayer;
+                }
+                QuantityRef::TargetZoneCardCount { zone } => match zone {
+                    ZoneRef::Hand => {
+                        *qty = QuantityRef::HandSize {
+                            player: PlayerScope::SourceChosenPlayer,
+                        }
+                    }
+                    ZoneRef::Library | ZoneRef::Graveyard => {
+                        *qty = QuantityRef::ZoneCardCount {
+                            zone: zone.clone(),
+                            card_types: Vec::new(),
+                            scope: CountScope::SourceChosenPlayer,
+                        };
+                    }
+                    ZoneRef::Exile => {}
+                },
+                _ => {}
+            },
+            QuantityExpr::DivideRounded { inner, .. }
+            | QuantityExpr::Multiply { inner, .. }
+            | QuantityExpr::ClampMin { inner, .. }
+            | QuantityExpr::Offset { inner, .. } => rewrite_qty(inner),
+            QuantityExpr::Sum { exprs } => {
+                for inner in exprs {
+                    rewrite_qty(inner);
+                }
+            }
+            QuantityExpr::UpTo { max } => rewrite_qty(max),
+            QuantityExpr::Power { exponent, .. } => rewrite_qty(exponent),
+            QuantityExpr::Difference { left, right } => {
+                rewrite_qty(left);
+                rewrite_qty(right);
+            }
+            QuantityExpr::Fixed { .. } => {}
+        }
+    }
+
+    each_quantity_expr_mut(&mut def.effect, &mut rewrite_qty);
+    if let Some(sub) = def.sub_ability.as_mut() {
+        rewrite_player_quantity_refs_to_source_chosen(sub);
+    }
+    if let Some(else_branch) = def.else_ability.as_mut() {
+        rewrite_player_quantity_refs_to_source_chosen(else_branch);
+    }
+}
+
 pub(crate) fn rewrite_event_player_quantity_refs_to_scoped(def: &mut AbilityDefinition) {
     use crate::types::ability::{CountScope, PlayerScope, QuantityRef, ZoneRef};
 
@@ -16428,6 +16557,24 @@ fn extract_resolution_unless_pay_modifier(
         .is_ok()
     {
         return (text.to_string(), None);
+    }
+
+    // CR 118.12a: "[Effect] unless a player has [~] deal N to them" (Barbarian
+    // Bully). Checked before the generic "unless " scan so the player-have-deal
+    // shape is not misclassified as a mana-payment unless.
+    if let Some((before_unless, _, after_unless_lower)) =
+        nom_primitives::scan_preceded(&lower, |i| tag("unless a player has ").parse(i))
+    {
+        if let Some(cost) = parse_unless_player_have_deal_damage_cost(after_unless_lower) {
+            let cleaned = text[..before_unless.trim_end().len()].trim().to_string();
+            return (
+                cleaned,
+                Some(UnlessPayModifier {
+                    cost,
+                    payer: TargetFilter::AllPlayers,
+                }),
+            );
+        }
     }
 
     // CR 118.12a: "[Effect] unless they X [or Y]" — the targeted player is
@@ -20255,6 +20402,50 @@ mod tests {
                 },
             }
         );
+    }
+
+    /// CR 118.12a + CR 701.9: Wrench Mind — "unless they discard an artifact
+    /// card" must hoist to `unless_pay`, not fire the two-card discard
+    /// unconditionally (issue #2361).
+    #[test]
+    fn effect_wrench_mind_unless_discard_artifact_card() {
+        let def = parse_effect_chain(
+            "Target player discards two cards unless they discard an artifact card",
+            AbilityKind::Spell,
+        );
+        let unless_pay = def.unless_pay.expect("should attach unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::Player);
+        match &unless_pay.cost {
+            AbilityCost::Discard { count, filter, .. } => {
+                assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+                assert!(filter.is_some(), "artifact filter required");
+            }
+            other => panic!("expected Discard unless cost, got {other:?}"),
+        }
+        match &*def.effect {
+            Effect::Discard { count, .. } => {
+                assert_eq!(*count, QuantityExpr::Fixed { value: 2 });
+            }
+            other => panic!("expected Discard primary effect, got {other:?}"),
+        }
+    }
+
+    /// Tyrannize — "unless they pay 7 life" must attach `unless_pay` with a
+    /// life cost (issue #2361).
+    #[test]
+    fn effect_tyrannize_unless_pay_seven_life() {
+        let def = parse_effect_chain(
+            "Target player discards their hand unless they pay 7 life",
+            AbilityKind::Spell,
+        );
+        let unless_pay = def.unless_pay.expect("should attach unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::Player);
+        assert!(matches!(
+            unless_pay.cost,
+            AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 7 }
+            }
+        ));
     }
 
     /// CR 118.12a: "unless they pay {N}" — `they` anaphors to the targeted
