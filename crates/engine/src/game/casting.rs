@@ -891,17 +891,27 @@ fn transient_granted_spell_keywords(
 /// prompting the controller to choose among them. Offering a choice across
 /// multiple simultaneous grants needs a multi-alternative choice surface and is
 /// a known limitation tracked for follow-up, not implemented here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct GrantedSpellAlternativeCost {
+    pub(super) cost: AbilityCost,
+    pub(super) timing_permission: Option<CastTimingPermission>,
+}
+
 pub(super) fn granted_spell_alternative_cost(
     state: &GameState,
     caster: PlayerId,
     object_id: ObjectId,
-) -> Option<AbilityCost> {
+) -> Option<GrantedSpellAlternativeCost> {
     let spell_obj = state.objects.get(&object_id)?;
     let origin_zone = pending_cast_origin_zone_for(state, object_id).unwrap_or(spell_obj.zone);
 
     // CR 604.1: Functioning gate owned by `game_active_statics`.
     for (source_obj, def) in super::functioning_abilities::game_active_statics(state) {
-        let StaticMode::CastWithAlternativeCost { cost } = &def.mode else {
+        let StaticMode::CastWithAlternativeCost {
+            cost,
+            timing_permission,
+        } = &def.mode
+        else {
             continue;
         };
 
@@ -917,7 +927,10 @@ pub(super) fn granted_spell_alternative_cost(
             )
         });
         if matches {
-            return Some(AbilityCost::Mana { cost: cost.clone() });
+            return Some(GrantedSpellAlternativeCost {
+                cost: cost.clone(),
+                timing_permission: *timing_permission,
+            });
         }
     }
 
@@ -3178,6 +3191,28 @@ fn prepare_spell_cast_with_variant_override_inner(
                     casting_variant,
                 )?;
                 mana_cost = restrictions::add_mana_cost(&mana_cost, &flash_cost);
+                if cast_outside_sorcery_timing {
+                    cast_timing_permission = Some(CastTimingPermission::AsThoughHadFlash);
+                }
+            } else if casting_costs::payable_spell_alternative_cost_for_timing(
+                state,
+                player,
+                object_id,
+                CastTimingPermission::AsThoughHadFlash,
+            )
+            .is_some()
+            {
+                // CR 118.9 + CR 702.8a: Some alternative-cost grants also
+                // permit the spell to be cast as though it had flash, but only
+                // when the spell is cast using that alternative cost.
+                restrictions::check_spell_timing(
+                    state,
+                    player,
+                    obj,
+                    ability_def.as_ref(),
+                    true,
+                    casting_variant,
+                )?;
                 if cast_outside_sorcery_timing {
                     cast_timing_permission = Some(CastTimingPermission::AsThoughHadFlash);
                 }
@@ -18640,6 +18675,96 @@ mod tests {
         assert_eq!(
             state.objects.get(&obj_id).unwrap().cast_timing_permission,
             None
+        );
+    }
+
+    fn add_primal_prayers_grant(state: &mut GameState, controller: PlayerId) -> ObjectId {
+        let source = create_object(
+            state,
+            CardId(24028),
+            controller,
+            "Primal Prayers".to_string(),
+            Zone::Battlefield,
+        );
+        let grant = StaticDefinition::new(StaticMode::CastWithAlternativeCost {
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 1 },
+            },
+            timing_permission: Some(CastTimingPermission::AsThoughHadFlash),
+        })
+        .affected(TargetFilter::Typed(
+            TypedFilter::creature()
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::Cmc {
+                    comparator: Comparator::LE,
+                    value: QuantityExpr::Fixed { value: 3 },
+                }]),
+        ))
+        .active_zones(vec![Zone::Battlefield]);
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(grant);
+        source
+    }
+
+    /// CR 118.9 + CR 702.8a: Primal Prayers' flash rider is conditional on
+    /// casting the spell for the {E} alternative cost. Normal-cost creature
+    /// casts do not gain instant-speed timing.
+    #[test]
+    fn primal_prayers_flash_rider_does_not_authorize_normal_cost_cast() {
+        let mut state = setup_game_at_main_phase();
+        state.phase = Phase::End;
+        state.active_player = PlayerId(1);
+        state.priority_player = PlayerId(0);
+        add_primal_prayers_grant(&mut state, PlayerId(0));
+
+        let spell_id = create_creature_spell_in_hand(&mut state, PlayerId(0));
+        let card_id = state.objects.get(&spell_id).unwrap().card_id;
+        state.objects.get_mut(&spell_id).unwrap().mana_cost = ManaCost::generic(1);
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+
+        let err = handle_cast_spell(&mut state, PlayerId(0), spell_id, card_id, &mut Vec::new())
+            .expect_err("normal-cost creature cast must not inherit Primal Prayers flash");
+
+        assert!(
+            matches!(err, EngineError::ActionNotAllowed(_)),
+            "expected timing rejection, got {err:?}"
+        );
+        assert_eq!(state.stack.len(), 0);
+    }
+
+    /// CR 118.9 + CR 107.14 + CR 702.8a: When Primal Prayers is the timing
+    /// permission used to cast outside sorcery timing, the {E} alternative cost
+    /// is the only legal cost path and is paid immediately.
+    #[test]
+    fn primal_prayers_outside_timing_requires_energy_alternative_cost() {
+        let mut state = setup_game_at_main_phase();
+        state.phase = Phase::End;
+        state.active_player = PlayerId(1);
+        state.priority_player = PlayerId(0);
+        state.players[0].energy = 1;
+        add_primal_prayers_grant(&mut state, PlayerId(0));
+
+        let spell_id = create_creature_spell_in_hand(&mut state, PlayerId(0));
+        let card_id = state.objects.get(&spell_id).unwrap().card_id;
+        state.objects.get_mut(&spell_id).unwrap().mana_cost = ManaCost::generic(1);
+
+        let waiting =
+            handle_cast_spell(&mut state, PlayerId(0), spell_id, card_id, &mut Vec::new())
+                .expect("payable Primal Prayers alternative cost should authorize the cast");
+
+        assert!(
+            matches!(waiting, WaitingFor::Priority { .. }),
+            "the timing-required alternative cost should be paid directly, got {waiting:?}"
+        );
+        assert_eq!(state.players[0].energy, 0);
+        assert_eq!(state.stack.len(), 1);
+        assert_eq!(
+            state.objects.get(&spell_id).unwrap().cast_timing_permission,
+            Some((CastTimingPermission::AsThoughHadFlash, state.turn_number))
         );
     }
 

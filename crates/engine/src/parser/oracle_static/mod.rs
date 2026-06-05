@@ -124,7 +124,9 @@ mod support {
     pub(super) use super::{lower_static_ir, parse_static_line};
 }
 
-pub(crate) use cost_mod::parse_spells_alternative_cost;
+pub(crate) use cost_mod::{
+    parse_cast_spells_alternative_cost_multi, parse_spells_alternative_cost,
+};
 pub(crate) use evasion::classify_block_exception;
 pub(crate) use keyword_grant::{
     classify_quoted_inner, parse_chosen_qualifier_subject, parse_continuous_modifications,
