@@ -1858,7 +1858,8 @@ fn spell_cast_record_from_object(spell_obj: &GameObject) -> SpellCastRecord {
         subtypes: spell_obj.card_types.subtypes.clone(),
         keywords: spell_obj.keywords.clone(),
         colors: spell_obj.color.clone(),
-        mana_value: spell_obj.mana_cost.mana_value(),
+        // CR 202.3e: While on the stack, X equals the announced value, not 0.
+        mana_value: spell_obj.mana_cost.mana_value_with_x(spell_obj.cost_x_paid),
         has_x_in_cost: crate::game::casting_costs::cost_has_x(&spell_obj.mana_cost),
         from_zone: spell_obj.zone,
         cast_variant: crate::types::game_state::CastingVariant::Normal,
@@ -2538,8 +2539,9 @@ fn matches_filter_prop(
         // CR 202.3: Mana value threshold comparisons. Dynamic thresholds
         // (`QuantityRef::Variable { "X" }`) resolve against the ability's
         // `chosen_x` when a `ResolvedAbility` is in scope via `FilterContext::from_ability`.
+        // CR 202.3e: For on-stack objects, X equals the announced value, not 0.
         FilterProp::Cmc { comparator, value } => {
-            let cmc = obj.mana_cost.mana_value() as i32;
+            let cmc = obj.mana_cost.mana_value_with_x(obj.cost_x_paid) as i32;
             comparator.evaluate(cmc, resolve_filter_threshold(state, value, source))
         }
         // CR 202.1: Compare exact printed mana cost, not mana value (CR 202.3).
@@ -3509,7 +3511,8 @@ fn object_shared_quality_values(
             name: &obj.name,
             power: obj.power,
             toughness: obj.toughness,
-            mana_value: obj.mana_cost.mana_value(),
+            // CR 202.3e: For on-stack objects, X equals the announced value, not 0.
+            mana_value: obj.mana_cost.mana_value_with_x(obj.cost_x_paid),
             core_types: &obj.card_types.core_types,
             subtypes: &obj.card_types.subtypes,
             colors: &obj.color,

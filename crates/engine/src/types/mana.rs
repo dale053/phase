@@ -829,6 +829,13 @@ impl ManaCost {
         }
     }
 
+    /// CR 202.3e: Mana value while the spell is on the stack — X equals the
+    /// announced value, not 0. Pass `obj.cost_x_paid` for on-stack objects;
+    /// pass `None` for non-stack objects (equivalent to `mana_value()`).
+    pub fn mana_value_with_x(&self, cost_x_paid: Option<u32>) -> u32 {
+        self.mana_value() + cost_x_paid.unwrap_or(0)
+    }
+
     /// CR 508.1h + CR 509.1d: Aggregate this cost with another cost, producing a
     /// combined "locked in" total. Used for combat-tax aggregation where multiple
     /// UnlessPay static abilities apply to the same attacker/blocker (e.g., two
@@ -2020,12 +2027,37 @@ mod tests {
 
     #[test]
     fn mana_value_x_contributes_zero() {
-        // CR 202.3e: {X}{R} → 0 + 1 = 1
+        // CR 202.3e: {X}{R} → 0 + 1 = 1 (off-stack, X=0)
         let cost = ManaCost::Cost {
             shards: vec![ManaCostShard::X, ManaCostShard::Red],
             generic: 0,
         };
         assert_eq!(cost.mana_value(), 1);
+    }
+
+    #[test]
+    fn mana_value_with_x_includes_chosen_value() {
+        // CR 202.3e: {X}{R}{R} cast with X=4 → 4 + 1 + 1 = 6 while on the stack.
+        let cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::X, ManaCostShard::Red, ManaCostShard::Red],
+            generic: 0,
+        };
+        assert_eq!(cost.mana_value_with_x(Some(4)), 6);
+        assert_eq!(cost.mana_value_with_x(None), 2);
+        assert_eq!(cost.mana_value_with_x(Some(0)), 2);
+    }
+
+    #[test]
+    fn mana_value_with_x_no_x_shard_adds_x_paid() {
+        // mana_value_with_x adds cost_x_paid unconditionally; the {X} shard's
+        // mana_value_contribution() is already 0, so adding cost_x_paid is the
+        // full on-stack mana value regardless of whether an {X} shard is present.
+        let cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Red, ManaCostShard::Blue],
+            generic: 1,
+        };
+        assert_eq!(cost.mana_value_with_x(Some(5)), 8); // 1R+1U+1 generic = 3, +5 = 8
+        assert_eq!(cost.mana_value_with_x(None), 3);
     }
 
     #[test]
