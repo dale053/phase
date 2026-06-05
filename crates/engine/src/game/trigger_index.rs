@@ -176,13 +176,15 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         TriggerMode::Attacks
         | TriggerMode::AttackersDeclared
         | TriggerMode::YouAttack
-        | TriggerMode::AttackersDeclaredOneTarget
-        | TriggerMode::AttackerBlocked
+        | TriggerMode::AttackersDeclaredOneTarget => push(TriggerEventKey::Attacks),
+        TriggerMode::AttackerBlocked
         | TriggerMode::AttackerBlockedOnce
         | TriggerMode::AttackerBlockedByCreature
         | TriggerMode::AttackerUnblocked
-        | TriggerMode::AttackerUnblockedOnce => push(TriggerEventKey::Attacks),
-        TriggerMode::Blocks | TriggerMode::BlockersDeclared | TriggerMode::BecomesBlocked => {
+        | TriggerMode::AttackerUnblockedOnce
+        | TriggerMode::Blocks
+        | TriggerMode::BlockersDeclared
+        | TriggerMode::BecomesBlocked => {
             push(TriggerEventKey::Blocks);
         }
 
@@ -687,6 +689,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::TimeTravel
         | EffectKind::BecomeMonarch
         | EffectKind::Proliferate
+        | EffectKind::ProliferateTarget
         | EffectKind::EndTheTurn
         | EffectKind::EndCombatPhase
         | EffectKind::Populate

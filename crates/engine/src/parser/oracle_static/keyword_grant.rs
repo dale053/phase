@@ -1,4 +1,4 @@
-// CR 613.3f (Layer 6) — keyword-grant static abilities.
+// CR 613.1f (Layer 6) — keyword-grant static abilities (ability-adding effects).
 
 #[allow(unused_imports)]
 use super::prelude::*;
@@ -95,8 +95,27 @@ pub(crate) fn parse_spells_have_keyword(tp: &TextPair<'_>, text: &str) -> Option
     let condition = scoped_tp.as_ref().map(|_| StaticCondition::DuringYourTurn);
     let tp = scoped_tp.as_ref().unwrap_or(tp);
 
-    // Pattern 1: "[type] spell(s) you cast [from zone] have/has [keyword]."
+    // CR 702.74a: keyword-grant lines that read "... gain <keyword> as you cast
+    // them" (Ashling, the Limitless) carry a trailing " as you cast them" after
+    // the keyword text. Strip it structurally (period then suffix) BEFORE the
+    // separator split so the keyword residue is "evoke {4}" rather than
+    // "evoke {4} as you cast them" — `parse_keyword_with_where_x` takes up to the
+    // first comma as keyword_text, and `parse_keyword_from_oracle` would reject
+    // the trailing clause. Mirror the existing trailing-period handling.
+    let trimmed_tp = tp.trim_end_matches('.');
+    let trimmed_tp = trimmed_tp
+        // allow-noncombinator: structural trailing-clause cleanup on the pre-delimited grant phrase, not parsing dispatch (mirrors the trim_end_matches period strip above).
+        .strip_suffix(" as you cast them")
+        .unwrap_or(trimmed_tp);
+    let tp = &trimmed_tp;
+
+    // Pattern 1: "[type] spell(s) you cast [from zone] have/has/gain/gains [keyword]."
     // Find the predicate separator to split subject from keyword.
+    // CR 702.74a: "... spells you cast ... gain <keyword>" (Ashling) uses "gain"/
+    // "gains" as the grant verb instead of "have"/"has". The grant verb is tried
+    // in the fixed priority order have → has → gain → gains (first verb in this
+    // list that appears anywhere wins); the real card class carries exactly one
+    // grant verb, so the order only disambiguates hypothetical mixed-verb text.
     let (have_pos, have_len) = tp
         .lower
         .match_indices(" have ")
@@ -105,6 +124,18 @@ pub(crate) fn parse_spells_have_keyword(tp: &TextPair<'_>, text: &str) -> Option
         .or_else(|| {
             tp.lower
                 .match_indices(" has ")
+                .next()
+                .map(|(pos, sep)| (pos, sep.len()))
+        })
+        .or_else(|| {
+            tp.lower
+                .match_indices(" gain ")
+                .next()
+                .map(|(pos, sep)| (pos, sep.len()))
+        })
+        .or_else(|| {
+            tp.lower
+                .match_indices(" gains ")
                 .next()
                 .map(|(pos, sep)| (pos, sep.len()))
         })?;
@@ -173,7 +204,7 @@ pub(crate) fn parse_spells_have_keyword(tp: &TextPair<'_>, text: &str) -> Option
         );
         // CR 105.2: trailing "that's one or more colors"/"that's exactly N colors" relative clause → ColorCount.
         let color_props = if let Some((props, consumed)) =
-            crate::parser::oracle_target::parse_that_clause_suffix(cursor)
+            crate::parser::oracle_target::parse_that_clause_suffix(cursor, None)
         {
             cursor = cursor[consumed..].trim_start();
             props
@@ -632,6 +663,21 @@ pub(crate) fn push_grant_clause_modifications(
 
     if let Some(kw) = map_keyword(part_trimmed) {
         modifications.push(ContinuousModification::AddKeyword { keyword: kw });
+        return;
+    }
+
+    // CR 702.18a / 702.11a: a descriptive "can't be the target [of ...]" grant is
+    // Shroud (blanket) or Hexproof (opponents only). Emit the keyword so the
+    // existing targeting checks apply the correct controller scope, rather than a
+    // scope-less rule static.
+    if let Some(scope) =
+        crate::parser::oracle_keyword::classify_cant_be_targeted(part_lower.as_str())
+    {
+        let keyword = match scope {
+            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => Keyword::Shroud,
+            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => Keyword::Hexproof,
+        };
+        modifications.push(ContinuousModification::AddKeyword { keyword });
         return;
     }
 

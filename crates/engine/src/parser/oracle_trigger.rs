@@ -12,7 +12,7 @@ use super::oracle_effect::{
     try_parse_exile_top_each_library_with_collection_counter,
 };
 use super::oracle_ir::context::ParseContext;
-use super::oracle_ir::trigger::{TriggerBody, TriggerIr, TriggerModifiers};
+use super::oracle_ir::trigger::{FirstTimeLimit, TriggerBody, TriggerIr, TriggerModifiers};
 use super::oracle_nom::condition::parse_inner_condition;
 use super::oracle_nom::condition::parse_source_has_counters;
 use super::oracle_nom::error::{oracle_err, OracleResult};
@@ -33,13 +33,16 @@ use super::oracle_util::{
 };
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, AttachmentKind, CastManaObjectScope,
-    CastManaSpentMetric, CastVariantPaid, CoinFlipResult, Comparator, ControllerRef,
-    CounterTriggerFilter, DamageKindFilter, DestinationConstraint, Effect, FilterProp, ObjectScope,
-    OriginConstraint, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, StaticCondition,
-    TargetFilter, TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
+    AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, AttachmentKind,
+    AttackersDeclaredCountSubject, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid,
+    CoinFlipResult, Comparator, ControllerRef, CounterTriggerFilter, DamageKindFilter,
+    DestinationConstraint, Effect, FilterProp, ObjectScope, OriginConstraint, PlayerFilter,
+    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, StaticCondition, TargetFilter,
+    TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
     UnlessPayModifier, ZoneChangeClause,
 };
+#[cfg(test)]
+use crate::types::ability::{AttackScope, AttackSubject};
 use crate::types::card_type::{is_land_subtype, CoreType};
 use crate::types::counter::CounterType;
 use crate::types::events::PlayerActionKind;
@@ -470,9 +473,9 @@ pub(crate) fn parse_trigger_lines_at_index_ir(
     )]
 }
 
-/// Part D: If `"for the first time each turn"` appears as a word-boundary
-/// phrase in `condition`, strip it and return `(stripped, true)`; otherwise
-/// return `(condition, false)` unchanged.
+/// Part D: If a `"for the first time ..."` qualifier appears as a
+/// word-boundary phrase in `condition`, strip it and return the corresponding
+/// trigger-event limit; otherwise return `(condition, None)` unchanged.
 ///
 /// Stripping is load-bearing. The generic cycle-trigger handlers in
 /// `try_parse_player_trigger` (and several other condition-level handlers)
@@ -486,13 +489,22 @@ pub(crate) fn parse_trigger_lines_at_index_ir(
 /// Implementation: `scan_preceded` locates the phrase at a word boundary
 /// (consistent with `scan_contains`), returning both the prefix and
 /// post-phrase remainder in a single pass — no `str::find` fallback.
-fn strip_first_time_each_turn_qualifier(condition: &str) -> (String, bool) {
+/// Returns stripped text and the detected "for the first time ..." trigger-event limit.
+fn strip_first_time_each_turn_qualifier(condition: &str) -> (String, Option<FirstTimeLimit>) {
     const PHRASE: &str = "for the first time each turn";
+    const PHRASE_PER_OPPONENT: &str = "for the first time during each of their turns";
     let lower = condition.to_lowercase();
-    let Some((before_lower, _, rest_lower)) =
-        scan_preceded(&lower, |i| tag::<_, _, OracleError<'_>>(PHRASE).parse(i))
-    else {
-        return (condition.to_string(), false);
+    let Some((before_lower, matched_phrase, rest_lower)) = scan_preceded(&lower, |i| {
+        alt((
+            value(
+                FirstTimeLimit::EachOpponentTurn,
+                tag::<_, _, OracleError<'_>>(PHRASE_PER_OPPONENT),
+            ),
+            value(FirstTimeLimit::EachTurn, tag(PHRASE)),
+        ))
+        .parse(i)
+    }) else {
+        return (condition.to_string(), None);
     };
     // ASCII-only phrase → byte offsets in `condition` align with `lower`.
     let start = before_lower.len();
@@ -503,7 +515,7 @@ fn strip_first_time_each_turn_qualifier(condition: &str) -> (String, bool) {
     // Collapse any leading / trailing / double whitespace introduced by
     // removing the phrase.
     let stripped = joined.split_whitespace().collect::<Vec<_>>().join(" ");
-    (stripped, true)
+    (stripped, Some(matched_phrase))
 }
 
 /// CR 608.2c + CR 506.2: "attack a player" — the attacked player is the
@@ -702,7 +714,7 @@ pub(crate) fn parse_trigger_line_with_index_ir(
     // before the condition is dispatched. Scoped to condition text (NOT full
     // text) so triggers whose EFFECT text coincidentally contains the phrase
     // aren't retroactively constrained.
-    let (condition_text_stripped, first_time_each_turn_in_condition) =
+    let (condition_text_stripped, first_time_limit) =
         strip_first_time_each_turn_qualifier(&condition_text_raw);
     let condition_text: &str = &condition_text_stripped;
 
@@ -711,8 +723,22 @@ pub(crate) fn parse_trigger_line_with_index_ir(
     // "if X, " can hide the "you may " optional marker behind the if-clause.
     let (effect_without_if, if_condition) = extract_if_condition(&effect_text);
 
-    // CR 609.3: "You may" at the start of the effect text makes the triggered
-    // effect optional at resolution.
+    // CR 608.2c (resolution-order instructions): "You may" at the start of
+    // the effect text makes the triggered effect optional at resolution.
+    //
+    // IMPORTANT — multi-sentence triggers must NOT hoist this flag to the
+    // outer trigger. A pattern like
+    //   "look at the top card of your library. If <cond>, you may reveal
+    //    that card and put it into your hand."
+    // contains a MANDATORY first action (`look at …`) followed by an
+    // OPTIONAL second action gated on a condition. Hoisting `you may` to the
+    // trigger-level `optional` flag would make the entire trigger
+    // (including the mandatory look) skippable, which is wrong per
+    // CR 608.2c (the controller follows instructions in printed order).
+    // Per-chunk peel in `clause_shell::peel_clause` marks only the inner
+    // optional sub_ability `optional = true`, which is the correct shape.
+    // The detection below only fires when the `you may` is the FIRST token
+    // (modulo an intervening-if), which excludes the multi-sentence case.
     let starts_with_you_may = |s: &str| tag::<_, _, OracleError<'_>>("you may ").parse(s).is_ok();
     let after_structural_if = effect_lower
         .strip_prefix("if ") // allow-noncombinator: structural if-clause skip when condition is unrecognized
@@ -840,7 +866,7 @@ pub(crate) fn parse_trigger_line_with_index_ir(
             unless_pay,
             intervening_if: if_condition,
             trigger_subject,
-            first_time_each_turn: first_time_each_turn_in_condition,
+            first_time_limit,
             constraint,
             has_up_to,
             effect_lower: effect_lower.to_string(),
@@ -940,9 +966,12 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     // Text-based constraints take precedence; fall back to condition-parser constraint.
     def.constraint = modifiers.constraint.clone().or(def.constraint.take());
 
-    // CR-uniform: apply OncePerTurn as fallback.
-    if modifiers.first_time_each_turn && def.constraint.is_none() {
-        def.constraint = Some(TriggerConstraint::OncePerTurn);
+    // CR 603.2: Apply trigger-event frequency limits as a fallback.
+    if let (Some(limit), None) = (modifiers.first_time_limit, def.constraint.as_ref()) {
+        def.constraint = Some(match limit {
+            FirstTimeLimit::EachTurn => TriggerConstraint::OncePerTurn,
+            FirstTimeLimit::EachOpponentTurn => TriggerConstraint::OncePerOpponentPerTurn,
+        });
     }
     constrain_triggering_spell_with_nth_filter(&mut def);
 
@@ -2223,6 +2252,10 @@ fn substitute_another_in_expr(expr: &QuantityExpr) -> QuantityExpr {
             inner: Box::new(substitute_another_in_expr(inner)),
             offset: *offset,
         },
+        QuantityExpr::ClampMin { inner, minimum } => QuantityExpr::ClampMin {
+            inner: Box::new(substitute_another_in_expr(inner)),
+            minimum: *minimum,
+        },
         QuantityExpr::DivideRounded {
             inner,
             divisor,
@@ -2702,7 +2735,14 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
             // triggers that reward defensive (non-aggressor) opponents.
             (
                 "if none of those creatures attacked you",
-                TriggerCondition::NoneOfAttackersTargetedYou,
+                TriggerCondition::AttackersDeclaredCount {
+                    subject: AttackersDeclaredCountSubject::AttackTarget {
+                        controller: ControllerRef::You,
+                        attacked: AttackTargetFilter::Player,
+                    },
+                    comparator: Comparator::EQ,
+                    count: 0,
+                },
             ),
             (
                 "if it's the first combat phase of the turn",
@@ -2729,6 +2769,13 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
     // contraction and optional negation postfix) rather than enumerated as
     // five verbatim phrases.
     if let Some(result) = try_extract_that_players_turn(&tp, &lower, text) {
+        return result;
+    }
+
+    // CR 506.2 + CR 508.1b + CR 603.4: Mangara-class attack-batch
+    // intervening-if, "if N or more of those creatures are attacking you
+    // and/or planeswalkers you control."
+    if let Some(result) = try_extract_attackers_to_controller_min(&lower, text) {
         return result;
     }
 
@@ -3114,6 +3161,57 @@ fn try_extract_that_players_turn(
         base
     };
     Some((strip_condition_clause(text, pos, consumed), Some(condition)))
+}
+
+fn try_extract_attackers_to_controller_min(
+    lower: &str,
+    text: &str,
+) -> Option<(String, Option<TriggerCondition>)> {
+    let (before, condition, rest) =
+        scan_preceded(lower, parse_attackers_to_controller_min_condition)?;
+    let rest_trimmed = rest.trim_start();
+    if !(rest_trimmed.is_empty() || rest_trimmed.starts_with(',') || rest_trimmed.starts_with('.'))
+    {
+        return None;
+    }
+    let consumed = lower.len() - before.len() - rest.len();
+    Some((
+        strip_condition_clause(text, before.len(), consumed),
+        Some(condition),
+    ))
+}
+
+fn parse_attackers_to_controller_min_condition(input: &str) -> OracleResult<'_, TriggerCondition> {
+    let (rest, _) = tag("if ").parse(input)?;
+    let (rest, minimum) = nom_primitives::parse_number.parse(rest)?;
+    let (rest, _) = tag(" or more of those creatures are attacking ").parse(rest)?;
+    let (rest, attacked) = alt((
+        value(
+            AttackTargetFilter::PlayerOrPlaneswalker,
+            tag("you and/or planeswalkers you control"),
+        ),
+        value(
+            AttackTargetFilter::PlayerOrPlaneswalker,
+            tag("you or planeswalkers you control"),
+        ),
+        value(
+            AttackTargetFilter::Planeswalker,
+            tag("planeswalkers you control"),
+        ),
+        value(AttackTargetFilter::Player, tag("you")),
+    ))
+    .parse(rest)?;
+    Ok((
+        rest,
+        TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::AttackTarget {
+                controller: ControllerRef::You,
+                attacked,
+            },
+            comparator: Comparator::GE,
+            count: minimum,
+        },
+    ))
 }
 
 /// Policy for a post-effect occurrence of the intervening keyword (one that
@@ -4351,6 +4449,38 @@ fn split_trigger(tp: TextPair<'_>) -> (String, String) {
     }
 }
 
+fn spell_quality_equal_to_chosen_number_tail<'a>(
+    input: &'a str,
+) -> nom::IResult<&'a str, (), OracleError<'a>> {
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("equal to the chosen number"),
+        tag("equal to that number"),
+    ))
+    .parse(input)?;
+    Ok((rest, ()))
+}
+
+/// CR 202.3 + CR 208.1: Commas inside a spell-quality disjunction
+/// ("mana value, power, or toughness equal to …") are not the condition/effect
+/// boundary. Talion, the Kindly Lord is the motivating card.
+fn continues_spell_quality_disjunction(after_comma: &str) -> bool {
+    let trimmed = after_comma.trim_start();
+
+    alt((
+        preceded(
+            tag::<_, _, OracleError<'_>>("power, or toughness "),
+            spell_quality_equal_to_chosen_number_tail,
+        ),
+        preceded(
+            tag::<_, _, OracleError<'_>>("or toughness "),
+            spell_quality_equal_to_chosen_number_tail,
+        ),
+    ))
+    .parse(trimmed)
+    .map(|(rest, _)| rest.is_empty() || tag::<_, _, OracleError<'_>>(", ").parse(rest).is_ok())
+    .unwrap_or(false)
+}
+
 fn find_effect_boundary(lower: &str) -> Option<usize> {
     use super::oracle_nom::primitives::split_once_on;
     let mut search_start = 0;
@@ -4359,6 +4489,7 @@ fn find_effect_boundary(lower: &str) -> Option<usize> {
         if !continues_player_action_list(after)
             && !continues_disjunctive_zone_change_condition(after)
             && !continues_serial_event_condition(after)
+            && !continues_spell_quality_disjunction(after)
         {
             return Some(comma_pos);
         }
@@ -4501,6 +4632,68 @@ fn is_new_sentence_not_type_continuation(text: &str) -> bool {
 fn make_base() -> TriggerDefinition {
     TriggerDefinition::new(TriggerMode::Unknown("unknown".to_string()))
         .trigger_zones(vec![Zone::Battlefield])
+}
+
+/// CR 202.3 + CR 208.1: Spell-cast quality suffix comparing mana value and/or
+/// power/toughness against the source's chosen number (Talion class).
+fn parse_spell_chosen_number_quality(spell_clause: &str) -> Option<TypedFilter> {
+    const SUFFIXES: &[(&str, bool)] = &[
+        (
+            "with mana value, power, or toughness equal to the chosen number",
+            true,
+        ),
+        (
+            "with mana value, power, or toughness equal to that number",
+            true,
+        ),
+        ("with mana value equal to the chosen number", false),
+        ("with mana value equal to that number", false),
+    ];
+    let (rest, include_pt) = SUFFIXES.iter().find_map(|(suffix, include_pt)| {
+        spell_clause
+            .strip_suffix(suffix) // allow-noncombinator: structural suffix on tokenized spell-quality chunk
+            .map(|rest| (rest.trim(), *include_pt))
+    })?;
+    let base_tf = if rest.is_empty() || rest == "spell" {
+        TypedFilter::default()
+    } else {
+        let (filter, _) = parse_type_phrase(rest);
+        match filter {
+            TargetFilter::Typed(tf) => tf,
+            _ => TypedFilter::default(),
+        }
+    };
+    let chosen = QuantityExpr::Ref {
+        qty: QuantityRef::ChosenNumber,
+    };
+    let props = if include_pt {
+        vec![FilterProp::AnyOf {
+            props: vec![
+                FilterProp::Cmc {
+                    comparator: Comparator::EQ,
+                    value: chosen.clone(),
+                },
+                FilterProp::PtComparison {
+                    stat: PtStat::Power,
+                    scope: PtValueScope::Current,
+                    comparator: Comparator::EQ,
+                    value: chosen.clone(),
+                },
+                FilterProp::PtComparison {
+                    stat: PtStat::Toughness,
+                    scope: PtValueScope::Current,
+                    comparator: Comparator::EQ,
+                    value: chosen,
+                },
+            ],
+        }]
+    } else {
+        vec![FilterProp::Cmc {
+            comparator: Comparator::EQ,
+            value: chosen,
+        }]
+    };
+    Some(base_tf.properties(props))
 }
 
 /// CR 603.4: AND-compose a newly extracted trigger condition onto any existing
@@ -5031,7 +5224,15 @@ fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFil
         ))
         .parse(after_quantifier)
         {
-            return (filter, rest.trim_start());
+            // CR 603.2c: "one or more opponents/players each <verb>" — the
+            // distributive "each" belongs to the subject phrase.  Strip it here
+            // at the subject seam so every event-verb parser (draws, loses life,
+            // etc.) sees a bare verb without a stray "each " prefix.
+            let trimmed = rest.trim_start();
+            let (trimmed, _) = opt(tag::<_, _, OracleError<'_>>("each "))
+                .parse(trimmed)
+                .unwrap_or((trimmed, None));
+            return (filter, trimmed);
         }
 
         let (filter, rest) = parse_type_phrase(after_quantifier);
@@ -5649,7 +5850,10 @@ fn try_parse_event(
                 def.valid_card = Some(subject.clone());
                 // CR 508.1a: Battalion/Pack Tactics counts any N *other* creatures
                 // (untyped head noun) → no condition-level type axis.
-                def.condition = Some(TriggerCondition::MinCoAttackers { minimum: n });
+                def.condition = Some(TriggerCondition::MinCoAttackers {
+                    minimum: n,
+                    filter: None,
+                });
                 return Some((TriggerMode::Attacks, def));
             }
         }
@@ -6295,21 +6499,42 @@ fn try_parse_event(
     // Vito, Thorn of the Dusk Rose ("Whenever you gain life, each opponent loses..."),
     // Bloodchief Ascension-adjacent cards, and Moonstone Harbinger-style combined
     // life-change triggers.
-    fn parse_life_verb(input: &str) -> OracleResult<'_, TriggerMode> {
-        alt((
-            value(TriggerMode::LifeChanged, tag("gains or loses life")),
+    fn parse_life_verb(input: &str) -> OracleResult<'_, (TriggerMode, Option<(Comparator, u32)>)> {
+        // Combined "gain or lose" form carries no amount qualifier.
+        if let Ok((rest, mode)) = alt((
+            value(
+                TriggerMode::LifeChanged,
+                tag::<_, _, OracleError<'_>>("gains or loses life"),
+            ),
             value(TriggerMode::LifeChanged, tag("gain or lose life")),
-            value(TriggerMode::LifeLost, tag("loses life")),
-            value(TriggerMode::LifeLost, tag("lose life")),
-            value(TriggerMode::LifeGained, tag("gains life")),
-            value(TriggerMode::LifeGained, tag("gain life")),
         ))
         .parse(input)
+        {
+            return Ok((rest, (mode, None)));
+        }
+
+        // CR 119.3: singular life verb + optional magnitude qualifier + "life"
+        // ("loses exactly 1 life", "lose 3 or more life"). "loses"/"gains" must
+        // precede "lose"/"gain" so the longer conjugation wins.
+        let (rest, mode) = alt((
+            value(
+                TriggerMode::LifeLost,
+                alt((tag::<_, _, OracleError<'_>>("loses"), tag("lose"))),
+            ),
+            value(TriggerMode::LifeGained, alt((tag("gains"), tag("gain")))),
+        ))
+        .parse(input)?;
+        let (rest, _) = tag(" ").parse(rest)?;
+        let (rest, amount) = opt(parse_event_amount_quantifier).parse(rest)?;
+        let (rest, _) = tag("life").parse(rest)?;
+        Ok((rest, (mode, amount)))
     }
-    if let Ok((tail, mode)) = parse_life_verb.parse(rest) {
+    if let Ok((tail, (mode, amount))) = parse_life_verb.parse(rest) {
         let mut def = make_base();
         def.mode = mode.clone();
         def.valid_target = Some(subject.clone());
+        // CR 119.3: per-event magnitude constraint ("loses exactly N life").
+        def.life_amount = amount;
         // CR 603.4 + CR 102.1: "gains life during their turn" / "loses life
         // during their turn" — the trailing timing tail restricts the trigger
         // to the acting player's own turn. Composed with the shared typed
@@ -6725,19 +6950,20 @@ fn parse_damage_predicate_tail(
     input: &str,
 ) -> OracleResult<'_, (DamageKindFilter, Option<(Comparator, u32)>)> {
     let (rest, kind) = opt(parse_damage_kind_adjective).parse(input)?;
-    let (rest, amount) = opt(parse_damage_amount_quantifier).parse(rest)?;
+    let (rest, amount) = opt(parse_event_amount_quantifier).parse(rest)?;
     let (rest, _) = tag("damage").parse(rest)?;
     Ok((rest, (kind.unwrap_or(DamageKindFilter::Any), amount)))
 }
 
-/// CR 603.2 + CR 120.1: Parse a damage-amount quantifier
-/// ("`5 or more `" / "`exactly 5 `") and return the resulting
-/// `(Comparator, threshold)` pair to store on `TriggerDefinition::damage_amount`.
-/// The trailing space is consumed so the caller can chain directly into
-/// `tag("damage")`.
+/// CR 603.2: Parse an event-magnitude quantifier ("`5 or more `" / "`exactly 5 `")
+/// that precedes a head noun, returning the resulting `(Comparator, threshold)`
+/// pair. The trailing space is consumed so the caller can chain directly into
+/// the head noun (`tag("damage")` for CR 120.1 damage triggers,
+/// `tag("life")` for CR 119.3 life triggers). Event-agnostic by design — the
+/// caller decides which constraint field the pair lands on.
 ///
 /// `"less than N"` slots in here via the same axis when needed.
-fn parse_damage_amount_quantifier(input: &str) -> OracleResult<'_, (Comparator, u32)> {
+fn parse_event_amount_quantifier(input: &str) -> OracleResult<'_, (Comparator, u32)> {
     fn parse_or_more(input: &str) -> OracleResult<'_, (Comparator, u32)> {
         let (rest, n) = nom_primitives::parse_number(input)?;
         let (rest, _) = tag(" or more ").parse(rest)?;
@@ -7176,8 +7402,9 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
 /// "creature[s]" head noun — i.e. it carries a subtype/negated-type/property
 /// constraint or a non-creature type. Used to decide whether a typed
 /// attacker-COUNT trigger ("two or more Dinosaurs attack") needs the
-/// condition-level type axis on `AttackersDeclaredMin`, or whether the untyped
-/// "two or more creatures attack" path can keep `filter: None`.
+/// condition-level type axis on `AttackersDeclaredCount`'s `Controller`
+/// subject, or whether the untyped "two or more creatures attack" path can
+/// keep `filter: None`.
 ///
 /// Controller scope ("creatures you control") does NOT narrow the class for
 /// counting purposes — it is already enforced by `matching_you_attack_pairs`'
@@ -7259,10 +7486,13 @@ fn try_parse_n_or_more_attacks(lower: &str) -> Option<(TriggerMode, TriggerDefin
             // so use the AttackersDeclared batch count rather than the
             // source-excluding MinCoAttackers condition.
             let count_filter = filter_narrows_beyond_creature(&filter).then_some(filter.clone());
-            def.condition = Some(TriggerCondition::AttackersDeclaredMin {
-                scope: ControllerRef::You,
-                minimum: min_count,
-                filter: count_filter,
+            def.condition = Some(TriggerCondition::AttackersDeclaredCount {
+                subject: AttackersDeclaredCountSubject::Controller {
+                    scope: ControllerRef::You,
+                    filter: count_filter,
+                },
+                comparator: Comparator::GE,
+                count: min_count,
             });
         }
         def.valid_card = Some(filter);
@@ -7291,12 +7521,13 @@ fn try_parse_n_or_more_attacks(lower: &str) -> Option<(TriggerMode, TriggerDefin
 ///     known — this drives `match_you_attack`'s attacking-player filter AND
 ///     feeds `resolve_they_pronoun` so a trailing "they draw a card" resolves
 ///     to `TargetFilter::TriggeringPlayer`.
-///   - `condition = AttackersDeclaredMin { scope, minimum, filter }` so only
-///     batches with at least N attackers from the scoped player — matching the
-///     typed `filter` when present — fire the trigger. The typed count>1 case
-///     ("attack with two or more Dinosaurs") parses the head-noun type phrase
-///     into both the matcher's `valid_card` gate and the condition's `filter`
-///     (CR 508.1), so it counts only Dinosaurs and cannot over-fire.
+///   - `condition = AttackersDeclaredCount { subject: Controller { scope, filter },
+///     comparator: GE, count }` so only batches with at least N attackers from the
+///     scoped player — matching the typed `filter` when present — fire the trigger.
+///     The typed count>1 case ("attack with two or more Dinosaurs") parses the
+///     head-noun type phrase into both the matcher's `valid_card` gate and the
+///     subject's `filter` (CR 508.1), so it counts only Dinosaurs and cannot
+///     over-fire.
 fn try_parse_attack_with_n_creatures(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
     use nom::combinator::opt;
 
@@ -7340,7 +7571,7 @@ fn try_parse_attack_with_n_creatures(lower: &str) -> Option<(TriggerMode, Trigge
 
     // Capture the head-noun type phrase once for both count==1 and count>1.
     // Count==1 needs only the matcher's valid_card gate; count>1 additionally
-    // uses AttackersDeclaredMin when the type phrase narrows beyond bare
+    // uses AttackersDeclaredCount when the type phrase narrows beyond bare
     // "creatures".
     let (filter, remainder) = parse_type_phrase(after_or_more);
     // Accept optional trailing " each turn" / " this turn" qualifier (unused here,
@@ -7380,10 +7611,13 @@ fn try_parse_attack_with_n_creatures(lower: &str) -> Option<(TriggerMode, Trigge
         def.valid_card = Some(filter.clone());
     }
     let count_filter = narrows.then_some(filter);
-    def.condition = Some(TriggerCondition::AttackersDeclaredMin {
-        scope: actor,
-        minimum: n,
-        filter: count_filter,
+    def.condition = Some(TriggerCondition::AttackersDeclaredCount {
+        subject: AttackersDeclaredCountSubject::Controller {
+            scope: actor,
+            filter: count_filter,
+        },
+        comparator: Comparator::GE,
+        count: n,
     });
 
     Some((TriggerMode::YouAttack, def))
@@ -8532,17 +8766,16 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
 
             // Parse the spell quality generically (e.g., "creature spell", "multicolored spell")
             // using the same parse_type_phrase building block as the "you cast" branch above.
-            // Truncate at ", " to avoid passing the effect clause (e.g., ", you gain 1 life")
-            // into parse_type_phrase where it would cause infinite recursion.
+            // The condition/effect boundary was already split by `split_trigger`; do not
+            // truncate on ", " here — spell qualities may contain commas (Talion:
+            // "mana value, power, or toughness equal to the chosen number").
             let after_casts = &lower[who.len() + " casts a".len()..].trim_start();
             let after_article = value((), tag::<_, _, OracleError<'_>>("n ")) // "an" → strip the trailing "n "
                 .parse(after_casts)
                 .map(|(rest, _)| rest)
                 .unwrap_or(after_casts)
                 .trim_start();
-            let spell_clause = nom_primitives::split_once_on(after_article, ", ")
-                .map(|(_, (before, _))| before)
-                .unwrap_or(after_article);
+            let spell_clause = after_article;
             // CR 601.2a: pre-extract the "from <zone>" cast-origin tail (see
             // the rationale in the "you cast a/an" branch above). Without
             // this, the zone constraint is silently dropped (Ghostly Pilferer
@@ -8563,28 +8796,10 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
                     Err(_) => (spell_clause, OriginConstraint::Any),
                 };
             def.spell_cast_origin = cast_origin;
-            // Handle "with mana value equal to the chosen number" (Talion, the Kindly Lord)
-            // CR 202.3: Mana value comparison against a dynamic reference quantity.
-            let chosen = spell_clause.strip_suffix("with mana value equal to the chosen number"); // allow-noncombinator: structural suffix on tokenized spell-quality chunk
-            let that = spell_clause.strip_suffix("with mana value equal to that number"); // allow-noncombinator: structural suffix on tokenized spell-quality chunk
-            if let Some(rest) = chosen.or(that) {
-                let rest = rest.trim();
-                // Parse the base type if present (e.g., "creature spell with mana value...")
-                let mut base_tf = if rest.is_empty() || rest == "spell" {
-                    TypedFilter::default()
-                } else {
-                    let (filter, _) = parse_type_phrase(rest);
-                    match filter {
-                        TargetFilter::Typed(tf) => tf,
-                        _ => TypedFilter::default(),
-                    }
-                };
-                base_tf = base_tf.properties(vec![FilterProp::Cmc {
-                    comparator: Comparator::EQ,
-                    value: QuantityExpr::Ref {
-                        qty: QuantityRef::ChosenNumber,
-                    },
-                }]);
+            // Handle "with mana value [, power, or toughness] equal to the chosen number"
+            // (Talion, the Kindly Lord). CR 202.3 + CR 208.1: disjunctive match on
+            // mana value, power, or toughness against the source's chosen number.
+            if let Some(base_tf) = parse_spell_chosen_number_quality(spell_clause) {
                 def.valid_card = Some(TargetFilter::Typed(base_tf));
                 return Some((TriggerMode::SpellCast, def));
             }
@@ -8987,10 +9202,11 @@ fn attach_event_timing_tail(def: &mut TriggerDefinition, tail: &str) {
 
 /// Nom combinator for a complete timing-tail clause: matches unrestricted
 /// per-turn tails ("each turn", "in a turn") and player-scoped turn tails
-/// ("during each opponent's turn", "during their turn", "during each of your
-/// turns", "during your turn"). Wrapped in `all_consuming` so it succeeds only
-/// when the clause consumes the entire (already-trimmed) input. Shared by the
-/// nth-spell, nth-draw, and related event timing classifiers.
+/// ("during each opponent's turn", "during their turn", "during each of their
+/// turns", "during each of your turns", "during your turn"). Wrapped in
+/// `all_consuming` so it succeeds only when the clause consumes the entire
+/// (already-trimmed) input. Shared by the nth-spell, nth-draw, and related
+/// event timing classifiers.
 fn parse_timing_tail(i: &str) -> OracleResult<'_, NthEventTimingKind> {
     all_consuming(alt((
         value(NthEventTimingKind::Unrestricted, tag("each turn")),
@@ -9004,7 +9220,7 @@ fn parse_timing_tail(i: &str) -> OracleResult<'_, NthEventTimingKind> {
         ),
         value(
             NthEventTimingKind::Restricted(PlayerFilter::TriggeringPlayer),
-            tag("during their turn"),
+            alt((tag("during their turn"), tag("during each of their turns"))),
         ),
         value(
             NthEventTimingKind::Restricted(PlayerFilter::Controller),
@@ -10757,21 +10973,26 @@ fn parse_control_none_filter(text: &str) -> Option<TargetFilter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::scenario::{GameScenario, P0, P1};
+    use crate::parser::oracle::parse_oracle_text;
     use crate::parser::oracle_ir::context::ParseContext;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
         AbilityCondition, AbilityCost, AbilityKind, AggregateFunction, BounceSelection,
-        CastingPermission, Comparator, ContinuousModification, ControllerRef, CountScope,
-        DamageModification, DamageSource, DelayedTriggerCondition, Duration, Effect, FilterProp,
-        ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope,
-        QuantityExpr, QuantityRef, SharedQuality, TargetFilter, TypeFilter, TypedFilter,
+        CastingPermission, ChosenAttribute, Comparator, ContinuousModification, ControllerRef,
+        CountScope, DamageModification, DamageSource, DelayedTriggerCondition, Duration, Effect,
+        FilterProp, ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat, PtValue,
+        PtValueScope, QuantityExpr, QuantityRef, SharedQuality, TargetFilter, TypeFilter,
+        TypedFilter,
     };
     use crate::types::counter::{CounterMatch, CounterType};
+    use crate::types::game_state::WaitingFor;
+    use crate::types::mana::{ManaCost, ManaType, ManaUnit};
     use crate::types::replacements::ReplacementEvent;
     use crate::types::statics::CastFrequency;
 
     fn blocking_source_beyond_first_expr() -> QuantityExpr {
-        QuantityExpr::Offset {
+        let count_minus_one = QuantityExpr::Offset {
             inner: Box::new(QuantityExpr::Ref {
                 qty: QuantityRef::ObjectCount {
                     filter: TargetFilter::Typed(TypedFilter {
@@ -10782,6 +11003,10 @@ mod tests {
                 },
             }),
             offset: -1,
+        };
+        QuantityExpr::ClampMin {
+            inner: Box::new(count_minus_one),
+            minimum: 0,
         }
     }
 
@@ -12102,8 +12327,9 @@ mod tests {
         );
         assert_eq!(def.mode, TriggerMode::Attacks);
         assert!(def.condition.is_some());
-        if let Some(TriggerCondition::MinCoAttackers { minimum }) = &def.condition {
+        if let Some(TriggerCondition::MinCoAttackers { minimum, filter }) = &def.condition {
             assert_eq!(*minimum, 2);
+            assert_eq!(*filter, None);
         } else {
             panic!("Expected MinCoAttackers");
         }
@@ -13629,7 +13855,7 @@ mod tests {
 
         // Clause 2 — effect + player scope: LoseTheGame fanned out over each
         // player the source creature attacked this turn (CR 508.6). The
-        // controller is excluded by `OpponentAttackedBySourceThisTurn`, so the
+        // controller is excluded by `OpponentAttacked { Source, ThisTurn }`, so the
         // Angel never eliminates itself — directly fixing the "my own Angel
         // killed me" report.
         let execute = def.execute.as_ref().expect("execute must be Some");
@@ -13640,7 +13866,10 @@ mod tests {
         );
         assert_eq!(
             execute.player_scope,
-            Some(PlayerFilter::OpponentAttackedBySourceThisTurn),
+            Some(PlayerFilter::OpponentAttacked {
+                subject: AttackSubject::Source,
+                scope: AttackScope::ThisTurn,
+            }),
             "LoseTheGame must scope to players the source attacked this turn (issue #1599), got {:?}",
             execute.player_scope,
         );
@@ -13948,6 +14177,69 @@ mod tests {
             def.condition
         );
         assert!(def.execute.is_some());
+    }
+
+    #[test]
+    fn shared_animosity_attack_pump_for_each_other_attacker_sharing_type() {
+        let def = parse_trigger_line(
+            "Whenever a creature you control attacks, it gets +1/+0 until end of turn for each other attacking creature that shares a creature type with it.",
+            "Shared Animosity",
+        );
+        assert_eq!(def.mode, TriggerMode::Attacks);
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::You)
+            ))
+        );
+        let exec = def.execute.as_ref().expect("execute");
+        match &*exec.effect {
+            Effect::Pump {
+                power,
+                toughness,
+                target,
+                ..
+            } => {
+                assert_eq!(
+                    *target,
+                    TargetFilter::TriggeringSource,
+                    "attacker anaphor should be TriggeringSource"
+                );
+                assert_eq!(*toughness, PtValue::Fixed(0));
+                let PtValue::Quantity(QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                }) = power
+                else {
+                    panic!("power should be for-each count, got {power:?}");
+                };
+                let TargetFilter::Typed(tf) = filter else {
+                    panic!("filter should be typed, got {filter:?}");
+                };
+                assert!(tf.properties.contains(&FilterProp::Another));
+                assert!(tf.properties.contains(&FilterProp::Attacking));
+                let shares = tf.properties.iter().find(|p| {
+                    matches!(
+                        p,
+                        FilterProp::SharesQuality {
+                            quality: SharedQuality::CreatureType,
+                            ..
+                        }
+                    )
+                });
+                let Some(FilterProp::SharesQuality { reference, .. }) = shares else {
+                    panic!(
+                        "for-each filter must include SharesQuality, properties: {:?}",
+                        tf.properties
+                    );
+                };
+                assert_eq!(
+                    reference.as_deref(),
+                    Some(&TargetFilter::TriggeringSource),
+                    "shares-type reference should bind to the attacking creature"
+                );
+            }
+            other => panic!("expected Pump, got {other:?}"),
+        }
     }
 
     #[test]
@@ -16024,6 +16316,80 @@ mod tests {
     }
 
     #[test]
+    fn trigger_one_or_more_opponents_each_lose_exactly_one_life() {
+        // CR 119.3 + CR 603.2c: Ob Nixilis, Captive Kingpin — batched
+        // "one or more opponents each" subject plus an "exactly 1" magnitude
+        // constraint on the life-loss event.
+        let def = parse_trigger_line(
+            "Whenever one or more opponents each lose exactly 1 life, put a +1/+1 counter on this creature.",
+            "Ob Nixilis, Captive Kingpin",
+        );
+        assert_eq!(def.mode, TriggerMode::LifeLost);
+        assert!(
+            def.batched,
+            "CR 603.2c: 'one or more … each' is a batched trigger"
+        );
+        assert_eq!(
+            def.life_amount,
+            Some((Comparator::EQ, 1)),
+            "the 'exactly 1' qualifier must constrain the life-loss magnitude"
+        );
+        assert_eq!(
+            def.valid_target,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::Opponent)
+            ))
+        );
+    }
+
+    #[test]
+    fn trigger_one_or_more_opponents_each_draw_generalizes() {
+        // CR 603.2c: Prove the "each" seam-move generalizes to non-life verbs.
+        // The distributive "each" is stripped at the subject seam (parse_single_subject),
+        // so parse_draws_card sees "draw a card" directly without any "each " prefix.
+        let def = parse_trigger_line(
+            "Whenever one or more opponents each draw a card, you gain 1 life.",
+            "Test Card",
+        );
+        assert_eq!(def.mode, TriggerMode::Drawn);
+        assert!(
+            def.batched,
+            "CR 603.2c: 'one or more … each' is a batched trigger"
+        );
+        assert_eq!(
+            def.valid_target,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::Opponent)
+            ))
+        );
+    }
+
+    #[test]
+    fn trigger_life_loss_or_more_threshold() {
+        // CR 119.3: the magnitude qualifier composes with "N or more" too — the
+        // same building block that powers "exactly N", proving the class is
+        // generalized rather than special-cased to one card.
+        let def = parse_trigger_line(
+            "Whenever an opponent loses 3 or more life, draw a card.",
+            "Test Card",
+        );
+        assert_eq!(def.mode, TriggerMode::LifeLost);
+        assert_eq!(def.life_amount, Some((Comparator::GE, 3)));
+    }
+
+    #[test]
+    fn trigger_plain_life_loss_has_no_amount_constraint() {
+        // Regression: an unqualified life-loss trigger must leave `life_amount`
+        // None so every loss fires it.
+        let def = parse_trigger_line(
+            "Whenever an opponent loses life, you gain that much life.",
+            "Exquisite Blood",
+        );
+        assert_eq!(def.mode, TriggerMode::LifeLost);
+        assert_eq!(def.life_amount, None);
+    }
+
+    #[test]
     fn trigger_you_gain_or_lose_life_during_your_turn() {
         let def = parse_trigger_line(
             "Whenever you gain or lose life during your turn, this creature gets +1/+0 until end of turn.",
@@ -17197,6 +17563,216 @@ mod tests {
             },
             other => panic!("expected Bounce effect, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn continues_spell_quality_disjunction_talion_segments() {
+        assert!(continues_spell_quality_disjunction(
+            "power, or toughness equal to the chosen number, that player loses 2 life",
+        ));
+        assert!(continues_spell_quality_disjunction(
+            "or toughness equal to the chosen number, that player loses 2 life",
+        ));
+        assert!(!continues_spell_quality_disjunction("you draw a card"));
+    }
+
+    #[test]
+    fn find_effect_boundary_does_not_skip_unrelated_power_or_comma() {
+        let line = "Whenever an opponent casts a red spell, you draw a card";
+        let lower = line.to_lowercase();
+        let boundary = find_effect_boundary(&lower).expect("effect boundary");
+        let suffix = &lower[boundary..];
+        let expected = ", you draw";
+        assert_eq!(
+            &suffix[..expected.len()],
+            expected,
+            "comma after spell type should split condition/effect, got {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn find_effect_boundary_skips_spell_quality_comma() {
+        let line = "Whenever an opponent casts a spell with mana value, power, or toughness equal to the chosen number, that player loses 2 life";
+        let lower = line.to_lowercase();
+        let boundary = find_effect_boundary(&lower).expect("effect boundary");
+        let suffix = &lower[boundary..];
+        let expected = ", that player";
+        assert_eq!(
+            &suffix[..expected.len()],
+            expected,
+            "boundary should follow the spell-quality clause, got {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn parse_spell_chosen_number_quality_talion_suffix() {
+        let tf = parse_spell_chosen_number_quality(
+            "spell with mana value, power, or toughness equal to the chosen number",
+        )
+        .expect("suffix should parse");
+        assert!(tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::AnyOf { .. })));
+    }
+
+    #[test]
+    fn talion_opponent_spell_cast_chosen_number_or_filter() {
+        let def = parse_trigger_line(
+            "Whenever an opponent casts a spell with mana value, power, or toughness equal to the chosen number, that player loses 2 life and you draw a card.",
+            "Talion, the Kindly Lord",
+        );
+        assert_eq!(def.mode, TriggerMode::SpellCast);
+        assert_eq!(
+            def.valid_target,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::Opponent)
+            ))
+        );
+        let valid_card = def.valid_card.as_ref().expect("spell quality filter");
+        let TargetFilter::Typed(tf) = valid_card else {
+            panic!("expected typed spell filter, got {valid_card:?}");
+        };
+        let props = tf
+            .properties
+            .iter()
+            .find_map(|p| match p {
+                FilterProp::AnyOf { props } => Some(props.as_slice()),
+                _ => None,
+            })
+            .expect("expected AnyOf cmc/pt props");
+        assert_eq!(props.len(), 3);
+        assert!(props.iter().any(|p| {
+            matches!(
+                p,
+                FilterProp::Cmc {
+                    comparator: Comparator::EQ,
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::ChosenNumber
+                    }
+                }
+            )
+        }));
+        assert!(props.iter().any(|p| {
+            matches!(
+                p,
+                FilterProp::PtComparison {
+                    stat: PtStat::Power,
+                    comparator: Comparator::EQ,
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::ChosenNumber
+                    },
+                    ..
+                }
+            )
+        }));
+        assert!(props.iter().any(|p| {
+            matches!(
+                p,
+                FilterProp::PtComparison {
+                    stat: PtStat::Toughness,
+                    comparator: Comparator::EQ,
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::ChosenNumber
+                    },
+                    ..
+                }
+            )
+        }));
+        let execute = def.execute.as_ref().expect("execute");
+        assert!(
+            matches!(
+                execute.effect.as_ref(),
+                Effect::LoseLife {
+                    amount: QuantityExpr::Fixed { value: 2 },
+                    target: Some(TargetFilter::TriggeringPlayer),
+                }
+            ),
+            "head effect: {:?}",
+            execute.effect
+        );
+        let draw = execute
+            .sub_ability
+            .as_ref()
+            .expect("draw chained after life loss");
+        assert!(matches!(draw.effect.as_ref(), Effect::Draw { .. }));
+    }
+
+    #[test]
+    fn talion_kindly_lord_full_oracle_no_swallowed_clause() {
+        let text = "Flying\nAs Talion, the Kindly Lord enters the battlefield, choose a number between 1 and 10.\nWhenever an opponent casts a spell with mana value, power, or toughness equal to the chosen number, that player loses 2 life and you draw a card.";
+        let parsed = parse_oracle_text(
+            text,
+            "Talion, the Kindly Lord",
+            &["Flying".to_string()],
+            &["Creature".to_string()],
+            &["Faerie".to_string(), "Noble".to_string()],
+        );
+        let swallowed: Vec<_> = parsed
+            .parse_warnings
+            .iter()
+            .filter(|w| w.category_name() == "swallowed-clause")
+            .collect();
+        assert!(
+            swallowed.is_empty(),
+            "Talion should parse without swallowed-clause warnings: {swallowed:?}"
+        );
+    }
+
+    #[test]
+    fn talion_runtime_triggers_only_for_matching_spell_quality() {
+        let run = |name: &str, creature_pt: Option<(i32, i32)>, mana_value: u32| {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            scenario.with_library_top(P0, &["Drawn Card"]);
+            let talion = scenario
+                .add_creature_from_oracle(
+                    P0,
+                    "Talion, the Kindly Lord",
+                    3,
+                    4,
+                    "Flying\nAs Talion, the Kindly Lord enters the battlefield, choose a number between 1 and 10.\nWhenever an opponent casts a spell with mana value, power, or toughness equal to the chosen number, that player loses 2 life and you draw a card.",
+                )
+                .id();
+            let spell = if let Some((power, toughness)) = creature_pt {
+                scenario
+                    .add_creature_to_hand_from_oracle(P1, name, power, toughness, "")
+                    .with_mana_cost(ManaCost::generic(mana_value))
+                    .id()
+            } else {
+                scenario
+                    .add_spell_to_hand_from_oracle(P1, name, true, "")
+                    .with_mana_cost(ManaCost::generic(mana_value))
+                    .id()
+            };
+            scenario.with_mana_pool(
+                P1,
+                (0..mana_value)
+                    .map(|_| ManaUnit::new(ManaType::Colorless, talion, false, Vec::new()))
+                    .collect(),
+            );
+            let mut runner = scenario.build();
+            {
+                let state = runner.state_mut();
+                state
+                    .objects
+                    .get_mut(&talion)
+                    .expect("Talion source exists")
+                    .chosen_attributes
+                    .push(ChosenAttribute::Number(3));
+                state.active_player = P1;
+                state.priority_player = P1;
+                state.waiting_for = WaitingFor::Priority { player: P1 };
+            }
+
+            let outcome = runner.cast(spell).resolve();
+            (outcome.life_delta(P1), outcome.hand_drawn(P0))
+        };
+
+        assert_eq!(run("Three-Mana Instant", None, 3), (-2, 1));
+        assert_eq!(run("Three-Power Creature", Some((3, 1)), 1), (-2, 1));
+        assert_eq!(run("Three-Toughness Creature", Some((1, 3)), 1), (-2, 1));
+        assert_eq!(run("One-One Creature", Some((1, 1)), 1), (0, 0));
     }
 
     #[test]
@@ -19010,6 +19586,45 @@ mod tests {
         assert_eq!(def.mode, TriggerMode::Phase);
         assert_eq!(def.phase, Some(Phase::BeginCombat));
         assert_eq!(def.constraint, Some(TriggerConstraint::OnlyDuringYourTurn));
+    }
+
+    /// Issue #1993: Halana and Alena, Partners — X in the counter clause must bind
+    /// to source power, not an unresolved Variable name.
+    #[test]
+    fn halana_alena_partners_combat_trigger_puts_source_power_counters() {
+        let def = parse_trigger_line(
+            "At the beginning of combat on your turn, put X +1/+1 counters on another target creature you control, where X is Halana and Alena's power. That creature gains haste until end of turn.",
+            "Halana and Alena, Partners",
+        );
+        assert_eq!(def.mode, TriggerMode::Phase);
+        assert_eq!(def.phase, Some(Phase::BeginCombat));
+        let execute = def.execute.as_ref().expect("execute");
+        match execute.effect.as_ref() {
+            Effect::PutCounter {
+                count,
+                counter_type,
+                target,
+            } => {
+                assert_eq!(
+                    counter_type,
+                    &crate::types::counter::CounterType::Plus1Plus1
+                );
+                assert_eq!(
+                    count,
+                    &QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: ObjectScope::Source,
+                        },
+                    },
+                    "where X is printed name's power must bind to Source, got {count:?}"
+                );
+                assert!(
+                    matches!(target, TargetFilter::Typed(_)),
+                    "expected typed creature target, got {target:?}"
+                );
+            }
+            other => panic!("expected PutCounter, got {other:?}"),
+        }
     }
 
     #[test]
@@ -21012,10 +21627,13 @@ mod tests {
         assert_eq!(def.mode, TriggerMode::YouAttack);
         assert_eq!(
             def.condition,
-            Some(TriggerCondition::AttackersDeclaredMin {
-                scope: ControllerRef::You,
-                minimum: 2,
-                filter: None
+            Some(TriggerCondition::AttackersDeclaredCount {
+                subject: AttackersDeclaredCountSubject::Controller {
+                    scope: ControllerRef::You,
+                    filter: None,
+                },
+                comparator: Comparator::GE,
+                count: 2,
             })
         );
         assert_eq!(def.valid_target, Some(TargetFilter::Player));
@@ -21041,10 +21659,14 @@ mod tests {
             other => panic!("expected Typed valid_card with Dinosaur, got {other:?}"),
         }
         match &def.condition {
-            Some(TriggerCondition::AttackersDeclaredMin {
-                scope: ControllerRef::You,
-                minimum: 2,
-                filter: Some(TargetFilter::Typed(tf)),
+            Some(TriggerCondition::AttackersDeclaredCount {
+                subject:
+                    AttackersDeclaredCountSubject::Controller {
+                        scope: ControllerRef::You,
+                        filter: Some(TargetFilter::Typed(tf)),
+                    },
+                comparator: Comparator::GE,
+                count: 2,
             }) => assert!(
                 tf.type_filters
                     .iter()
@@ -21053,7 +21675,7 @@ mod tests {
                 tf.type_filters,
             ),
             other => {
-                panic!("expected AttackersDeclaredMin {{ You, 2, Some(Dinosaur) }}, got {other:?}")
+                panic!("expected AttackersDeclaredCount {{ Controller {{ You, Some(Dinosaur) }}, GE, 2 }}, got {other:?}")
             }
         }
     }
@@ -23720,6 +24342,21 @@ mod tests {
     }
 
     #[test]
+    fn first_time_during_each_opponent_turn_sets_per_opponent_constraint() {
+        // CR 603.2: the "first time during each of their turns" text is part
+        // of the trigger event, not a generic once-per-turn limit.
+        let def = parse_trigger_line(
+            "Whenever an opponent loses life for the first time during each of their turns, put a +1/+1 counter on ~.",
+            "Valgavoth, Harrower of Souls",
+        );
+        assert_eq!(def.mode, TriggerMode::LifeLost);
+        assert_eq!(
+            def.constraint,
+            Some(TriggerConstraint::OncePerOpponentPerTurn)
+        );
+    }
+
+    #[test]
     fn first_time_each_turn_in_effect_only_does_not_set_constraint() {
         // Part D scope guard: the phrase in EFFECT text alone must not set the constraint.
         // Contrived input — no real card prints this, but the guard is important.
@@ -23969,9 +24606,9 @@ mod tests {
 
     /// CR 508.1a + CR 603.2c: the UNTYPED actor-led count>1 form
     /// ("two or more creatures") stays byte-identical to pre-fix behavior:
-    /// `valid_card` UNSET and the count condition carries `filter: None`.
-    /// (Formerly the deferral lock — the typed count>1 form is now implemented;
-    /// see `trigger_you_attack_with_two_or_more_typed_creatures`.)
+    /// `valid_card` UNSET and the count condition's `Controller` subject carries
+    /// `filter: None`. (Formerly the deferral lock — the typed count>1 form is
+    /// now implemented; see `trigger_you_attack_with_two_or_more_typed_creatures`.)
     #[test]
     fn you_attack_with_two_or_more_creatures_untyped_no_filter() {
         let def = parse_trigger_line(
@@ -23985,10 +24622,13 @@ mod tests {
         );
         assert_eq!(
             def.condition,
-            Some(TriggerCondition::AttackersDeclaredMin {
-                scope: ControllerRef::You,
-                minimum: 2,
-                filter: None,
+            Some(TriggerCondition::AttackersDeclaredCount {
+                subject: AttackersDeclaredCountSubject::Controller {
+                    scope: ControllerRef::You,
+                    filter: None,
+                },
+                comparator: Comparator::GE,
+                count: 2,
             })
         );
     }
@@ -23996,8 +24636,9 @@ mod tests {
     /// CR 508.1a + CR 603.2c: the TYPED actor-led count>1 form
     /// ("two or more Dinosaurs") now parses the type phrase into BOTH the
     /// matcher's `valid_card` gate AND the condition-level type axis
-    /// (`AttackersDeclaredMin.filter`), so the count enforces ≥N *Dinosaurs*
-    /// rather than ≥N *any* attackers. This is the over-fire guard.
+    /// (`AttackersDeclaredCount`'s `Controller` subject `filter`), so the count
+    /// enforces ≥N *Dinosaurs* rather than ≥N *any* attackers. This is the
+    /// over-fire guard.
     #[test]
     fn trigger_you_attack_with_two_or_more_typed_creatures() {
         let def = parse_trigger_line(
@@ -24020,10 +24661,14 @@ mod tests {
         }
         // The count condition carries the SAME filter as the type axis.
         match &def.condition {
-            Some(TriggerCondition::AttackersDeclaredMin {
-                scope: ControllerRef::You,
-                minimum: 2,
-                filter: Some(TargetFilter::Typed(tf)),
+            Some(TriggerCondition::AttackersDeclaredCount {
+                subject:
+                    AttackersDeclaredCountSubject::Controller {
+                        scope: ControllerRef::You,
+                        filter: Some(TargetFilter::Typed(tf)),
+                    },
+                comparator: Comparator::GE,
+                count: 2,
             }) => assert!(
                 tf.type_filters
                     .iter()
@@ -24032,7 +24677,7 @@ mod tests {
                 tf.type_filters,
             ),
             other => {
-                panic!("expected AttackersDeclaredMin {{ You, 2, Some(Dinosaur) }}, got {other:?}")
+                panic!("expected AttackersDeclaredCount {{ Controller {{ You, Some(Dinosaur) }}, GE, 2 }}, got {other:?}")
             }
         }
     }
@@ -24053,10 +24698,13 @@ mod tests {
         );
         assert!(matches!(
             def.condition,
-            Some(TriggerCondition::AttackersDeclaredMin {
-                scope: ControllerRef::You,
-                minimum: 2,
-                filter: None,
+            Some(TriggerCondition::AttackersDeclaredCount {
+                subject: AttackersDeclaredCountSubject::Controller {
+                    scope: ControllerRef::You,
+                    filter: None,
+                },
+                comparator: Comparator::GE,
+                count: 2,
             })
         ));
     }
@@ -24081,19 +24729,29 @@ mod tests {
                 assert_eq!(conditions.len(), 2);
                 assert!(matches!(
                     &conditions[0],
-                    TriggerCondition::AttackersDeclaredMin {
-                        scope: ControllerRef::Opponent,
-                        minimum: 2,
-                        filter: None,
+                    TriggerCondition::AttackersDeclaredCount {
+                        subject: AttackersDeclaredCountSubject::Controller {
+                            scope: ControllerRef::Opponent,
+                            filter: None,
+                        },
+                        comparator: Comparator::GE,
+                        count: 2,
                     }
                 ));
                 assert!(matches!(
                     &conditions[1],
-                    TriggerCondition::NoneOfAttackersTargetedYou
+                    TriggerCondition::AttackersDeclaredCount {
+                        subject: AttackersDeclaredCountSubject::AttackTarget {
+                            controller: ControllerRef::You,
+                            attacked: AttackTargetFilter::Player,
+                        },
+                        comparator: Comparator::EQ,
+                        count: 0,
+                    }
                 ));
             }
             other => panic!(
-                "expected And(AttackersDeclaredMin, NoneOfAttackersTargetedYou), got {other:?}"
+                "expected And(controller AttackersDeclaredCount, target AttackersDeclaredCount), got {other:?}"
             ),
         }
         // CR 121.1 + CR 603.7c + CR 608.2k: "they draw a card" — the effect-level
@@ -24130,13 +24788,36 @@ mod tests {
         assert_eq!(def.mode, TriggerMode::YouAttack);
         assert!(matches!(
             def.condition,
-            Some(TriggerCondition::AttackersDeclaredMin {
-                scope: ControllerRef::Opponent,
-                minimum: 2,
-                filter: None,
+            Some(TriggerCondition::AttackersDeclaredCount {
+                subject: AttackersDeclaredCountSubject::Controller {
+                    scope: ControllerRef::Opponent,
+                    filter: None,
+                },
+                comparator: Comparator::GE,
+                count: 2,
             })
         ));
         assert!(def.batched);
+    }
+
+    #[test]
+    fn mangara_attack_batch_intervening_if_counts_attacking_you_or_planeswalkers() {
+        let def = parse_trigger_line(
+            "Whenever an opponent attacks with creatures, if two or more of those creatures are attacking you and/or planeswalkers you control, draw a card.",
+            "Mangara, the Diplomat",
+        );
+        assert_eq!(def.mode, TriggerMode::Attacks);
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::AttackersDeclaredCount {
+                subject: AttackersDeclaredCountSubject::AttackTarget {
+                    controller: ControllerRef::You,
+                    attacked: AttackTargetFilter::PlayerOrPlaneswalker,
+                },
+                comparator: Comparator::GE,
+                count: 2,
+            })
+        );
     }
 
     /// CR 109.4 + CR 115.1 + CR 506.2: Karazikar's first trigger introduces

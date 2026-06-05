@@ -20,6 +20,23 @@ pub(crate) enum InvertedAsLongAs {
     Allow,
     Skip,
 }
+
+fn parse_each_other_players_untap_step_suffix(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        all_consuming((
+            space1,
+            alt((
+                tag("during each other player's untap step"),
+                tag("during each other player\u{2019}s untap step"),
+            )),
+            opt(tag(".")),
+            space0,
+        )),
+    )
+    .parse(input)
+}
+
 pub(crate) fn parse_static_line_inner(
     text: &str,
     inverted: InvertedAsLongAs,
@@ -252,18 +269,11 @@ pub(crate) fn parse_static_line_inner(
         // which handles the full range of type + controller phrases.
         let (filter, remainder) = parse_type_phrase(rest.original);
         let remainder_lower = remainder.to_lowercase();
-        // Accept "during each other player's untap step" with straight and curly apostrophes.
-        let tail = remainder_lower.trim().trim_end_matches('.');
-        let during_ok = nom_on_lower(tail, tail, |i| {
-            value(
-                (),
-                alt((
-                    tag("during each other player's untap step"),
-                    tag("during each other player\u{2019}s untap step"),
-                )),
-            )
-            .parse(i)
-        })
+        let during_ok = nom_on_lower(
+            remainder,
+            &remainder_lower,
+            parse_each_other_players_untap_step_suffix,
+        )
         .is_some();
         // Require the subject filter to be controlled by "you" — rules text
         // variations outside this ("each player's permanents") would not be
@@ -278,6 +288,36 @@ pub(crate) fn parse_static_line_inner(
                     .affected(filter)
                     .description(text.to_string()),
             );
+        }
+    }
+
+    // --- "Untap this <permanent> during each other player's untap step." ---
+    // CR 502.3 + CR 113.6: the self-referential Seedborn-class variant (Bender's
+    // Waterskin: "Untap this artifact during each other player's untap step").
+    // Shares the runtime of the "untap all" form
+    // (`StaticMode::UntapsDuringEachOtherPlayersUntapStep`), but the affected
+    // filter is the source itself (`SelfRef`) so its controller untaps only it
+    // during every other player's untap step. Ordered after the "untap all" arm
+    // — the typed "you control" subject and these self-reference subjects are
+    // disjoint, so neither shadows the other.
+    if let Some(rest) = nom_tag_tp(&tp, "untap ") {
+        let self_subject =
+            nom_on_lower(rest.original, rest.lower, nom_target::parse_self_reference);
+        if let Some((TargetFilter::SelfRef, remainder)) = self_subject {
+            let remainder_lower = remainder.to_lowercase();
+            let during_ok = nom_on_lower(
+                remainder,
+                &remainder_lower,
+                parse_each_other_players_untap_step_suffix,
+            )
+            .is_some();
+            if during_ok {
+                return Some(
+                    StaticDefinition::new(StaticMode::UntapsDuringEachOtherPlayersUntapStep)
+                        .affected(TargetFilter::SelfRef)
+                        .description(text.to_string()),
+                );
+            }
         }
     }
 
@@ -1179,6 +1219,30 @@ pub(crate) fn parse_static_line_inner(
 
     // --- "~ can't attack" ---
     if nom_primitives::scan_contains(tp.lower, "can't attack") {
+        // CR 508.1d: Subject-led lines ("Each creature ... can't attack you") must not
+        // collapse to SelfRef — `parse_subject_combat_rule_static` handles them above.
+        if let Some((subject_lower, _, rest)) =
+            nom_primitives::scan_preceded(tp.lower, parse_cant_attack_rule_static_predicate_nom)
+        {
+            let rest = match opt(tag::<_, _, OracleError<'_>>(".")).parse(rest) {
+                Ok((r, _)) => r,
+                Err(_) => rest,
+            };
+            // Only defer when the line is a fully consumed scoped cant-attack
+            // (Eriette). Trailing "unless"/"if" clauses must still use SelfRef.
+            if rest.trim().is_empty() {
+                let subject = tp.original[..subject_lower.len()].trim();
+                let subject_lower = subject.to_lowercase();
+                if !subject.is_empty()
+                    && subject_lower != "~"
+                    && subject_lower != "it"
+                    && subject_lower != "this"
+                    && !SELF_REF_PARSE_ONLY_PHRASES.contains(&subject_lower.as_str())
+                {
+                    return None;
+                }
+            }
+        }
         let mode = if nom_primitives::scan_contains(tp.lower, "can't attack or block") {
             StaticMode::CantAttackOrBlock
         } else {
@@ -1288,14 +1352,27 @@ pub(crate) fn parse_static_line_inner(
     }
 
     // --- "~ can't be the target" or "~ can't be targeted" ---
-    if nom_primitives::scan_contains(tp.lower, "can't be the target")
-        || nom_primitives::scan_contains(tp.lower, "can't be targeted")
-    {
-        return Some(
-            StaticDefinition::new(StaticMode::CantBeTargeted)
-                .affected(TargetFilter::SelfRef)
-                .description(text.to_string()),
-        );
+    // CR 702.18a / 702.11a: these descriptive phrasings ARE Shroud / Hexproof.
+    if let Some(scope) = crate::parser::oracle_keyword::classify_cant_be_targeted(tp.lower) {
+        return Some(match scope {
+            // CR 702.11a: "... your opponents control" — grant Hexproof so the
+            // permanent's own controller can still target it.
+            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => {
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SelfRef)
+                    .modifications(vec![ContinuousModification::AddKeyword {
+                        keyword: Keyword::Hexproof,
+                    }])
+                    .description(text.to_string())
+            }
+            // CR 702.18a: blanket — can't be targeted by any player. Enforced in
+            // `targeting.rs::can_target` via the object's active static definitions.
+            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => {
+                StaticDefinition::new(StaticMode::CantBeTargeted)
+                    .affected(TargetFilter::SelfRef)
+                    .description(text.to_string())
+            }
+        });
     }
 
     // --- "~ can't be sacrificed" (CR 701.21) ---

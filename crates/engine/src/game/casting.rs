@@ -458,6 +458,14 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
         objects.extend(permission_ids);
     }
 
+    // CR 601.2a + CR 611.2a: Graveyard objects with a timed `ExileWithAltCost`
+    // grant from `CastFromZone` (Emry class).
+    objects.extend(player_data.graveyard.iter().copied().filter(|&obj_id| {
+        state.objects.get(&obj_id).is_some_and(|obj| {
+            obj.owner == player && has_graveyard_timed_alt_cost_permission(state, obj, player)
+        })
+    }));
+
     // CR 601.2a + CR 113.6b + CR 118.9: Cards in exile castable via a
     // `StaticMode::ExileCastPermission` static from a battlefield permanent
     // (Maralen, Fae Ascendant). Restricted to cards exiled "with" the source
@@ -1296,6 +1304,19 @@ fn has_alt_cost_permission_for(
     obj.casting_permissions.iter().any(|permission| {
         exile_alt_cost_permission_supports_cast(state, obj, player, permission, None)
     })
+}
+
+/// CR 601.2a: Object-level timed alt-cost grants that allow casting from the
+/// graveyard without exiling first (Emry, Lurker in the Loch).
+fn has_graveyard_timed_alt_cost_permission(
+    state: &GameState,
+    obj: &crate::game::game_object::GameObject,
+    player: PlayerId,
+) -> bool {
+    obj.zone == Zone::Graveyard
+        && obj.casting_permissions.iter().any(|permission| {
+            exile_alt_cost_permission_supports_cast(state, obj, player, permission, None)
+        })
 }
 
 /// CR 604.3 + CR 601.2a: Find graveyard objects castable via static permission
@@ -2365,6 +2386,9 @@ fn casting_variant_candidates(
                 graveyard_destination_replacement: source.graveyard_destination_replacement,
             });
         }
+        if has_graveyard_timed_alt_cost_permission(state, obj, player) {
+            candidates.push(CastingVariant::Normal);
+        }
     }
 
     if obj.zone == Zone::Exile {
@@ -2432,6 +2456,18 @@ fn casting_variant_candidates(
         candidates.push(CastingVariant::Freerunning);
     }
 
+    // CR 702.74a + CR 118.9: Evoke is a static alternative cost usable from any
+    // zone the card can be cast from; surface it as a hand candidate so the gate
+    // offers it when the printed cost is unaffordable. effective_spell_keywords
+    // covers printed (obj.keywords) AND granted (CastWithKeyword) evoke.
+    if obj.zone == Zone::Hand
+        && effective_spell_keywords(state, player, object_id)
+            .iter()
+            .any(|k| matches!(k, crate::types::keywords::Keyword::Evoke(_)))
+    {
+        candidates.push(CastingVariant::Evoke);
+    }
+
     candidates
 }
 
@@ -2473,6 +2509,7 @@ fn prepare_spell_cast_with_variant_override_inner(
         None
     };
     let has_graveyard_permission = graveyard_permission_src.is_some();
+    let has_graveyard_alt_cost = has_graveyard_timed_alt_cost_permission(state, obj, player);
 
     // CR 401.5 + CR 118.9 + CR 601.2a: Top-of-library cast via static permission
     // (Realmwalker, Future Sight, Bolas's Citadel, etc.). The card must be the
@@ -2509,6 +2546,7 @@ fn prepare_spell_cast_with_variant_override_inner(
                 || has_madness
                 || has_graveyard_cast_keyword
                 || has_graveyard_permission
+                || has_graveyard_alt_cost
                 || has_top_of_library_permission));
     if !castable_zone {
         return Err(EngineError::InvalidAction(
@@ -2583,7 +2621,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // (ExileWithAltAbilityCost) zeroes the mana cost — its `AbilityCost` is
     // routed through `pay_additional_cost` in `check_additional_cost_or_pay`
     // (CR 118.9 + CR 119.4).
-    let alt_cost_from_exile = if obj.zone == Zone::Exile {
+    let alt_cost_from_exile = if obj.zone == Zone::Exile || has_graveyard_alt_cost {
         // CR 611.2a: When a permission carries `granted_to: Some(p)`, only
         // player `p` may consume its cost override. Skip alt-cost permissions
         // bound to a different player so a non-grantee casting from the same
@@ -2841,7 +2879,11 @@ fn prepare_spell_cast_with_variant_override_inner(
     // mana component substitutes to `ManaCost::zero()` and the residual
     // non-mana cost is paid via the additional-cost path (CR 601.2h).
     let (evoke_cost, evoke_non_mana_cost) = if casting_variant == CastingVariant::Evoke {
-        let split = obj.keywords.iter().find_map(|k| match k {
+        // CR 702.74a + CR 601.2f-h + CR 604.1: read evoke cost from effective
+        // keywords so granted evoke (CastWithKeyword) substitutes its cost, not
+        // just printed evoke.
+        let effective_kws = effective_spell_keywords(state, player, object_id);
+        let split = effective_kws.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Evoke(cost) => Some(split_evoke_cost_components(cost)),
             _ => None,
         });
@@ -6150,10 +6192,15 @@ pub fn handle_cast_spell_with_payment_mode(
     // (CR 601.2h). Affordability requires BOTH halves to be payable.
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand {
-            if let Some(evoke_cost) = obj.keywords.iter().find_map(|k| match k {
-                crate::types::keywords::Keyword::Evoke(cost) => Some(cost.clone()),
-                _ => None,
-            }) {
+            // CR 702.74a + CR 604.1: effective keywords so granted evoke
+            // routes/affords.
+            if let Some(evoke_cost) = effective_spell_keywords(state, player, object_id)
+                .into_iter()
+                .find_map(|k| match k {
+                    crate::types::keywords::Keyword::Evoke(cost) => Some(cost),
+                    _ => None,
+                })
+            {
                 let (evoke_mana_part, evoke_non_mana_part) =
                     split_evoke_cost_components(&evoke_cost);
                 // CR 601.2f + CR 118.9d: affordability and the displayed costs
@@ -9969,6 +10016,7 @@ fn quantity_expr_is_board_state_relative(expr: &QuantityExpr) -> bool {
         QuantityExpr::Ref { qty } => quantity_ref_is_board_state_relative(qty),
         QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => quantity_expr_is_board_state_relative(inner),
         QuantityExpr::Sum { exprs } => exprs.iter().all(quantity_expr_is_board_state_relative),
         _ => false,
@@ -9997,7 +10045,10 @@ fn quantity_ref_is_board_state_relative(qty: &QuantityRef) -> bool {
         | QuantityRef::Toughness { scope }
         | QuantityRef::ObjectManaValue { scope }
         | QuantityRef::ObjectColorCount { scope }
-        | QuantityRef::ObjectNameWordCount { scope } => matches!(scope, ObjectScope::Source),
+        | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::ObjectTypelineComponentCount { scope } => {
+            matches!(scope, ObjectScope::Source)
+        }
         // Conservative default: any ref not positively known to be
         // board/controller-relative (Variable/X, target-relative scopes,
         // cast/trigger-event context, etc.) makes the condition non-evaluable
@@ -12099,6 +12150,7 @@ mod tests {
                 active_zones: vec![],
                 characteristic_defining: false,
                 description: Some("Assassin spells you cast have freerunning {B}{B}.".to_string()),
+                attack_defended: None,
             };
             obj.static_definitions = vec![def].into();
         }
@@ -15962,8 +16014,14 @@ mod tests {
                         .expect("priority pass to advance the turn");
                 }
                 WaitingFor::DeclareAttackers { .. } => {
-                    apply_as_current(&mut state, GameAction::DeclareAttackers { attacks: vec![] })
-                        .expect("declare no attackers");
+                    apply_as_current(
+                        &mut state,
+                        GameAction::DeclareAttackers {
+                            attacks: vec![],
+                            bands: vec![],
+                        },
+                    )
+                    .expect("declare no attackers");
                 }
                 WaitingFor::DeclareBlockers { .. } => {
                     apply_as_current(
@@ -16131,8 +16189,14 @@ mod tests {
                         .expect("priority pass to advance the turn");
                 }
                 WaitingFor::DeclareAttackers { .. } => {
-                    apply_as_current(&mut state, GameAction::DeclareAttackers { attacks: vec![] })
-                        .expect("declare no attackers");
+                    apply_as_current(
+                        &mut state,
+                        GameAction::DeclareAttackers {
+                            attacks: vec![],
+                            bands: vec![],
+                        },
+                    )
+                    .expect("declare no attackers");
                 }
                 WaitingFor::DeclareBlockers { .. } => {
                     apply_as_current(
@@ -17282,6 +17346,7 @@ mod tests {
                     active_zones: vec![],
                     characteristic_defining: false,
                     description: None,
+                    attack_defended: None,
                 }]
                 .into();
             }
@@ -19347,6 +19412,7 @@ mod tests {
                 description: Some(
                     "Instant and sorcery spells you cast have affinity for creatures.".to_string(),
                 ),
+                attack_defended: None,
             };
             obj.static_definitions = vec![def].into();
         }
@@ -19467,6 +19533,246 @@ mod tests {
             crate::game::keywords::has_keyword_kind(obj, KeywordKind::Deathtouch),
             "Witherbloom, the Balancer must have Deathtouch; keywords = {:?}",
             obj.keywords
+        );
+    }
+
+    /// CR 702.74a + CR 613.1f + CR 604.1: Ashling, the Limitless — "Elemental
+    /// permanent spells you cast from your hand gain evoke {4} as you cast them."
+    /// The granted keyword lives on the spell while on the stack, never on the
+    /// resolving permanent's printed triggers, so the gate must offer Evoke and
+    /// the runtime must install the ETB-sac onto the permanent at resolution.
+    #[test]
+    fn ashling_granted_evoke_offered_and_installs_etb_sac() {
+        use crate::types::keywords::{EvokeCost, Keyword};
+
+        let mut state = setup_game_at_main_phase();
+        // 4 mana: not enough for a {6} printed elemental spell, exactly the
+        // granted evoke {4}.
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 4);
+
+        // Grantor permanent on the battlefield carrying the parsed Ashling
+        // static (real parser AST, not a hand-built fixture).
+        let ashling_static = crate::parser::oracle_static::parse_static_line(
+            "Elemental permanent spells you cast from your hand gain evoke {4} as you cast them.",
+        )
+        .expect("Ashling line must parse to a CastWithKeyword static");
+        let grantor = create_object(
+            &mut state,
+            CardId(8000),
+            PlayerId(0),
+            "Ashling, the Limitless".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&grantor).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            obj.static_definitions = vec![ashling_static].into();
+        }
+
+        // An Elemental creature (permanent) spell in hand, printed {6}.
+        let spell = create_object(
+            &mut state,
+            CardId(8001),
+            PlayerId(0),
+            "Some Elemental".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Elemental".to_string());
+            obj.base_card_types.subtypes.push("Elemental".to_string());
+            obj.mana_cost = ManaCost::generic(6);
+            obj.base_mana_cost = ManaCost::generic(6);
+        }
+
+        // (a) The granted evoke keyword resolves onto the spell.
+        let granted = super::effective_spell_keywords(&state, PlayerId(0), spell);
+        assert!(
+            granted
+                .iter()
+                .any(|k| matches!(k, Keyword::Evoke(EvokeCost::Mana(c)) if c.mana_value() == 4)),
+            "Ashling's static must grant evoke {{4}} to elemental spells you cast; got {granted:?}"
+        );
+
+        // (b) The gate offers Evoke even though the printed {6} is unaffordable.
+        assert!(
+            can_cast_object_now(&state, PlayerId(0), spell),
+            "granted evoke {{4}} affordable ⇒ spell must be castable via the gate"
+        );
+        let choices = casting_variant_choice_set(&state, PlayerId(0), spell);
+        assert!(
+            choices
+                .options
+                .iter()
+                .any(|o| o.variant == CastingVariant::Evoke),
+            "choice set must include the granted Evoke option; got {:?}",
+            choices.options
+        );
+
+        // (c) Negative: a non-Elemental spell in hand gets NO granted evoke.
+        let non_elemental = create_object(
+            &mut state,
+            CardId(8002),
+            PlayerId(0),
+            "Plain Bear".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&non_elemental).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            obj.mana_cost = ManaCost::generic(2);
+            obj.base_mana_cost = ManaCost::generic(2);
+        }
+        let non_elemental_kws = super::effective_spell_keywords(&state, PlayerId(0), non_elemental);
+        assert!(
+            !non_elemental_kws
+                .iter()
+                .any(|k| matches!(k, Keyword::Evoke(_))),
+            "non-elemental spell must not receive granted evoke; got {non_elemental_kws:?}"
+        );
+
+        // (d) Runtime install: the resolving permanent (granted evoke) carries no
+        // printed evoke trigger, so `ensure_evoke_etb_sac_trigger` installs it,
+        // and a second call is an idempotent no-op (structural-equality guard).
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            assert_eq!(
+                obj.trigger_definitions.len(),
+                0,
+                "granted-evoke spell starts with no ETB-sac trigger"
+            );
+            crate::database::synthesis::ensure_evoke_etb_sac_trigger(obj);
+            assert_eq!(
+                obj.trigger_definitions.len(),
+                1,
+                "ensure_evoke_etb_sac_trigger must install the trigger once"
+            );
+            crate::database::synthesis::ensure_evoke_etb_sac_trigger(obj);
+            assert_eq!(
+                obj.trigger_definitions.len(),
+                1,
+                "second call must be an idempotent no-op (no double install)"
+            );
+            let trig = obj.trigger_definitions.get(0).unwrap();
+            assert!(
+                matches!(
+                    trig.condition,
+                    Some(crate::types::ability::TriggerCondition::CastVariantPaid {
+                        variant: crate::types::ability::CastVariantPaid::Evoke,
+                    })
+                ),
+                "installed trigger must be gated on CastVariantPaid(Evoke)"
+            );
+        }
+    }
+
+    /// CR 702.74a + CR 604.1: End-to-end composition of the two evoke work items.
+    /// Ashling grants evoke {4} to an Elemental permanent spell in hand; casting
+    /// it for the granted evoke cost (only {4} available, printed {6} unaffordable)
+    /// must drive a full cast -> resolution -> sacrifice: the runtime-installed
+    /// ETB-sac trigger, gated on CastVariantPaid::Evoke, fires and the permanent
+    /// ends up in its owner's graveyard. Nothing else exercises granted evoke
+    /// through actual resolution, so this is the load-bearing composition guard.
+    #[test]
+    fn ashling_granted_evoke_full_cast_resolves_to_sacrifice() {
+        use super::super::engine::apply_as_current;
+
+        let mut state = setup_game_at_main_phase();
+        // Exactly the granted evoke {4}; NOT enough for the printed {6}.
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 4);
+
+        let ashling_static = crate::parser::oracle_static::parse_static_line(
+            "Elemental permanent spells you cast from your hand gain evoke {4} as you cast them.",
+        )
+        .expect("Ashling line must parse to a CastWithKeyword static");
+        let grantor = create_object(
+            &mut state,
+            CardId(8100),
+            PlayerId(0),
+            "Ashling, the Limitless".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&grantor).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            obj.static_definitions = vec![ashling_static].into();
+        }
+
+        let spell = create_object(
+            &mut state,
+            CardId(8101),
+            PlayerId(0),
+            "Some Elemental".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Elemental".to_string());
+            obj.base_card_types.subtypes.push("Elemental".to_string());
+            obj.mana_cost = ManaCost::generic(6);
+            obj.base_mana_cost = ManaCost::generic(6);
+        }
+
+        // Cast: only the granted evoke {4} is affordable, so the cast auto-routes
+        // to the evoke alternative cost (no printed-vs-evoke choice). The {4}
+        // generic cost paid by 4 colorless is unambiguous, so it auto-finalizes
+        // straight to the stack (mirrors the X-cost auto-pay path).
+        let result = apply_as_current(
+            &mut state,
+            GameAction::CastSpell {
+                object_id: spell,
+                card_id: CardId(8101),
+                targets: vec![],
+            },
+        )
+        .unwrap();
+        assert!(
+            !matches!(result.waiting_for, WaitingFor::AlternativeCastChoice { .. }),
+            "only evoke affordable ⇒ auto-route, not a printed-vs-evoke choice"
+        );
+        assert_eq!(
+            state.players[0].hand.len(),
+            0,
+            "evoke spell left the hand for the stack"
+        );
+        assert_eq!(state.stack.len(), 1, "evoke spell is on the stack");
+
+        // Resolve the spell and the subsequent ETB-sacrifice trigger by passing
+        // priority a bounded number of times (stop before turns advance into an
+        // empty-library deck-out).
+        for _ in 0..8 {
+            if state.players[0].graveyard.contains(&spell) {
+                break;
+            }
+            if apply_as_current(&mut state, GameAction::PassPriority).is_err() {
+                break;
+            }
+        }
+        let dbg_obj = state.objects.get(&spell);
+        let diag = format!(
+            "zone={:?} cvp={:?} trigs={:?} bf={} gy={} stack={}",
+            dbg_obj.map(|o| o.zone),
+            dbg_obj.and_then(|o| o.cast_variant_paid),
+            dbg_obj.map(|o| o.trigger_definitions.len()),
+            state.battlefield.contains(&spell),
+            state.players[0].graveyard.contains(&spell),
+            state.stack.len(),
+        );
+
+        assert!(
+            state.players[0].graveyard.contains(&spell),
+            "granted-evoke Elemental must be sacrificed on ETB and end in the graveyard; {diag}"
+        );
+        assert!(
+            !state.battlefield.contains(&spell),
+            "sacrificed permanent must not remain on the battlefield; {diag}"
         );
     }
 
@@ -20018,6 +20324,50 @@ mod tests {
             obj_id,
             &state.objects[&obj_id].mana_cost
         ));
+    }
+
+    /// Issue #2027 — Emry, Lurker in the Loch: targeted graveyard artifact may
+    /// be cast this turn via `CastFromZone` without exiling first.
+    #[test]
+    fn graveyard_timed_alt_cost_grant_is_castable_in_place() {
+        use crate::game::effects::cast_from_zone;
+        use crate::types::ability::{CardPlayMode, Effect, ResolvedAbility, TargetRef};
+
+        let mut state = setup_game_at_main_phase();
+        let bauble = create_object(
+            &mut state,
+            CardId(2027),
+            PlayerId(0),
+            "Mishra's Bauble".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&bauble).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.mana_cost = ManaCost::zero();
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::ParentTarget,
+                without_paying_mana_cost: false,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: Some(Duration::UntilEndOfTurn),
+                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+            },
+            vec![TargetRef::Object(bauble)],
+            ObjectId(9001),
+            PlayerId(0),
+        );
+        cast_from_zone::resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+
+        assert_eq!(state.objects[&bauble].zone, Zone::Graveyard);
+        assert!(spell_objects_available_to_cast(&state, PlayerId(0)).contains(&bauble));
+        prepare_spell_cast(&state, PlayerId(0), bauble)
+            .expect("bauble must be castable from graveyard");
     }
 
     fn add_borrowed_exile_sorcery_with_mana_value(
@@ -31447,6 +31797,175 @@ mod tests {
                 "reduced printed cost is affordable ⇒ player must be offered the \
                  Evoke choice, not auto-skipped; got {:?}",
                 wf
+            );
+        }
+
+        // --- Gate-level coverage (CR 702.74a + CR 118.9): `can_cast_object_now`
+        // must offer Evoke from hand when only the evoke cost is affordable. The
+        // pre-existing `evoke_*` tests above hit `handle_cast_spell` directly and
+        // never exercised the legal-action gate, which derives Evoke from the
+        // hand candidate added to `casting_variant_candidates`. ---
+
+        /// (a) Printed cost unaffordable, evoke mana cost affordable ⇒ the gate
+        /// reports the object as castable and dispatch routes into the evoke path
+        /// (it does NOT surface an `AlternativeCastChoice` because the printed
+        /// cost is unpayable — only one viable path).
+        #[test]
+        fn gate_offers_evoke_when_only_evoke_affordable() {
+            let mut state = setup_game_at_main_phase();
+            // 2 mana: printed {6} unaffordable, evoke {2} affordable.
+            add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
+
+            let obj = create_evoke_spell(
+                &mut state,
+                PlayerId(0),
+                700,
+                ManaCost::generic(6),
+                ManaCost::generic(2),
+            );
+
+            assert!(
+                can_cast_object_now(&state, PlayerId(0), obj),
+                "evoke-only affordability must make the object castable via the gate"
+            );
+
+            let mut events = Vec::new();
+            let wf =
+                handle_cast_spell(&mut state, PlayerId(0), obj, CardId(700), &mut events).unwrap();
+            assert!(
+                !matches!(
+                    wf,
+                    WaitingFor::AlternativeCastChoice {
+                        keyword: AlternativeCastKeyword::Evoke,
+                        ..
+                    }
+                ),
+                "printed cost unpayable ⇒ auto-route to evoke path, no prompt; got {:?}",
+                wf
+            );
+        }
+
+        /// (b) Non-mana evoke (Solitude-shape): printed cost unaffordable, the
+        /// non-mana evoke (exile a white card from hand) is payable ⇒ the gate
+        /// reports the object castable.
+        #[test]
+        fn gate_offers_non_mana_evoke_when_only_evoke_affordable() {
+            use crate::types::ability::{FilterProp, TypedFilter};
+            use crate::types::mana::ManaColor;
+
+            let mut state = setup_game_at_main_phase();
+            // No mana at all ⇒ printed {3}{W}{W} unaffordable; the only cost the
+            // player can pay is the non-mana exile.
+            let white_card_filter = TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Card],
+                controller: Some(ControllerRef::You),
+                properties: vec![FilterProp::HasColor {
+                    color: ManaColor::White,
+                }],
+            });
+            let exile_cost = AbilityCost::Exile {
+                count: 1,
+                zone: Some(Zone::Hand),
+                filter: Some(white_card_filter),
+            };
+            let solitude = create_evoke_spell_non_mana(
+                &mut state,
+                PlayerId(0),
+                701,
+                ManaCost::Cost {
+                    generic: 3,
+                    shards: vec![ManaCostShard::White, ManaCostShard::White],
+                },
+                exile_cost,
+            );
+            // A second white card in hand so the exile sub-cost is payable.
+            let _white_card = {
+                let id = create_object(
+                    &mut state,
+                    CardId(702),
+                    PlayerId(0),
+                    "White Card In Hand".to_string(),
+                    Zone::Hand,
+                );
+                let obj = state.objects.get_mut(&id).unwrap();
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.color.push(ManaColor::White);
+                id
+            };
+
+            assert!(
+                can_cast_object_now(&state, PlayerId(0), solitude),
+                "non-mana evoke affordability must make the object castable via the gate"
+            );
+        }
+
+        /// (c) Both printed and evoke affordable ⇒ the choice set yields the
+        /// single Evoke option (so `had_multiple_candidates == false`, no
+        /// auto-pick) and dispatch surfaces `WaitingFor::AlternativeCastChoice`.
+        #[test]
+        fn gate_offers_choice_when_both_affordable() {
+            let mut state = setup_game_at_main_phase();
+            add_mana(&mut state, PlayerId(0), ManaType::Colorless, 10);
+
+            let obj = create_evoke_spell(
+                &mut state,
+                PlayerId(0),
+                703,
+                ManaCost::generic(4),
+                ManaCost::generic(2),
+            );
+
+            assert!(can_cast_object_now(&state, PlayerId(0), obj));
+
+            // The Evoke hand candidate is the only non-Normal variant, so the
+            // choice set carries exactly one option and is not flagged multiple.
+            let choices = casting_variant_choice_set(&state, PlayerId(0), obj);
+            assert!(
+                choices
+                    .options
+                    .iter()
+                    .any(|o| o.variant == CastingVariant::Evoke),
+                "choice set must include the Evoke option; got {:?}",
+                choices.options
+            );
+            assert!(
+                !choices.had_multiple_candidates,
+                "a single Evoke candidate must not flag multiple candidates"
+            );
+
+            let mut events = Vec::new();
+            let wf =
+                handle_cast_spell(&mut state, PlayerId(0), obj, CardId(703), &mut events).unwrap();
+            assert!(
+                matches!(
+                    wf,
+                    WaitingFor::AlternativeCastChoice {
+                        keyword: AlternativeCastKeyword::Evoke,
+                        ..
+                    }
+                ),
+                "both costs affordable ⇒ player must be offered the Evoke choice; got {:?}",
+                wf
+            );
+        }
+
+        /// (d) Neither printed nor evoke affordable ⇒ not castable.
+        #[test]
+        fn gate_rejects_when_neither_affordable() {
+            let mut state = setup_game_at_main_phase();
+            add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+
+            let obj = create_evoke_spell(
+                &mut state,
+                PlayerId(0),
+                704,
+                ManaCost::generic(6),
+                ManaCost::generic(3),
+            );
+
+            assert!(
+                !can_cast_object_now(&state, PlayerId(0), obj),
+                "neither printed nor evoke affordable ⇒ object must not be castable"
             );
         }
     }

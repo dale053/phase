@@ -380,6 +380,10 @@ fn parse_mtgjson_missing_standalone_keyword_line(line: &str) -> Option<Vec<Keywo
     let keyword = parse_keyword_from_oracle(&lower)?;
     match keyword {
         Keyword::ForMirrodin => Some(vec![keyword]),
+        // CR 702.89a: Umbra armor (printed as "umbra armor"/"totem armor") is a
+        // standalone keyword line MTGJSON does not surface in its `keywords` array,
+        // so it must be recovered from the Oracle line here.
+        Keyword::TotemArmor => Some(vec![keyword]),
         _ => None,
     }
 }
@@ -867,6 +871,49 @@ fn parse_craft_material_count(input: &str) -> Option<(&str, CostObjectCount)> {
     Some((input, CostObjectCount::exactly(1)))
 }
 
+/// CR 702.18a / 702.11a: the CR keyword that a descriptive "can't be the target
+/// [of ...]" prohibition corresponds to. These phrasings ARE Shroud / Hexproof
+/// (CR 702.18a: "Shroud" means "can't be the target of spells or abilities";
+/// CR 702.11a: Hexproof restricts only opponents' spells/abilities), so callers
+/// map them onto the existing keyword targeting checks rather than a bespoke rule
+/// static, getting the correct controller scope for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CantBeTargetedScope {
+    /// CR 702.18a: blanket — can't be targeted by ANY player (Shroud).
+    AnyPlayer,
+    /// CR 702.11a: only spells/abilities an opponent controls (Hexproof).
+    OpponentsOnly,
+}
+
+/// Classify a predicate carrying a "can't be the target[ed]" prohibition.
+///
+/// Returns `None` when no such prohibition is present, or when its scope is one
+/// this parser does not yet model precisely (e.g. a specific spell type), so a
+/// caller never collapses an unrecognized scope into a blanket restriction.
+pub(crate) fn classify_cant_be_targeted(predicate_lower: &str) -> Option<CantBeTargetedScope> {
+    let is_prohibition = scan_contains(predicate_lower, "can't be the target")
+        || scan_contains(predicate_lower, "cannot be the target")
+        || scan_contains(predicate_lower, "can't be targeted")
+        || scan_contains(predicate_lower, "cannot be targeted");
+    if !is_prohibition {
+        return None;
+    }
+    // CR 702.11a: an opponent-controlled qualifier makes this Hexproof, not Shroud.
+    if scan_contains(predicate_lower, "your opponents control")
+        || scan_contains(predicate_lower, "an opponent controls")
+    {
+        return Some(CantBeTargetedScope::OpponentsOnly);
+    }
+    // CR 702.18a: the bare form ("~ can't be targeted") or the unqualified
+    // "spells or abilities" scope is blanket Shroud. Any other qualifier is left
+    // unclassified so it is not mistreated as a blanket restriction.
+    let bare = !scan_contains(predicate_lower, " of ");
+    let unqualified_scope = scan_contains(predicate_lower, "spells or abilities")
+        || scan_contains(predicate_lower, "spell or ability")
+        || scan_contains(predicate_lower, "spells and abilities");
+    (bare || unqualified_scope).then_some(CantBeTargetedScope::AnyPlayer)
+}
+
 ///
 /// Oracle text uses space-separated format: "protection from red", "ward {2}",
 /// "flashback {2}{U}". Converts to the colon format that `FromStr` expects,
@@ -1166,6 +1213,20 @@ pub(crate) fn parse_keyword_from_oracle(text: &str) -> Option<Keyword> {
     .is_ok()
     {
         return Some(Keyword::Ripple);
+    }
+
+    // CR 702.89a/b: "umbra armor" — and the obsolete "totem armor" the Oracle text
+    // of older cards was updated from — is a single two-word keyword. The generic
+    // name/parameter split below would read "umbra"/"totem" as the name and drop
+    // "armor", so recognize the whole phrase here (mirrors the `ripple N` check).
+    if all_consuming(alt((
+        tag::<_, _, OracleError<'_>>("umbra armor"),
+        tag("totem armor"),
+    )))
+    .parse(text)
+    .is_ok()
+    {
+        return Some(Keyword::TotemArmor);
     }
 
     // For parameterized keywords, find the first space to split name from parameter.
@@ -2473,6 +2534,39 @@ mod tests {
         let keywords = result.unwrap();
         assert_eq!(keywords.len(), 1);
         assert!(matches!(keywords[0], Keyword::Transmute(_)));
+    }
+
+    #[test]
+    fn parse_keyword_from_oracle_umbra_and_totem_armor() {
+        // CR 702.89a/b: both the current "umbra armor" and the obsolete
+        // "totem armor" spelling map to Keyword::TotemArmor.
+        assert_eq!(
+            parse_keyword_from_oracle("umbra armor"),
+            Some(Keyword::TotemArmor)
+        );
+        assert_eq!(
+            parse_keyword_from_oracle("totem armor"),
+            Some(Keyword::TotemArmor)
+        );
+    }
+
+    #[test]
+    fn extract_keyword_line_umbra_armor_reachable_without_mtgjson_keyword() {
+        // CR 702.89a: the Umbra cycle's "Umbra armor (…)" line carries reminder
+        // text and is NOT surfaced in MTGJSON's `keywords` array, so it must be
+        // recovered from the Oracle line. Regression guard that the runtime
+        // umbra-armor replacement is actually reachable (the keyword is produced).
+        for line in [
+            "Umbra armor (If enchanted permanent would be destroyed, instead remove all damage marked on it and destroy this Aura.)",
+            "Totem armor (If enchanted creature would be destroyed, instead remove all damage marked on it and destroy this Aura.)",
+        ] {
+            let result = extract_keyword_line(line, &[]);
+            assert_eq!(
+                result,
+                Some(vec![Keyword::TotemArmor]),
+                "umbra/totem armor line must yield Keyword::TotemArmor, got {result:?} for {line:?}"
+            );
+        }
     }
 
     #[test]

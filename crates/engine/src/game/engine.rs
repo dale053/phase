@@ -153,6 +153,10 @@ pub fn apply(
     sync_waiting_for(state, &result.waiting_for);
     run_auto_pass_loop(state, &mut result);
     reconcile_terminal_result(state, &mut result);
+    // Debug "infinite mana" (CR 500.5 suppressed for flagged players): restore any
+    // pool that a spend during this action depleted, before public state is
+    // finalized and the next affordability probe runs. No-op when none flagged.
+    super::mana_payment::refill_infinite_mana(state);
     remember_public_reveals(state, &result.events);
     // Targeted public-state dirty marking over the full accumulated event set
     // (the auto-pass loop appends events). `finalize_public_state` is the only
@@ -2871,9 +2875,12 @@ fn apply_action(
             mulligan::handle_opening_hand_bottom(state, actor, cards, &mut events)
                 .map_err(EngineError::InvalidAction)?
         }
-        (WaitingFor::DeclareAttackers { player, .. }, GameAction::DeclareAttackers { attacks }) => {
+        (
+            WaitingFor::DeclareAttackers { player, .. },
+            GameAction::DeclareAttackers { attacks, bands },
+        ) => {
             triggers_processed_inline = true;
-            engine_combat::handle_declare_attackers(state, *player, &attacks, &mut events)?
+            engine_combat::handle_declare_attackers(state, *player, &attacks, &bands, &mut events)?
         }
         (
             WaitingFor::DeclareBlockers { player, .. },
@@ -3988,6 +3995,28 @@ fn apply_action(
                 &assignments,
                 trample_damage,
                 controller_damage,
+                &mut events,
+            )?
+        }
+        // CR 510.1d + CR 702.22k: A banded blocker's combat damage is divided by
+        // the active player among the attackers it blocks.
+        (
+            WaitingFor::AssignBlockerDamage {
+                player,
+                blocker_id,
+                total_damage,
+                attackers,
+            },
+            GameAction::AssignBlockerDamage { assignments },
+        ) => {
+            triggers_processed_inline = true;
+            engine_combat::handle_assign_blocker_damage(
+                state,
+                *player,
+                *blocker_id,
+                *total_damage,
+                attackers,
+                &assignments,
                 &mut events,
             )?
         }
@@ -6992,6 +7021,7 @@ mod tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(bombardiers, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -9792,6 +9822,7 @@ mod tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(attacker, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -15348,6 +15379,7 @@ When this creature enters or dies, create a 1/1 red Goblin creature token.";
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(ajani, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -15541,6 +15573,7 @@ When this creature enters or dies, create a 1/1 red Goblin creature token.";
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(bat, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -18162,6 +18195,7 @@ When this creature enters or dies, create a 1/1 red Goblin creature token.";
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(attacker, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();

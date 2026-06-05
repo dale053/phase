@@ -9,6 +9,8 @@ use crate::types::ability::{
     PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, RepeatContinuation, ResolvedAbility,
     SharedQuality, SharedQualityRelation, SubAbilityLink, TargetFilter, TargetRef,
 };
+#[cfg(test)]
+use crate::types::ability::{AttackScope, AttackSubject};
 use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::game_state::{
     AutoMayChoice, CastOfferKind, ClauseMinimumSnapshot, DayNight, GameState, LKISnapshot,
@@ -233,14 +235,11 @@ pub(crate) fn matches_player_scope(
                             state, p.id, controller, source, source_id,
                         )
                     }
-                    // CR 508.6: opponent this player attacked this turn.
-                    PlayerFilter::OpponentAttackedThisTurn => {
-                        p.id != controller && state.has_attacked(controller, p.id)
-                    }
-                    // CR 508.6: opponent this source creature attacked this turn.
-                    PlayerFilter::OpponentAttackedBySourceThisTurn => {
+                    // CR 508.6: opponent the subject attacked within scope.
+                    PlayerFilter::OpponentAttacked { subject, scope } => {
                         p.id != controller
-                            && state.creature_attacked_player_this_turn(source_id, p.id)
+                            && state
+                                .opponent_attacked(*subject, *scope, controller, source_id, p.id)
                     }
                     PlayerFilter::HighestSpeed => {
                         let highest_speed = state
@@ -1287,6 +1286,7 @@ fn collect_clause_minimum_refs<'a>(expr: &'a QuantityExpr, out: &mut Vec<&'a Qua
         QuantityExpr::Fixed { .. } => {}
         QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Multiply { inner, .. }
         | QuantityExpr::UpTo { max: inner }
         | QuantityExpr::Power {
@@ -1715,6 +1715,7 @@ pub fn resolve_effect(
         Effect::TimeTravel => Ok(()),
         Effect::BecomeMonarch => become_monarch::resolve(state, ability, events),
         Effect::Proliferate => proliferate::resolve(state, ability, events),
+        Effect::ProliferateTarget { .. } => proliferate::resolve_target(state, ability, events),
         Effect::EndTheTurn => end_the_turn::resolve(state, ability, events),
         Effect::EndCombatPhase => end_combat_phase::resolve(state, ability, events),
         Effect::Populate => populate::resolve(state, ability, events),
@@ -2033,6 +2034,7 @@ fn quantity_expr_references_tracked_set(qty: &QuantityExpr) -> bool {
             )
         }
         QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Multiply { inner, .. }
         | QuantityExpr::DivideRounded { inner, .. } => quantity_expr_references_tracked_set(inner),
         QuantityExpr::Sum { exprs } => exprs.iter().any(quantity_expr_references_tracked_set),
@@ -3240,6 +3242,16 @@ fn resolve_chain_body(
                     remaining_scoped.set_original_controller_recursive(controller);
                     remaining_scoped.controller = remaining_pid;
                     remaining_scoped.set_scoped_player_recursive(remaining_pid);
+                    // CR 608.2c: each remaining player's clause is an INDEPENDENT
+                    // following instruction, not a continuation of the prior
+                    // player's. When the scoped template carries a conditional
+                    // rider (e.g. Momentum Breaker's "each opponent who can't
+                    // discards a card"), this clause gets appended after the
+                    // first player's stashed rider; marking it `SequentialSibling`
+                    // ensures it still resolves when that rider's condition is
+                    // false (it ran for a player who DID perform the action), so
+                    // the per-opponent fan-out is not truncated after the first.
+                    remaining_scoped.sub_link = SubAbilityLink::SequentialSibling;
                     if let Some(prev) = tail {
                         super::ability_utils::append_to_sub_chain(&mut remaining_scoped, *prev);
                     }
@@ -3482,13 +3494,32 @@ fn resolve_chain_body(
                 // here: `CopyTokenOf {IfYouDo}` is skipped (no pay → effect not
                 // performed) and the chain descends to `Token(Insect)
                 // {Not(IfYouDo)}`, which evaluates true and creates the Insect.
-                // Restricted to performed-gate sub-conditions so an
-                // unconditional continuation is never run when its parent's
+                // Restricted to performed-gate sub-conditions so a *dependent*
+                // continuation (one whose own gate references the parent's
+                // action, e.g. a `WhenYouDo` reflexive — Ezio's "When you do,
+                // that player loses the game") is never run when its parent's
                 // condition failed (that remains an early return).
+                //
+                // CR 608.2c: An UNCONDITIONAL `SequentialSibling` is the next
+                // INDEPENDENT instruction "in the order written", not a
+                // continuation of this node's action, so it resolves regardless
+                // of this node's condition. The `is_none()` guard is what keeps
+                // Ezio's gated reflexive blocked while letting a truly
+                // independent sibling through. This covers per-opponent
+                // `player_scope` continuations: when a scoped clause carries a
+                // conditional rider (Momentum Breaker's "each opponent who can't
+                // discards a card"), the remaining opponents' unconditional
+                // sacrifice clauses are appended after the first opponent's
+                // stashed rider as `SequentialSibling`s, and must still resolve
+                // when that rider's condition is false. Mirrors the gated-sub
+                // sibling escape hatch (the `next.sub_link == SequentialSibling`
+                // branch below).
                 if sub
                     .condition
                     .as_ref()
                     .is_some_and(condition_depends_on_effect_performed)
+                    || (sub.sub_link == SubAbilityLink::SequentialSibling
+                        && sub.condition.is_none())
                 {
                     let mut sub_resolved = sub.as_ref().clone();
                     if sub_resolved.targets.is_empty() && !ability.targets.is_empty() {
@@ -5087,8 +5118,7 @@ fn scoped_player_matches_filter(
         // game/triggers.rs:3703-3723).
         PlayerFilter::DefendingPlayer
         | PlayerFilter::OpponentDealtCombatDamage { .. }
-        | PlayerFilter::OpponentAttackedThisTurn
-        | PlayerFilter::OpponentAttackedBySourceThisTurn
+        | PlayerFilter::OpponentAttacked { .. }
         | PlayerFilter::HighestSpeed
         | PlayerFilter::ZoneChangedThisWay
         | PlayerFilter::PerformedActionThisWay { .. }
@@ -5370,6 +5400,8 @@ fn resolve_add_pending_etb_counters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::synthesis::synthesize_extort;
+    use crate::game::ability_utils::build_resolved_from_def;
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityCondition, AbilityDefinition, AbilityKind, AggregateFunction, BounceSelection,
@@ -5380,6 +5412,7 @@ mod tests {
         UntilCondition,
     };
     use crate::types::actions::GameAction;
+    use crate::types::card::CardFace;
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
     use crate::types::format::FormatConfig;
@@ -5389,10 +5422,11 @@ mod tests {
     };
     use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
     use crate::types::keywords::Keyword;
-    use crate::types::mana::{ManaColor, ManaCost};
+    use crate::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
     use crate::types::phase::Phase;
     use crate::types::player::{PlayerCounterKind, PlayerId};
     use crate::types::statics::CastFrequency;
+    use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
 
     #[test]
@@ -5458,7 +5492,10 @@ mod tests {
             matches_player_scope(
                 &state,
                 PlayerId(2),
-                &PlayerFilter::OpponentAttackedThisTurn,
+                &PlayerFilter::OpponentAttacked {
+                    subject: AttackSubject::You,
+                    scope: AttackScope::ThisTurn,
+                },
                 PlayerId(0),
                 angel,
             ),
@@ -5468,7 +5505,10 @@ mod tests {
             !matches_player_scope(
                 &state,
                 PlayerId(2),
-                &PlayerFilter::OpponentAttackedBySourceThisTurn,
+                &PlayerFilter::OpponentAttacked {
+                    subject: AttackSubject::Source,
+                    scope: AttackScope::ThisTurn,
+                },
                 PlayerId(0),
                 angel,
             ),
@@ -5478,7 +5518,10 @@ mod tests {
             matches_player_scope(
                 &state,
                 PlayerId(1),
-                &PlayerFilter::OpponentAttackedBySourceThisTurn,
+                &PlayerFilter::OpponentAttacked {
+                    subject: AttackSubject::Source,
+                    scope: AttackScope::ThisTurn,
+                },
                 PlayerId(0),
                 angel,
             ),
@@ -13236,6 +13279,110 @@ mod tests {
             "After discarding 1 of 2 and drawing 2, hand should have 3 cards, got {}. \
              IfYouDo sub-ability likely did not fire.",
             hand_after,
+        );
+    }
+
+    /// Issue #1972: Extort must prompt before draining, then pay {W/B}, drain each
+    /// opponent, and gain life equal to the total life lost.
+    #[test]
+    fn issue_1972_extort_optional_accept_drains_all_opponents_and_gains() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Extort);
+        synthesize_extort(&mut face);
+        let execute = face
+            .triggers
+            .iter()
+            .find(|t| {
+                matches!(t.mode, TriggerMode::SpellCast)
+                    && matches!(t.execute.as_deref().map(|e| e.optional), Some(true))
+            })
+            .and_then(|t| t.execute.as_deref())
+            .expect("synthesized extort trigger");
+
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        let source_id = ObjectId(100);
+        state.players[0].mana_pool.add(ManaUnit::new(
+            ManaType::White,
+            ObjectId(200),
+            false,
+            Vec::new(),
+        ));
+        let resolved = build_resolved_from_def(execute, source_id, PlayerId(0));
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &resolved, &mut events, 0).unwrap();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "extort must prompt before draining, got {:?}",
+            state.waiting_for
+        );
+        assert_eq!(
+            (state.players[1].life, state.players[2].life),
+            (20, 20),
+            "opponents must not lose life before the may-pay decision"
+        );
+
+        crate::game::engine_payment_choices::handle_optional_effect_choice(
+            &mut state,
+            true,
+            &mut events,
+        )
+        .unwrap();
+        assert_eq!(state.players[0].life, 22);
+        assert_eq!(state.players[1].life, 19);
+        assert_eq!(state.players[2].life, 19);
+        assert_eq!(state.players[0].mana_pool.mana.len(), 0);
+    }
+
+    /// Accept extort with no {W/B} available — drain must not run (CR 702.101a).
+    #[test]
+    fn issue_1972_extort_accept_without_payable_mana_does_not_drain() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Extort);
+        synthesize_extort(&mut face);
+        let execute = face
+            .triggers
+            .iter()
+            .find(|t| {
+                matches!(t.mode, TriggerMode::SpellCast)
+                    && matches!(t.execute.as_deref().map(|e| e.optional), Some(true))
+            })
+            .and_then(|t| t.execute.as_deref())
+            .expect("synthesized extort trigger");
+
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        let source_id = ObjectId(100);
+        assert!(
+            state.players[0].mana_pool.mana.is_empty(),
+            "controller must have no mana to pay W/B"
+        );
+        let resolved = build_resolved_from_def(execute, source_id, PlayerId(0));
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &resolved, &mut events, 0).unwrap();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "extort must prompt before draining, got {:?}",
+            state.waiting_for
+        );
+
+        crate::game::engine_payment_choices::handle_optional_effect_choice(
+            &mut state,
+            true,
+            &mut events,
+        )
+        .unwrap();
+
+        assert!(
+            state.cost_payment_failed_flag,
+            "PayCost with no W/B must set cost_payment_failed_flag"
+        );
+        assert_eq!(
+            (
+                state.players[0].life,
+                state.players[1].life,
+                state.players[2].life
+            ),
+            (20, 20, 20),
+            "accepting without payable mana must not drain opponents or grant life"
         );
     }
 
