@@ -345,6 +345,18 @@ pub fn move_to_zone(
 
     let obj = state.objects.get(&object_id).expect("object exists");
     let from = obj.zone;
+
+    // CR 400.7 / CR 603.2: A zone change that would move an object from a zone
+    // to the same zone (Battlefield → Battlefield) is a no-op — no new object
+    // is created, no ZoneChanged event is emitted, and no ETB triggers fire.
+    // Without this guard, move_to_zone(coiling_id, Battlefield) while Coiling
+    // Oracle is already on the battlefield removes then re-adds it, emits a
+    // spurious ZoneChanged{from:Battlefield, to:Battlefield} event, and fires
+    // its own ETB trigger again — causing an infinite loop.
+    if from == Zone::Battlefield && to == Zone::Battlefield {
+        return;
+    }
+
     let owner = obj.owner;
     let redirect_attraction_to_command = super::attractions::is_attraction_card(obj)
         && !matches!(to, Zone::Battlefield | Zone::Exile | Zone::Command);
