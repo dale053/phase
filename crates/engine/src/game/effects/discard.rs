@@ -291,12 +291,15 @@ pub(crate) fn discard_as_cost_with_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::engine::apply_as_current;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, ControllerRef, QuantityExpr, ReplacementCondition,
-        ReplacementDefinition, TargetFilter,
+        AbilityCondition, AbilityDefinition, AbilityKind, ControllerRef, EffectOutcomeSignal,
+        QuantityExpr, ReplacementCondition, ReplacementDefinition, SubAbilityLink, TargetFilter,
     };
+    use crate::types::actions::GameAction;
     use crate::types::counter::CounterType;
+    use crate::types::game_state::WaitingFor;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::player::PlayerId;
     use crate::types::replacements::ReplacementEvent;
@@ -1092,13 +1095,6 @@ mod tests {
     /// Regression for issue #2001 (Shadow of the Goblin draw never fires).
     #[test]
     fn if_you_do_draw_fires_after_interactive_discard_choice() {
-        use crate::game::engine::apply_as_current;
-        use crate::types::ability::{
-            AbilityCondition, EffectOutcomeSignal, QuantityExpr, SubAbilityLink,
-        };
-        use crate::types::actions::GameAction;
-        use crate::types::game_state::WaitingFor;
-
         let mut state = GameState::new_two_player(42);
 
         // Give the controller 3 cards in hand so the interactive DiscardChoice path fires.

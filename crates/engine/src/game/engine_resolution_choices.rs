@@ -1869,8 +1869,7 @@ pub(super) fn handle_resolution_choice(
             // sub_ability condition evaluates against optional_effect_performed.
             // Set it on the stashed continuation before draining so the gate
             // evaluates true when at least one card was actually discarded.
-            // Mirrors the LookAtTop/Scry handler (line 1094) and the
-            // AutoMayChoice::Accept path in effects/mod.rs.
+            // Mirrors the recursive AutoMayChoice::Accept path in effects/mod.rs.
             if !chosen.is_empty() {
                 if let Some(cont) = state.pending_continuation.as_mut() {
                     cont.chain.set_optional_effect_performed_recursive(true);
