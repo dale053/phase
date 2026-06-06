@@ -368,13 +368,12 @@ fn trigger_tree_has_optional(trigger: &TriggerDefinition) -> bool {
 /// player's reveal choice IS the "may" decision, with the decline branch
 /// handling the "if you don't" alternative.
 ///
-/// CR 117.3a + CR 118.9b + CR 707.12: `CastCopyOfCard` encodes "you may cast
-/// the copy without paying its mana cost" — CR 117.3a grants an optional-cast
-/// permission; CR 118.9b makes the alternative cost optional; the resolver
-/// presents a TrackedSet `ChooseFromZoneChoice { up_to: true }` — choosing 0
-/// is the decline path. The def-level `optional` flag is correctly false
-/// (`fold_cast_copy_of_card_defs` hardcodes it); the "may" lives in the
-/// CR 707.12 cast step.
+/// CR 118.9b + CR 707.12: `CastCopyOfCard` encodes "you may cast the copy
+/// without paying its mana cost" — CR 118.9b makes the alternative cost
+/// optional; the resolver presents a TrackedSet
+/// `ChooseFromZoneChoice { up_to: true }` — choosing 0 is the decline path.
+/// The def-level `optional` flag is correctly false (`fold_cast_copy_of_card_defs`
+/// hardcodes it); the "may" lives in the CR 707.12 cast step.
 fn effect_has_internal_optionality(effect: &Effect) -> bool {
     match effect {
         // CR 701.23j: Outside-game searches are optional at the selection
@@ -384,9 +383,8 @@ fn effect_has_internal_optionality(effect: &Effect) -> bool {
         Effect::Dig { up_to: true, .. }
         | Effect::GrantCastingPermission { .. }
         | Effect::CastFromZone { .. }
-        // CR 117.3a + CR 118.9b + CR 707.12: CastCopyOfCard encodes "you may
-        // cast the copy without paying its mana cost" — CR 117.3a grants
-        // optional-cast permission; CR 118.9b makes the alternative cost
+        // CR 118.9b + CR 707.12: CastCopyOfCard encodes "you may cast the copy
+        // without paying its mana cost" — CR 118.9b makes the alternative cost
         // optional; the resolver presents a TrackedSet
         // `ChooseFromZoneChoice { up_to: true }` — choosing 0 is the decline
         // path. Restricted to TrackedSet-target forms (what
@@ -2429,8 +2427,11 @@ mod tests {
     use super::{def_tree_has_optional, def_tree_has_unimplemented, trigger_tree_has_optional};
     use crate::parser::oracle::parse_oracle_text;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
-    use crate::types::ability::{AbilityDefinition, Effect, OutsideGameSourcePool};
+    use crate::types::ability::{AbilityDefinition, Effect, OutsideGameSourcePool, TargetFilter};
+    use crate::types::identifiers::TrackedSetId;
+    use crate::types::mana::ManaCost;
     use crate::types::statics::StaticMode;
+    use crate::types::zones::Zone;
 
     fn parse(text: &str, types: &[&str]) -> crate::parser::oracle::ParsedAbilities {
         parse_named(text, "Test Card", types)
@@ -3538,18 +3539,15 @@ mod tests {
         assert!(!has_swallowed_detector(&parsed, "Duration_UntilEndOfTurn"));
     }
 
-    /// CR 117.3a + CR 118.9b + CR 707.12: `CastCopyOfCard` encodes the "you may
-    /// cast the copy without paying its mana cost" permission internally, so
+    /// CR 118.9b + CR 707.12: `CastCopyOfCard` encodes the "you may cast the
+    /// copy without paying its mana cost" permission internally, so
     /// `effect_has_internal_optionality` must classify the TrackedSet-target
     /// form (the only shape the parser produces) as carrying its own
     /// optionality (analogous to `CastFromZone`). The def-level `optional` flag
-    /// stays false; the "may" lives in the CR 117.3a optional-cast permission
-    /// presented by the resolver as a TrackedSet `ChooseFromZoneChoice { up_to: true }`.
+    /// stays false; the "may" is presented by the resolver as a TrackedSet
+    /// `ChooseFromZoneChoice { up_to: true }`.
     #[test]
     fn effect_has_internal_optionality_cast_copy_of_card() {
-        use crate::types::ability::TargetFilter;
-        use crate::types::identifiers::TrackedSetId;
-        use crate::types::mana::ManaCost;
         let effect = Effect::CastCopyOfCard {
             target: TargetFilter::TrackedSet {
                 id: TrackedSetId(0),
@@ -3635,7 +3633,6 @@ mod tests {
     #[ignore = "trigger-context exile+copy folds to CopySpell, not CastCopyOfCard; \
                 trigger fold gap is out of scope for the swallow_check fix (issue #2273 follow-up)"]
     fn optional_you_may_accepts_narset_attack_cast_copy() {
-        use crate::types::zones::Zone;
         let parsed = parse_named(
             "Creatures you control have prowess.\n\
              Whenever Narset attacks, exile target noncreature, nonland card with \
