@@ -1577,6 +1577,27 @@ pub(super) fn match_counter_added(
                 if !(previous < threshold && threshold <= current) {
                     return false;
                 }
+                // CR 702.155a: A Saga with read ahead can't have its chapter
+                // abilities trigger the turn it entered the battlefield unless its
+                // lore count equals that chapter's number exactly. Entering at
+                // chapter N seeds N lore counters at once (0 -> N), which crosses
+                // every threshold 1..N; suppress all but the exact-count chapter
+                // on the enter-turn. After the enter-turn (one counter per turn)
+                // current == threshold holds at each crossing, so the gate is inert.
+                //
+                // Scoped to Lore: CR 702.155a restricts only chapter abilities
+                // (which trigger on lore counters). A Read-Ahead Saga with a
+                // thresholded trigger on some other counter type must not be
+                // suppressed on its enter turn.
+                if threshold != current
+                    && *counter_type == crate::types::counter::CounterType::Lore
+                    && state.objects.get(object_id).is_some_and(|obj| {
+                        obj.entered_battlefield_turn == Some(state.turn_number)
+                            && obj.has_keyword(&crate::types::keywords::Keyword::ReadAhead)
+                    })
+                {
+                    return false;
+                }
             }
         }
         true
@@ -7492,6 +7513,108 @@ mod tests {
                 threshold: Some(2),
             });
         assert!(!match_counter_added(&event, &trigger_ch2, saga_id, &state));
+    }
+
+    /// CR 702.155a: a read-ahead Saga that entered at chapter N this turn
+    /// (0 -> N lore counters) triggers only the exact-count chapter N; the
+    /// crossed-over chapters 1..N-1 are suppressed. A non-read-ahead Saga that
+    /// jumps to N this turn still fires every crossed chapter.
+    #[test]
+    fn read_ahead_suppresses_skipped_chapters_on_enter_turn() {
+        use crate::types::ability::CounterTriggerFilter;
+        use crate::types::triggers::TriggerMode;
+
+        let mut state = GameState::new_two_player(42);
+        let chapter = |n: u32| {
+            TriggerDefinition::new(TriggerMode::CounterAdded)
+                .valid_card(TargetFilter::SelfRef)
+                .counter_filter(CounterTriggerFilter {
+                    counter_type: crate::types::counter::CounterType::Lore,
+                    threshold: Some(n),
+                })
+        };
+
+        // Read-ahead Saga that entered this turn at chapter 3 (0 -> 3 at once).
+        let saga_id = crate::game::zones::create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Read-Ahead Saga".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&saga_id).unwrap();
+            obj.keywords.push(Keyword::ReadAhead);
+            obj.counters
+                .insert(crate::types::counter::CounterType::Lore, 3);
+        }
+        let event = GameEvent::CounterAdded {
+            object_id: saga_id,
+            counter_type: crate::types::counter::CounterType::Lore,
+            count: 3,
+        };
+        assert!(
+            match_counter_added(&event, &chapter(3), saga_id, &state),
+            "chapter 3 (exact count) fires"
+        );
+        assert!(
+            !match_counter_added(&event, &chapter(1), saga_id, &state),
+            "chapter 1 suppressed on read-ahead enter-turn"
+        );
+        assert!(
+            !match_counter_added(&event, &chapter(2), saga_id, &state),
+            "chapter 2 suppressed on read-ahead enter-turn"
+        );
+
+        // A non-read-ahead Saga that jumps 0 -> 3 this turn still fires chapter 1.
+        let normal_id = crate::game::zones::create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Normal Saga".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&normal_id)
+            .unwrap()
+            .counters
+            .insert(crate::types::counter::CounterType::Lore, 3);
+        let normal_event = GameEvent::CounterAdded {
+            object_id: normal_id,
+            counter_type: crate::types::counter::CounterType::Lore,
+            count: 3,
+        };
+        assert!(
+            match_counter_added(&normal_event, &chapter(1), normal_id, &state),
+            "non-read-ahead Saga still fires chapter 1 on a 0->3 jump"
+        );
+
+        // CR 702.155a is scoped to chapter (lore) abilities: a non-Lore
+        // thresholded trigger on the same Read-Ahead Saga must NOT be suppressed
+        // on its enter turn. Give the read-ahead Saga a 0 -> 2 +1/+1 jump and a
+        // +1/+1 threshold-1 trigger; it fires (0 < 1 <= 2) despite threshold != current.
+        state
+            .objects
+            .get_mut(&saga_id)
+            .unwrap()
+            .counters
+            .insert(crate::types::counter::CounterType::Plus1Plus1, 2);
+        let p1p1_event = GameEvent::CounterAdded {
+            object_id: saga_id,
+            counter_type: crate::types::counter::CounterType::Plus1Plus1,
+            count: 2,
+        };
+        let p1p1_trigger = TriggerDefinition::new(TriggerMode::CounterAdded)
+            .valid_card(TargetFilter::SelfRef)
+            .counter_filter(CounterTriggerFilter {
+                counter_type: crate::types::counter::CounterType::Plus1Plus1,
+                threshold: Some(1),
+            });
+        assert!(
+            match_counter_added(&p1p1_event, &p1p1_trigger, saga_id, &state),
+            "non-Lore thresholded trigger on a Read-Ahead Saga is not suppressed (CR 702.155a is lore-only)"
+        );
     }
 
     #[test]

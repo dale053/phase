@@ -8091,6 +8091,99 @@ pub fn synthesize_plot(face: &mut CardFace) {
     }
 }
 
+/// CR 702.155a-b + CR 714.3b: Read Ahead — a Saga with read ahead lets its
+/// controller choose which chapter it enters at. Replace the default Saga
+/// "enters with one lore counter" replacement (CR 714.3a, installed by
+/// `parse_saga_chapters`) with "as it enters, choose a number between one and
+/// this Saga's final chapter number; it enters with that many lore counters."
+///
+/// The choose-and-enter-with-N execute reuses the interactive-ETB-replacement
+/// pattern (Devour: a choice effect with a `PutCounter` sub-ability) and the
+/// `Effect::Choose { NumberRange, persist }` → `QuantityRef::ChosenNumber`
+/// number-choice primitive (Talion). `final` is the greatest chapter threshold
+/// among the Saga's parsed chapter triggers (CR 714.2d). The CR 702.155a
+/// suppression half — chapters 1..N-1 don't trigger the turn it enters at N —
+/// is enforced in `match_counter_added` (an exact-count gate for read-ahead
+/// Sagas that entered this turn), since the chapter triggers are
+/// `CounterAdded` + threshold and entering at N crosses thresholds 1..N at once.
+///
+/// CR 702.155c: multiple instances are redundant — this swaps the single ETB
+/// replacement once regardless of instance count, and is idempotent (the
+/// already-swapped replacement no longer matches `is_default_saga_lore_etb`).
+pub fn synthesize_read_ahead(face: &mut CardFace) {
+    if !face.keywords.contains(&Keyword::ReadAhead) {
+        return;
+    }
+    // CR 714.2d: final chapter number = greatest lore-counter threshold among
+    // this Saga's chapter triggers. No chapter abilities → nothing to read ahead to.
+    let Some(final_chapter) = face
+        .triggers
+        .iter()
+        .filter_map(|t| t.counter_filter.as_ref())
+        .filter(|f| f.counter_type == CounterType::Lore)
+        .filter_map(|f| f.threshold)
+        .max()
+    else {
+        return;
+    };
+
+    let read_ahead_execute = AbilityDefinition::new(
+        AbilityKind::Spell,
+        // CR 702.155b: "choose a number between one and this Saga's final
+        // chapter number"; the chosen value is persisted on the entering Saga
+        // so the `PutCounter` sub-ability can read it via `ChosenNumber`.
+        Effect::Choose {
+            choice_type: ChoiceType::NumberRange {
+                min: 1,
+                max: final_chapter.min(u8::MAX as u32) as u8,
+            },
+            persist: true,
+        },
+    )
+    .sub_ability(AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PutCounter {
+            counter_type: CounterType::Lore,
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::ChosenNumber,
+            },
+            target: TargetFilter::SelfRef,
+        },
+    ));
+
+    for replacement in face.replacements.iter_mut() {
+        if is_default_saga_lore_etb(replacement) {
+            replacement.execute = Some(Box::new(read_ahead_execute.clone()));
+            replacement.description = Some(
+                "CR 702.155b: Read ahead — enter with a chosen number of lore counters".to_string(),
+            );
+        }
+    }
+}
+
+/// True for the default Saga "enters with one lore counter" replacement
+/// installed by `parse_saga_chapters` (CR 714.3a): a `Moved` replacement on
+/// `SelfRef` whose execute puts exactly one `Lore` counter on `SelfRef`. After
+/// `synthesize_read_ahead` swaps the execute, this returns false (idempotency).
+fn is_default_saga_lore_etb(r: &ReplacementDefinition) -> bool {
+    if !matches!(r.event, ReplacementEvent::Moved)
+        || !matches!(r.valid_card, Some(TargetFilter::SelfRef))
+    {
+        return false;
+    }
+    let Some(execute) = r.execute.as_deref() else {
+        return false;
+    };
+    matches!(
+        &*execute.effect,
+        Effect::PutCounter {
+            counter_type: CounterType::Lore,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::SelfRef,
+        }
+    )
+}
+
 /// Run all synthesis functions in canonical order on a card face.
 /// Both `oracle_loader.rs` and `oracle_gen.rs` call this to ensure the same
 /// complete set of synthesizers is applied.
@@ -8317,6 +8410,11 @@ pub fn synthesize_all(face: &mut CardFace) {
     // permanent (deterministic reveal-all of the strictly-beneficial reveal).
     // Each instance functions independently (CR 702.38b).
     synthesize_amplify(face);
+    // CR 702.155a-b: Read Ahead — swap a Saga's default "enters with one lore
+    // counter" replacement for a "choose 1..final, enter with that many lore
+    // counters" replacement. Must run after Saga chapters/ETB are parsed (they
+    // are, pre-synthesis). The chapter-suppression half is in match_counter_added.
+    synthesize_read_ahead(face);
     // CR 702.62a: Suspend — hand-activated alt-cost + upkeep counter-removal +
     // last-counter free-cast. Runs after Evoke to keep alt-cost synthesizers
     // grouped; idempotent so order against Cycling/Madness is irrelevant.
@@ -20441,6 +20539,125 @@ mod devour_synthesis_tests {
                 .any(|r| is_amplify_etb_replacement(r, 2)),
             "Amplify(1) replacement must not match the Amplify(2) predicate"
         );
+    }
+
+    /// Build a Saga face mirroring what `parse_saga_chapters` produces: one
+    /// `CounterAdded` chapter trigger per chapter number, plus the default
+    /// CR 714.3a "enters with one lore counter" replacement.
+    fn saga_face_with_chapters(chapters: &[u32], read_ahead: bool) -> CardFace {
+        let mut face = CardFace::default();
+        if read_ahead {
+            face.keywords.push(Keyword::ReadAhead);
+        }
+        for &n in chapters {
+            face.triggers.push(
+                TriggerDefinition::new(TriggerMode::CounterAdded)
+                    .valid_card(TargetFilter::SelfRef)
+                    .counter_filter(CounterTriggerFilter {
+                        counter_type: CounterType::Lore,
+                        threshold: Some(n),
+                    }),
+            );
+        }
+        face.replacements.push(
+            ReplacementDefinition::new(ReplacementEvent::Moved)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::PutCounter {
+                        counter_type: CounterType::Lore,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::SelfRef,
+                    },
+                ))
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield),
+        );
+        face
+    }
+
+    /// CR 702.155b: a read-ahead Saga's default fixed lore ETB replacement is
+    /// swapped for "choose 1..final chapter, enter with that many lore counters".
+    #[test]
+    fn synthesize_read_ahead_swaps_lore_etb_for_choose_to_final_chapter() {
+        let mut face = saga_face_with_chapters(&[1, 2, 3], true);
+        synthesize_read_ahead(&mut face);
+
+        assert!(
+            !face.replacements.iter().any(is_default_saga_lore_etb),
+            "default fixed lore ETB replacement should be swapped"
+        );
+        let etb = face
+            .replacements
+            .iter()
+            .find(|r| matches!(r.event, ReplacementEvent::Moved))
+            .expect("read-ahead ETB replacement");
+        let execute = etb.execute.as_deref().expect("execute body");
+        let Effect::Choose {
+            choice_type: ChoiceType::NumberRange { min, max },
+            persist,
+        } = &*execute.effect
+        else {
+            panic!("read-ahead ETB should choose a number");
+        };
+        // CR 702.155b + CR 714.2d: between one and the final chapter number (3).
+        assert_eq!((*min, *max), (1, 3));
+        assert!(*persist, "chosen number must persist for ChosenNumber");
+
+        let sub = execute
+            .sub_ability
+            .as_deref()
+            .expect("PutCounter sub-ability");
+        assert!(matches!(
+            &*sub.effect,
+            Effect::PutCounter {
+                counter_type: CounterType::Lore,
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::ChosenNumber
+                },
+                target: TargetFilter::SelfRef,
+            }
+        ));
+    }
+
+    /// A Saga without read ahead keeps the default fixed "enters with 1 lore" ETB.
+    #[test]
+    fn synthesize_read_ahead_is_noop_without_keyword() {
+        let mut face = saga_face_with_chapters(&[1, 2, 3], false);
+        synthesize_read_ahead(&mut face);
+        assert!(
+            face.replacements.iter().any(is_default_saga_lore_etb),
+            "non-read-ahead Saga keeps the default fixed lore ETB"
+        );
+    }
+
+    /// CR 702.155c: redundant — re-running synthesis swaps exactly once.
+    #[test]
+    fn synthesize_read_ahead_is_idempotent() {
+        let mut face = saga_face_with_chapters(&[1, 2], true);
+        synthesize_read_ahead(&mut face);
+        synthesize_read_ahead(&mut face);
+        let choose_etbs = face
+            .replacements
+            .iter()
+            .filter(|r| {
+                r.execute
+                    .as_deref()
+                    .is_some_and(|e| matches!(&*e.effect, Effect::Choose { .. }))
+            })
+            .count();
+        assert_eq!(
+            choose_etbs, 1,
+            "exactly one swapped read-ahead ETB replacement"
+        );
+    }
+
+    /// No chapters → nothing to read ahead to (final chapter undefined) → no-op.
+    #[test]
+    fn synthesize_read_ahead_no_chapters_is_noop() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::ReadAhead);
+        synthesize_read_ahead(&mut face);
+        assert!(face.replacements.is_empty());
     }
 }
 
