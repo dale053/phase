@@ -2643,7 +2643,7 @@ fn casting_variant_candidates(
     // the card is in a player's hand. It lets the caster cast both halves as a
     // fused split spell. Only offered when the back face is the right (Split)
     // half so single-faced cards never surface it.
-    if obj.zone == Zone::Hand
+    let has_fuse_candidate = obj.zone == Zone::Hand
         && obj
             .keywords
             .iter()
@@ -2651,8 +2651,9 @@ fn casting_variant_candidates(
         && obj
             .back_face
             .as_ref()
-            .is_some_and(|bf| bf.layout_kind == Some(LayoutKind::Split))
-    {
+            .is_some_and(|bf| bf.layout_kind == Some(LayoutKind::Split));
+    if has_fuse_candidate {
+        candidates.push(CastingVariant::Normal);
         candidates.push(CastingVariant::Fuse);
     }
 
@@ -3613,9 +3614,9 @@ fn prepare_spell_cast_with_variant_override_inner(
     // CR 601.2c: Both halves' targets are chosen at cast time in a single pass —
     // `build_target_slots` / `collect_target_slots` recurse the sub_ability chain
     // and `assign_targets_in_chain` distributes the chosen targets back across the
-    // whole chain (left slots first, then right). No separate right-half targeting
-    // phase is required; the `PendingCast::right_half_*` fields remain reserved for
-    // a future split-targeting UX that wants to label halves distinctly.
+    // whole chain (left slots first, then right). No separate right-half
+    // targeting phase or pending-cast side storage is required; the merged
+    // ability chain is the single authority for target slots.
     if casting_variant == CastingVariant::Fuse {
         if let Some(back) = obj
             .back_face

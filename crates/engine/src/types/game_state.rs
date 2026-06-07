@@ -1121,14 +1121,6 @@ pub struct PendingCast {
     pub cancel_restore_prepared_source: Option<ObjectId>,
     #[serde(default)]
     pub payment_mode: CastPaymentMode,
-    /// CR 601.2c + CR 702.102d: Set during fuse-casting when the right half also
-    /// needs targets. Cleared once right-half target selection begins.
-    #[serde(default)]
-    pub right_half_targeting_pending: bool,
-    /// CR 601.2c + CR 702.102d: Stash for right-half target slots while
-    /// left-half targeting is in progress during a fused split spell cast.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub right_half_target_slots: Vec<TargetSelectionSlot>,
 }
 
 fn default_origin_zone() -> Zone {
@@ -1177,8 +1169,6 @@ impl PendingCast {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: CastPaymentMode::Auto,
-            right_half_targeting_pending: false,
-            right_half_target_slots: Vec::new(),
         }
     }
 
@@ -6779,8 +6769,6 @@ mod tests {
                 convoked_creatures: Vec::new(),
                 cancel_restore_prepared_source: None,
                 payment_mode: CastPaymentMode::Auto,
-                right_half_targeting_pending: false,
-                right_half_target_slots: Vec::new(),
             })
         }
 
@@ -7107,8 +7095,6 @@ mod tests {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: CastPaymentMode::Auto,
-            right_half_targeting_pending: false,
-            right_half_target_slots: Vec::new(),
         });
         let choose_x = WaitingFor::ChooseXValue {
             player: PlayerId(0),

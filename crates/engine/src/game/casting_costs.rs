@@ -4209,19 +4209,20 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
     // protection all see the merged characteristics while the spell resolves.
     if casting_variant == CastingVariant::Fuse {
         if let Some(obj) = state.objects.get_mut(&object_id) {
-            if let Some(back) = obj
+            let right_half_characteristics = obj
                 .back_face
-                .clone()
+                .as_ref()
                 .filter(|bf| bf.layout_kind == Some(crate::types::card::LayoutKind::Split))
-            {
-                for ct in &back.card_types.core_types {
-                    if !obj.card_types.core_types.contains(ct) {
-                        obj.card_types.core_types.push(*ct);
+                .map(|back| (back.card_types.core_types.clone(), back.color.clone()));
+            if let Some((core_types, colors)) = right_half_characteristics {
+                for ct in core_types {
+                    if !obj.card_types.core_types.contains(&ct) {
+                        obj.card_types.core_types.push(ct);
                     }
                 }
-                for color in &back.color {
-                    if !obj.color.contains(color) {
-                        obj.color.push(*color);
+                for color in colors {
+                    if !obj.color.contains(&color) {
+                        obj.color.push(color);
                     }
                 }
             }
@@ -6061,8 +6062,6 @@ mod tests {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: CastPaymentMode::Auto,
-            right_half_targeting_pending: false,
-            right_half_target_slots: Vec::new(),
         }
     }
 
@@ -9787,8 +9786,6 @@ mod tests {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: CastPaymentMode::Auto,
-            right_half_targeting_pending: false,
-            right_half_target_slots: Vec::new(),
         };
 
         let result = pay_additional_cost(
@@ -9910,8 +9907,6 @@ mod tests {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: CastPaymentMode::Auto,
-            right_half_targeting_pending: false,
-            right_half_target_slots: Vec::new(),
         };
 
         let mut events = Vec::new();
@@ -10002,8 +9997,6 @@ mod tests {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: CastPaymentMode::Auto,
-            right_half_targeting_pending: false,
-            right_half_target_slots: Vec::new(),
         };
 
         // Exactly one card is required. Selecting two must fail.
@@ -10083,8 +10076,6 @@ mod tests {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: CastPaymentMode::Auto,
-            right_half_targeting_pending: false,
-            right_half_target_slots: Vec::new(),
         };
 
         // `red` is not in the legal-cards list, so the cost handler must reject
@@ -10197,8 +10188,6 @@ mod tests {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: CastPaymentMode::Auto,
-            right_half_targeting_pending: false,
-            right_half_target_slots: Vec::new(),
         };
 
         let result = pay_additional_cost(
