@@ -288,7 +288,7 @@ pub fn replacement_choice_waiting_for(player: PlayerId, state: &GameState) -> Wa
             _ => {
                 let count = if p.is_optional { 2 } else { p.candidates.len() };
                 let descs: Vec<String> = if p.is_optional {
-                    let accept_desc = p
+                    let (accept_desc, decline_desc) = p
                         .candidates
                         .first()
                         .and_then(|rid| {
@@ -299,15 +299,42 @@ pub fn replacement_choice_waiting_for(player: PlayerId, state: &GameState) -> Wa
                         })
                         .map(|repl| match &repl.mode {
                             ReplacementMode::MayCost { cost, .. } => {
-                                replacement_cost_description(cost)
+                                (replacement_cost_description(cost), "Decline".to_string())
                             }
-                            ReplacementMode::Mandatory | ReplacementMode::Optional { .. } => repl
-                                .description
-                                .clone()
-                                .unwrap_or_else(|| "Accept".to_string()),
+                            // CR 702.136a (Riot) / CR 702.98a (Unleash): label an
+                            // Optional replacement's accept branch by the
+                            // replacement's own `description` (which names its source
+                            // keyword, e.g. "Riot — ..." / "Unleash — ..."), falling
+                            // back to the `execute` effect text when there is none.
+                            // The decline branch, when it is a distinct outcome
+                            // (e.g. Riot's "It gains haste"), is labeled by that
+                            // outcome rather than a bare "Decline" — the reported
+                            // bug was that declining silently granted haste with no
+                            // indication; a decline-less Optional (Unleash) keeps a
+                            // plain "Decline".
+                            ReplacementMode::Optional { decline } => {
+                                let accept = repl
+                                    .description
+                                    .clone()
+                                    .or_else(|| {
+                                        repl.execute.as_ref().and_then(|e| e.description.clone())
+                                    })
+                                    .unwrap_or_else(|| "Accept".to_string());
+                                let decline_label = decline
+                                    .as_ref()
+                                    .and_then(|d| d.description.clone())
+                                    .unwrap_or_else(|| "Decline".to_string());
+                                (accept, decline_label)
+                            }
+                            ReplacementMode::Mandatory => (
+                                repl.description
+                                    .clone()
+                                    .unwrap_or_else(|| "Accept".to_string()),
+                                "Decline".to_string(),
+                            ),
                         })
-                        .unwrap_or_else(|| "Accept".to_string());
-                    vec![accept_desc, "Decline".to_string()]
+                        .unwrap_or_else(|| ("Accept".to_string(), "Decline".to_string()));
+                    vec![accept_desc, decline_desc]
                 } else {
                     // CR 616.1 / CR 614.1c / CR 614.1d: each candidate gets an
                     // outcome-descriptive label derived from its `execute`
@@ -5830,6 +5857,83 @@ mod tests {
                 "label must not be a raw Oracle-text blob: {label:?}"
             );
         }
+    }
+
+    /// CR 702.136a: Riot — the optional ETB replacement offers "+1/+1 counter"
+    /// (accept) vs "gains haste" (decline). The prompt must label each option by
+    /// its OWN outcome, not the card's rules-text `description` for accept and a
+    /// bare "Decline" for the haste branch (the reported bug: clicking the rules
+    /// text gave the counter and "decline" silently gave haste).
+    #[test]
+    fn riot_optional_replacement_labels_each_branch_by_outcome() {
+        let counter_branch = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::SelfRef,
+            },
+        )
+        .description("This permanent enters with an additional +1/+1 counter on it".to_string());
+        let haste_branch = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Tap {
+                target: TargetFilter::SelfRef,
+            },
+        )
+        .description("It gains haste".to_string());
+
+        let riot_repl = ReplacementDefinition::new(ReplacementEvent::Moved)
+            .execute(counter_branch)
+            .mode(ReplacementMode::Optional {
+                decline: Some(Box::new(haste_branch)),
+            })
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Battlefield)
+            .description(
+                "CR 702.136a: Riot — this permanent may enter with an additional +1/+1 \
+                 counter; otherwise it gains haste."
+                    .to_string(),
+            );
+
+        let mut state = test_state_with_object(ObjectId(20), Zone::Hand, vec![riot_repl]);
+        // Drive the prompt state directly (the CR 616.1 accept/decline choice a
+        // single optional replacement produces): candidate 0 is the real Riot
+        // replacement, decline is synthetic. This isolates the label builder.
+        state.pending_replacement = Some(PendingReplacement {
+            proposed: ProposedEvent::zone_change(ObjectId(20), Zone::Hand, Zone::Battlefield, None),
+            candidates: vec![ReplacementId {
+                source: ObjectId(20),
+                index: 0,
+            }],
+            depth: 0,
+            is_optional: true,
+        });
+
+        let WaitingFor::ReplacementChoice {
+            candidate_count,
+            candidate_descriptions,
+            ..
+        } = replacement_choice_waiting_for(PlayerId(0), &state)
+        else {
+            panic!("expected ReplacementChoice waiting_for");
+        };
+        assert_eq!(candidate_count, 2);
+        // Index 0 = accept: the replacement's own `description`, which names its
+        // source keyword ("Riot — ...") so the prompt is identifiable (the
+        // issue_709 granted-keyword contract). Index 1 = decline: the distinct
+        // outcome ("It gains haste") rather than a bare "Decline" — the reported
+        // bug was that declining silently granted haste with no indication.
+        assert_eq!(
+            candidate_descriptions,
+            vec![
+                "CR 702.136a: Riot — this permanent may enter with an additional +1/+1 \
+                 counter; otherwise it gains haste."
+                    .to_string(),
+                "It gains haste".to_string(),
+            ],
+            "accept identifies the source (Riot); decline shows its outcome (haste), not a bare \"Decline\""
+        );
     }
 
     #[test]
