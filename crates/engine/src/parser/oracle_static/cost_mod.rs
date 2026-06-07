@@ -431,8 +431,11 @@ fn parse_alternative_keyword_cost_body(text: &str) -> Option<StaticDefinition> {
         .ok()?;
     let cost_len = cost_lower.len();
     let cost_text = tp.original[..cost_len].trim();
-    // Strip "pay " prefix if present (e.g., "pay {0}" → "{0}").
-    let cost_text_clean = cost_text.strip_prefix("pay ").unwrap_or(cost_text);
+    // Strip optional "pay " prefix (e.g., "pay {0}" → "{0}") using a nom combinator.
+    let cost_text_clean = opt(tag::<_, _, VE<'_>>("pay "))
+        .parse(cost_text)
+        .map(|(rest, _)| rest)
+        .unwrap_or(cost_text);
 
     let cost = parse_oracle_cost(cost_text_clean);
     if matches!(cost, AbilityCost::Unimplemented { .. }) {

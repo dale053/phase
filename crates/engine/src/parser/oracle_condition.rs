@@ -590,9 +590,11 @@ fn parse_hand_condition(text: &str) -> Option<ParsedCondition> {
     // evaluates as always-true in the runtime evaluator; we use count: 1 + Not here.
     // Verified: CR 601.3 (docs/MagicCompRules.txt:2475).
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("you have no ").parse(text) {
-        if let Some(subtype_raw) = rest
-            .strip_suffix(" cards in hand")
-            .or_else(|| rest.strip_suffix(" card in hand"))
+        if let Ok((_, subtype_raw)) = terminated(
+            take_until::<_, _, OracleError<'_>>(" card"),
+            alt((tag(" cards in hand"), tag(" card in hand"))),
+        )
+        .parse(rest)
         {
             let subtype = subtype_raw.trim().to_string();
             if !subtype.is_empty() {
