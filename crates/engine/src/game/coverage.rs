@@ -66,6 +66,10 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // CR 118.9: CastWithAlternativeCost carries an `AbilityCost` — runtime
             // data, not registry-keyable (Rooftop Storm, Fist of Suns, Jodah).
             | StaticMode::CastWithAlternativeCost { .. }
+            // CR 118.9 + CR 702.29a + CR 702.122a: AlternativeKeywordCost carries a
+            // KeywordKind + AbilityCost — runtime data, not registry-keyable
+            // (New Perspectives, Heart of Kiran, Gavi Nest Warden).
+            | StaticMode::AlternativeKeywordCost { .. }
             // CR 702.16: PlayerProtection carries a `ProtectionTarget` (Strings) —
             // open value space, consumed by direct match in `player_protection_from`.
             | StaticMode::PlayerProtection { .. }

@@ -560,6 +560,29 @@ fn parse_hand_condition(text: &str) -> Option<ParsedCondition> {
     {
         return Some(ParsedCondition::HandSizeExact { count: 0 });
     }
+    // "you have no [subtype] cards in hand" — e.g. "you have no land cards in hand".
+    // CR 601.3: Cast restriction — hand contains no cards of the given subtype.
+    // Uses Not { ZoneSubtypeCardCountAtLeast { Hand, subtype, 1 } } to express
+    // "count of [subtype] cards in hand == 0". Note: ZoneSubtypeCardCountAtLeast { count: 0 }
+    // evaluates as always-true in the runtime evaluator; we use count: 1 + Not here.
+    // Verified: CR 601.3 (docs/MagicCompRules.txt:2475).
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("you have no ").parse(text) {
+        if let Some(subtype_raw) = rest
+            .strip_suffix(" cards in hand")
+            .or_else(|| rest.strip_suffix(" card in hand"))
+        {
+            let subtype = subtype_raw.trim().to_string();
+            if !subtype.is_empty() {
+                return Some(ParsedCondition::Not {
+                    condition: Box::new(ParsedCondition::ZoneSubtypeCardCountAtLeast {
+                        zone: Zone::Hand,
+                        subtype,
+                        count: 1,
+                    }),
+                });
+            }
+        }
+    }
     if tag::<_, _, OracleError<'_>>("you have one or fewer cards in hand")
         .parse(text)
         .is_ok()
