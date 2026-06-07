@@ -1449,6 +1449,7 @@ impl StaticMode {
             | StaticMode::GrantsExtraVote
             | StaticMode::CastWithKeyword { .. }
             | StaticMode::CastWithAlternativeCost { .. }
+            | StaticMode::AlternativeKeywordCost { .. }
             | StaticMode::ModifyCost { .. }
             | StaticMode::ReduceAbilityCost { .. }
             | StaticMode::ModifyActivationLimit { .. }
