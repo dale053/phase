@@ -1103,6 +1103,14 @@ pub struct PendingCast {
     pub cancel_restore_prepared_source: Option<ObjectId>,
     #[serde(default)]
     pub payment_mode: CastPaymentMode,
+    /// CR 601.2c + CR 702.102d: Set during fuse-casting when the right half also
+    /// needs targets. Cleared once right-half target selection begins.
+    #[serde(default)]
+    pub right_half_targeting_pending: bool,
+    /// CR 601.2c + CR 702.102d: Stash for right-half target slots while
+    /// left-half targeting is in progress during a fused split spell cast.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub right_half_target_slots: Vec<TargetSelectionSlot>,
 }
 
 fn default_origin_zone() -> Zone {
@@ -1151,6 +1159,8 @@ impl PendingCast {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: CastPaymentMode::Auto,
+            right_half_targeting_pending: false,
+            right_half_target_slots: Vec::new(),
         }
     }
 
@@ -4108,6 +4118,12 @@ pub enum CastingVariant {
     /// exiled instead of going anywhere else any time it would leave the stack
     /// (see `exiles_when_leaving_stack_for_any_reason`).
     JumpStart,
+    /// CR 702.102a-d: Both halves of a split card cast from hand as a fused
+    /// split spell. The mana cost is the combined cost of both halves
+    /// (CR 702.102c). On resolution, the left half's instructions are followed
+    /// first, then the right half's (CR 702.102d). Not an alternative cost
+    /// (CR 118.9a) — the player pays the full combined printed mana cost.
+    Fuse,
 }
 
 impl CastingVariant {
@@ -4157,6 +4173,9 @@ impl CastingVariant {
             // CR 702.133a: Jump-start discards a card as an *additional* cost on
             // top of the normal mana cost — not an alternative cost (CR 118.9a).
             | CastingVariant::JumpStart
+            // CR 702.102c + CR 118.9a: Fuse pays the full combined printed mana
+            // cost of both halves — not an alternative cost.
+            | CastingVariant::Fuse
             | CastingVariant::GraveyardPermission { .. }
             | CastingVariant::ExilePermission { .. } => false,
         }
@@ -6704,6 +6723,8 @@ mod tests {
                 convoked_creatures: Vec::new(),
                 cancel_restore_prepared_source: None,
                 payment_mode: CastPaymentMode::Auto,
+                right_half_targeting_pending: false,
+                right_half_target_slots: Vec::new(),
             })
         }
 
@@ -7030,6 +7051,8 @@ mod tests {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: CastPaymentMode::Auto,
+            right_half_targeting_pending: false,
+            right_half_target_slots: Vec::new(),
         });
         let choose_x = WaitingFor::ChooseXValue {
             player: PlayerId(0),

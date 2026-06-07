@@ -10943,6 +10943,8 @@ mod tests {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+            right_half_targeting_pending: false,
+            right_half_target_slots: Vec::new(),
         }));
         state.waiting_for = WaitingFor::ManaPayment {
             player: PlayerId(0),
@@ -11325,6 +11327,8 @@ mod tests {
             convoked_creatures: Vec::new(),
             cancel_restore_prepared_source: None,
             payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+            right_half_targeting_pending: false,
+            right_half_target_slots: Vec::new(),
         }));
         state.waiting_for = WaitingFor::ManaPayment {
             player: PlayerId(0),
