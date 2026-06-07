@@ -12,7 +12,7 @@ use crate::types::card::{LayoutKind, PrintedCardRef, TokenImageRef};
 use crate::types::card_type::{CardType, CoreType};
 use crate::types::counter::CounterType;
 use crate::types::definitions::Definitions;
-use crate::types::game_state::{GameState, LKISnapshot};
+use crate::types::game_state::{AttackDeclarationRecord, GameState, LKISnapshot};
 use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::keywords::{Keyword, KeywordKind};
 use crate::types::mana::{ColoredManaCount, ManaColor, ManaCost, ManaPip};
@@ -806,6 +806,15 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "is_zero_u32_field")]
     pub mana_spent_to_cast_amount: u32,
 
+    /// CR 702.150a: Number of this object's Phyrexian mana symbols that the
+    /// caster chose to pay with **life** (2 life each). Set at cast finalization
+    /// from the `ShardChoice::PayLife` selections; read when the object enters as
+    /// a planeswalker with `Keyword::Compleated` to reduce its entering loyalty by
+    /// two per symbol. Like `mana_spent_to_cast_amount`, this is a historical cast
+    /// fact that persists through resolution; initialized to 0 by `GameObject::new`.
+    #[serde(default, skip_serializing_if = "is_zero_u32_field")]
+    pub phyrexian_life_paid: u32,
+
     /// CR 106.3 + CR 601.2h: Source snapshots for each mana spent to cast this
     /// object. One entry per spent mana lets source-qualified dynamic quantities
     /// count "mana from a Cave/Treasure/artifact source" without depending on
@@ -1048,14 +1057,14 @@ impl GameObject {
             mana_spent_to_cast: false,
             colors_spent_to_cast: ColoredManaCount::default(),
             mana_spent_to_cast_amount: 0,
+            phyrexian_life_paid: 0,
             mana_spent_source_snapshots: Vec::new(),
             phase_status: PhaseStatus::PhasedIn,
         }
     }
 
-    /// CR 106.3 + CR 601.2h: Capture the public source characteristics needed
-    /// by source-qualified "mana spent to cast" effects.
-    pub fn snapshot_for_mana_spent(&self) -> LKISnapshot {
+    /// Capture public object characteristics for event-time look-back queries.
+    pub fn snapshot_public_characteristics(&self) -> LKISnapshot {
         LKISnapshot {
             name: self.name.clone(),
             power: self.power,
@@ -1074,6 +1083,24 @@ impl GameObject {
             colors: self.color.clone(),
             chosen_attributes: self.chosen_attributes.clone(),
             counters: self.counters.clone(),
+        }
+    }
+
+    /// CR 106.3 + CR 601.2h: Capture the public source characteristics needed
+    /// by source-qualified "mana spent to cast" effects.
+    pub fn snapshot_for_mana_spent(&self) -> LKISnapshot {
+        self.snapshot_public_characteristics()
+    }
+
+    /// CR 508.1a: Capture the public characteristics of a creature when it is
+    /// declared as an attacker, so later "attacked with <quality> this turn"
+    /// queries do not depend on the attacker still existing.
+    pub fn snapshot_for_attack_declaration(&self, object_id: ObjectId) -> AttackDeclarationRecord {
+        AttackDeclarationRecord {
+            object_id,
+            lki: self.snapshot_public_characteristics(),
+            is_token: self.is_token,
+            is_commander: self.is_commander,
         }
     }
 
@@ -1156,6 +1183,10 @@ impl GameObject {
         // CR 701.60a / CR 702.112b: Suspect and renowned are battlefield designations.
         self.is_suspected = false;
         self.is_renowned = false;
+        // CR 400.7 + CR 702.150a: Compleated's life-payment count belongs to
+        // the cast that created this permanent. Once it leaves the battlefield,
+        // a later entry has no memory of that payment.
+        self.phyrexian_life_paid = 0;
         // CR 702.171b: Saddled clears when the Mount leaves the battlefield.
         self.is_saddled = false;
         // CR 702.xxx: Prepared (Strixhaven) is a battlefield-only designation —

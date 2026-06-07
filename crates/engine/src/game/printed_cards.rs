@@ -902,6 +902,75 @@ fn build_conjure_registry(
     (registry, all_collected)
 }
 
+/// CR 712 / CR 715 / CR 722: Attach the other printed face to `obj.back_face`
+/// when absent. Required for transformed zone changes (Fable of the
+/// Mirror-Breaker chapter III, Ajani flip triggers), adventurer casts, MDFC
+/// casts, and prepare spell access. Without this, `deliver_replaced_zone_change`
+/// silently skips transform when `back_face` is `None` and saga ETB lore-counter
+/// replacements fire on the front face.
+pub fn populate_back_face_if_dfc(obj: &mut GameObject, db: &CardDatabase, card_face: &CardFace) {
+    if obj.back_face.is_some() {
+        return;
+    }
+
+    let second_face = db
+        .get_by_name(&card_face.name)
+        .and_then(|card_rules| match &card_rules.layout {
+            // CR 715: Adventurer cards have alternative Adventure characteristics.
+            CardLayout::Adventure(_, back) => Some((LayoutKind::Adventure, back)),
+            // CR 712: Transforming, modal, meld, and omen DFCs need their other face.
+            CardLayout::Transform(_, back) => Some((LayoutKind::Transform, back)),
+            CardLayout::Modal(_, back) => Some((LayoutKind::Modal, back)),
+            CardLayout::Meld(_, back) => Some((LayoutKind::Meld, back)),
+            CardLayout::Omen(_, back) => Some((LayoutKind::Omen, back)),
+            // CR 722: Preparation cards expose prepare-spell characteristics.
+            CardLayout::Prepare(_, back) => Some((LayoutKind::Prepare, back)),
+            _ => None,
+        })
+        .or_else(|| {
+            let layout_kind = card_face
+                .scryfall_oracle_id
+                .as_deref()
+                .and_then(|id| db.get_layout_kind(id))
+                .unwrap_or(LayoutKind::Single);
+            obj.printed_ref
+                .as_ref()
+                .and_then(|printed_ref| db.get_other_face_by_printed_ref(printed_ref))
+                .map(|face| (layout_kind, face))
+        });
+    let Some((layout_kind, face)) = second_face else {
+        return;
+    };
+
+    let mut back = BackFaceData {
+        name: String::new(),
+        power: None,
+        toughness: None,
+        loyalty: None,
+        defense: None,
+        card_types: Default::default(),
+        mana_cost: Default::default(),
+        keywords: Vec::new(),
+        abilities: Vec::new(),
+        trigger_definitions: crate::types::definitions::Definitions::default(),
+        replacement_definitions: crate::types::definitions::Definitions::default(),
+        static_definitions: crate::types::definitions::Definitions::default(),
+        color: Vec::new(),
+        printed_ref: None,
+        modal: None,
+        additional_cost: None,
+        strive_cost: None,
+        casting_restrictions: Vec::new(),
+        casting_options: Vec::new(),
+        layout_kind: None,
+    };
+    apply_card_face_to_back_face(&mut back, face);
+    if layout_kind != LayoutKind::Single {
+        back.layout_kind = Some(layout_kind);
+    }
+    obj.back_face = Some(back);
+}
+
 pub fn rehydrate_game_from_card_db(state: &mut GameState, db: &CardDatabase) {
     // Populate the Conjure card-face registry (used by the Conjure effect
     // handler). Scoped to exactly the faces reachable as Conjure targets so we
@@ -1050,69 +1119,7 @@ pub fn rehydrate_game_from_card_db(state: &mut GameState, db: &CardDatabase) {
                 }
             }
 
-            // Populate back_face for dual-faced layouts so the other face's
-            // characteristics are available for transform, adventure cast, and
-            // preview display (Ctrl-hover).
-            if obj.back_face.is_none() {
-                let second_face = db
-                    .get_by_name(&card_face.name)
-                    .and_then(|card_rules| match &card_rules.layout {
-                        // CR 715: Adventure half available at cast time
-                        CardLayout::Adventure(_, back) => Some((LayoutKind::Adventure, back)),
-                        // CR 712: Transform / Modal DFC / Meld / Omen back face
-                        CardLayout::Transform(_, back) => Some((LayoutKind::Transform, back)),
-                        CardLayout::Modal(_, back) => Some((LayoutKind::Modal, back)),
-                        CardLayout::Meld(_, back) => Some((LayoutKind::Meld, back)),
-                        CardLayout::Omen(_, back) => Some((LayoutKind::Omen, back)),
-                        // CR 702.xxx: Prepare (Strixhaven) — face `b` is the prepare spell
-                        // (Sorcery/Instant), held in back_face for runtime copy-cast access.
-                        CardLayout::Prepare(_, back) => Some((LayoutKind::Prepare, back)),
-                        _ => None,
-                    })
-                    .or_else(|| {
-                        // Fallback for export-loaded databases where `cards` is empty.
-                        // Use the layout_index (populated from the `layout` field in
-                        // card-data.json) to determine the correct LayoutKind.
-                        let layout_kind = card_face
-                            .scryfall_oracle_id
-                            .as_deref()
-                            .and_then(|id| db.get_layout_kind(id))
-                            .unwrap_or(LayoutKind::Single);
-                        obj.printed_ref
-                            .as_ref()
-                            .and_then(|printed_ref| db.get_other_face_by_printed_ref(printed_ref))
-                            .map(|face| (layout_kind, face))
-                    });
-                if let Some((layout_kind, face)) = second_face {
-                    let mut back = BackFaceData {
-                        name: String::new(),
-                        power: None,
-                        toughness: None,
-                        loyalty: None,
-                        defense: None,
-                        card_types: Default::default(),
-                        mana_cost: Default::default(),
-                        keywords: Vec::new(),
-                        abilities: Vec::new(),
-                        trigger_definitions: crate::types::definitions::Definitions::default(),
-                        replacement_definitions: crate::types::definitions::Definitions::default(),
-                        static_definitions: crate::types::definitions::Definitions::default(),
-                        color: Vec::new(),
-                        printed_ref: None,
-                        modal: None,
-                        additional_cost: None,
-                        strive_cost: None,
-                        casting_restrictions: Vec::new(),
-                        casting_options: Vec::new(),
-                        layout_kind: None,
-                    };
-                    apply_card_face_to_back_face(&mut back, face);
-                    if layout_kind != LayoutKind::Single {
-                        back.layout_kind = Some(layout_kind);
-                    }
-                    obj.back_face = Some(back);
-                }
-            }
+            populate_back_face_if_dfc(obj, db, &card_face);
         }
 
         changed_any = true;
@@ -1587,6 +1594,62 @@ mod tests {
             back_face.layout_kind,
             Some(LayoutKind::Adventure),
             "Adventure back face should carry LayoutKind::Adventure from export"
+        );
+    }
+
+    /// CR 712.14a: Transform DFCs (Fable of the Mirror-Breaker) must hydrate
+    /// `back_face` from the export so chapter-III `enter_transformed` returns
+    /// work at resolution time.
+    #[test]
+    fn populate_back_face_attaches_transform_dfc_back_from_export() {
+        let fable = test_face(
+            "Fable of the Mirror-Breaker",
+            "fable-oracle-id",
+            vec![CoreType::Enchantment],
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 2,
+            },
+        );
+        let reflection = test_face(
+            "Reflection of Kiki-Jiki",
+            "fable-oracle-id",
+            vec![CoreType::Creature],
+            ManaCost::default(),
+        );
+        let mut fable_json = serde_json::to_value(&fable).unwrap();
+        fable_json["layout"] = serde_json::json!("transform");
+        let mut reflection_json = serde_json::to_value(&reflection).unwrap();
+        reflection_json["layout"] = serde_json::json!("transform");
+        let export = serde_json::json!({
+            "fable of the mirror-breaker": fable_json,
+            "reflection of kiki-jiki": reflection_json,
+        })
+        .to_string();
+        let db = CardDatabase::from_json_str(&export).expect("export db should parse");
+
+        let mut state = GameState::default();
+        let object_id = create_object_from_card_face(
+            &mut state,
+            db.get_face_by_name("Fable of the Mirror-Breaker").unwrap(),
+            PlayerId(0),
+        );
+        let obj = state.objects.get_mut(&object_id).unwrap();
+        populate_back_face_if_dfc(
+            obj,
+            &db,
+            db.get_face_by_name("Fable of the Mirror-Breaker").unwrap(),
+        );
+
+        let back_face = obj
+            .back_face
+            .as_ref()
+            .expect("transform DFC must hydrate back_face from export");
+        assert_eq!(back_face.name, "Reflection of Kiki-Jiki");
+        assert_eq!(
+            back_face.layout_kind,
+            Some(LayoutKind::Transform),
+            "transform back face must carry LayoutKind::Transform"
         );
     }
 

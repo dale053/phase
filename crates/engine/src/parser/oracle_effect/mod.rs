@@ -6934,7 +6934,11 @@ fn parse_clause_ast(text: &str, ctx: &mut ParseContext) -> ClauseAst {
         // Strip "if " prefix before passing to the condition parser.
         let condition_lower = condition_text.to_lowercase();
         let cond_body = nom_on_lower(&condition_text, &condition_lower, |i| {
-            value((), tag("if ")).parse(i)
+            value(
+                (),
+                alt((tag("if "), tag("during any turn "), tag("during a turn "))),
+            )
+            .parse(i)
         })
         .map(|((), rest)| rest)
         .unwrap_or(&condition_text)
@@ -13950,7 +13954,47 @@ pub(crate) fn parse_effect_chain_ir(
     // mode is re-applied to the built chain via `rewrite_rounding_mode`.
     let (text, chain_rounding) = strip_trailing_rounding_annotation(&text);
     let text = text.as_str();
-    let full_text = text; // Bind before `text` is shadowed by strip helpers in the loop
+    // CR 611.2b + CR 611.2a: A leading "For as long as <condition>," prefix that
+    // resolves to UntilHostLeavesPlay (either "you control ~" or "~ remains on the
+    // battlefield") scopes the ENTIRE following comma body, not just its first
+    // clause. When that body is HETEROGENEOUS — its first clause is a distinct effect
+    // (e.g. "gain control of that permanent") the single-clause arm cannot merge with
+    // the trailing static/restriction riders — starts_prefix_clause ("for as long as")
+    // would otherwise glue the body into one chunk and the single-clause arm would drop
+    // every sibling after the first (Opportunistic Dragon: "it loses all abilities" lost).
+    // Strip the prefix here so split_clause_sequence produces the sibling chunks; the
+    // duration is restamped onto every clause after the chunk loop.
+    //
+    // Gate is deliberately narrow (only Opportunistic Dragon fires across the full
+    // dataset): RESTRICTED to UntilHostLeavesPlay (excludes "until end of turn"
+    // animations, which the single-clause arm MERGES into one GenericEffect) AND to
+    // bodies whose first chunk is neither GenericEffect (homogeneous continuous-mod /
+    // animate merge — Kitesail) nor GrantCastingPermission (play/mana permission merge
+    // — Kotose), the two classes the single-clause arm merges across commas.
+    let leading_host_lifetime_split = strip_leading_duration(text).and_then(|(dur, body)| {
+        if !matches!(dur, Duration::UntilHostLeavesPlay) {
+            return None;
+        }
+        let body_chunks = split_clause_sequence(body);
+        if body_chunks.len() <= 1 {
+            return None;
+        }
+        // Parser-as-detector: classify the first chunk's effect; only chain-route a
+        // distinct, non-mergeable lead.
+        let mut probe_ctx = ParseContext::default();
+        let first = parse_effect_clause(body_chunks[0].text.trim(), &mut probe_ctx);
+        if matches!(
+            first.effect,
+            Effect::GenericEffect { .. } | Effect::GrantCastingPermission { .. }
+        ) {
+            return None;
+        }
+        Some((dur, body))
+    });
+    let text = leading_host_lifetime_split
+        .as_ref()
+        .map_or(text, |(_, body)| *body);
+    let full_text = text; // bind AFTER the strip so diagnostics track the parsed chunks
     let chunks = split_clause_sequence(text);
     // CR 107.3i: "Normally, all instances of X on an object have the same value."
     // Build a per-chunk sentence-scoped `where X is <expr>` binding so that when
@@ -16098,6 +16142,16 @@ pub(crate) fn parse_effect_chain_ir(
     // `GenericEffect` whose duration field is `None`; the CR baseline per
     // CR 611.2a is "until end of the game", which is not what we want either).
     try_fold_loses_other_sibling(&mut clauses);
+
+    // CR 611.2b: stamp the stripped leading "for as long as" duration onto every
+    // sibling clause of the heterogeneous body (gain control, "it loses all abilities"
+    // -> RemoveAllAbilities, "can't attack or block"). with_clause_duration patches
+    // both the clause-level duration and any inner GenericEffect.duration.
+    if let Some((dur, _)) = leading_host_lifetime_split {
+        for clause in clauses.iter_mut() {
+            clause.parsed = with_clause_duration(clause.parsed.clone(), dur.clone());
+        }
+    }
 
     EffectChainIr {
         clauses,
@@ -20285,6 +20339,72 @@ mod tests {
         assert!(modifications.contains(&ContinuousModification::AddKeyword {
             keyword: Keyword::Trample,
         }));
+    }
+
+    // CR 611.2b: A leading "for as long as <condition>," prefix that resolves to
+    // UntilHostLeavesPlay scopes the ENTIRE comma body. For the heterogeneous
+    // control-theft class (Opportunistic Dragon) the middle sibling "it loses all
+    // abilities" must NOT be dropped: the chain must carry GainControl, a
+    // RemoveAllAbilities GenericEffect, and a can't-attack/can't-block restriction,
+    // every clause stamped with Duration::UntilHostLeavesPlay.
+    #[test]
+    fn opportunistic_dragon_loses_all_abilities_sibling_preserved() {
+        let def = parse_effect_chain(
+            "For as long as ~ remains on the battlefield, gain control of that permanent, it loses all abilities, and it can't attack or block.",
+            AbilityKind::Spell,
+        );
+
+        // Walk the effect + sub_ability chain collecting every effect, every
+        // continuous modification, and every static mode, tracking whether the
+        // RemoveAllAbilities-bearing clause carries the host-lifetime duration.
+        let mut has_gain_control = false;
+        let mut remove_all_abilities_with_host_duration = false;
+        let mut has_cant_attack = false;
+        let mut has_cant_block = false;
+
+        let mut node = Some(&def);
+        while let Some(ability) = node {
+            if matches!(ability.effect.as_ref(), Effect::GainControl { .. }) {
+                has_gain_control = true;
+            }
+            if let Effect::GenericEffect {
+                static_abilities, ..
+            } = ability.effect.as_ref()
+            {
+                for static_def in static_abilities {
+                    for modification in &static_def.modifications {
+                        match modification {
+                            ContinuousModification::RemoveAllAbilities
+                                if ability.duration == Some(Duration::UntilHostLeavesPlay) =>
+                            {
+                                remove_all_abilities_with_host_duration = true;
+                            }
+                            ContinuousModification::AddStaticMode { mode } => match mode {
+                                StaticMode::CantAttack => has_cant_attack = true,
+                                StaticMode::CantBlock => has_cant_block = true,
+                                StaticMode::CantAttackOrBlock => {
+                                    has_cant_attack = true;
+                                    has_cant_block = true;
+                                }
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            node = ability.sub_ability.as_deref();
+        }
+
+        assert!(has_gain_control, "expected GainControl in chain: {def:#?}");
+        assert!(
+            remove_all_abilities_with_host_duration,
+            "expected RemoveAllAbilities GenericEffect with UntilHostLeavesPlay (middle sibling dropped?): {def:#?}"
+        );
+        assert!(
+            has_cant_attack && has_cant_block,
+            "expected can't-attack and can't-block restriction in chain: {def:#?}"
+        );
     }
 
     #[test]
@@ -30596,6 +30716,67 @@ mod tests {
         assert_library_change_destination(move_found, Zone::Graveyard);
     }
 
+    /// CR 701.23a: Search for Glory — "a snow permanent card, a legendary card,
+    /// or a Saga card" is a disjunctive series describing ONE card matching any
+    /// of three co-equal filters. It must lower to a single `SearchLibrary` with
+    /// `count: Fixed{1}`, an `Or` of three branches, and `selection_constraint:
+    /// None` (NOT `MatchEachFilter` / three required picks). The destination /
+    /// shuffle / gain-life sub_ability chain stays intact.
+    #[test]
+    fn search_for_glory_disjunctive_series_lowers_to_single_or_choice() {
+        let def = parse_effect_chain(
+            "Search your library for a snow permanent card, a legendary card, or a Saga card, reveal it, put it into your hand, then shuffle. You gain 1 life for each {S} spent to cast this spell.",
+            AbilityKind::Spell,
+        );
+
+        let Effect::SearchLibrary {
+            filter,
+            count,
+            selection_constraint,
+            ..
+        } = &*def.effect
+        else {
+            panic!("expected SearchLibrary, got {:?}", def.effect);
+        };
+        assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+        assert_eq!(*selection_constraint, SearchSelectionConstraint::None);
+        let TargetFilter::Or { filters } = filter else {
+            panic!("expected Or search filter, got {filter:?}");
+        };
+        assert_eq!(
+            filters.len(),
+            3,
+            "expected 3 disjunctive branches: {filters:?}"
+        );
+
+        // sub_ability chain: ChangeZone (Library -> Hand) -> Shuffle -> GainLife.
+        let move_found = def
+            .sub_ability
+            .as_deref()
+            .expect("expected move ChangeZone");
+        assert_library_change_destination(move_found, Zone::Hand);
+
+        let shuffle = move_found
+            .sub_ability
+            .as_deref()
+            .expect("expected Shuffle after move");
+        assert!(
+            matches!(*shuffle.effect, Effect::Shuffle { .. }),
+            "expected Shuffle, got {:?}",
+            shuffle.effect
+        );
+
+        let gain_life = shuffle
+            .sub_ability
+            .as_deref()
+            .expect("expected GainLife after shuffle");
+        assert!(
+            matches!(*gain_life.effect, Effect::GainLife { .. }),
+            "expected GainLife, got {:?}",
+            gain_life.effect
+        );
+    }
+
     fn assert_filter_has_color(filter: &TargetFilter, expected: ManaColor) {
         let TargetFilter::Typed(typed) = filter else {
             panic!("expected typed search filter, got {filter:?}");
@@ -31394,6 +31575,47 @@ mod tests {
                 .is_none(),
             "prepositional shape belongs to strip_for_each_opponent_who_doesnt"
         );
+    }
+
+    /// Issue #2423 — Deadly Brew: sacrifice rider + optional graveyard return.
+    #[test]
+    fn deadly_brew_sacrifice_planeswalker_return_condition() {
+        let def = parse_effect_chain(
+            "Each player sacrifices a creature or planeswalker of their choice. If you sacrificed a permanent this way, you may return another permanent card from your graveyard to your hand.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(*def.effect, Effect::Sacrifice { .. }));
+        assert_eq!(def.player_scope, Some(PlayerFilter::All));
+
+        let return_sub = def.sub_ability.as_ref().expect("Deadly Brew return clause");
+        assert!(return_sub.optional);
+        assert!(matches!(
+            return_sub.condition,
+            Some(AbilityCondition::CostPaidObjectMatchesFilter {
+                filter: TargetFilter::Typed(TypedFilter { ref type_filters, .. })
+            }) if type_filters.contains(&TypeFilter::Permanent)
+        ));
+        match &*return_sub.effect {
+            Effect::Bounce { target, .. } => {
+                let TargetFilter::Typed(typed) = target else {
+                    panic!("expected typed graveyard permanent target, got {target:?}");
+                };
+                assert!(typed.type_filters.contains(&TypeFilter::Permanent));
+                assert!(typed.properties.iter().any(|p| {
+                    matches!(
+                        p,
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard
+                        }
+                    )
+                }));
+                assert!(typed
+                    .properties
+                    .iter()
+                    .any(|p| matches!(p, FilterProp::Another)));
+            }
+            other => panic!("expected graveyard-to-hand Bounce, got {other:?}"),
+        }
     }
 
     /// CR 101.3 + CR 118.12 + CR 109.5: Plaguecrafter's ETB body — "each
@@ -41184,6 +41406,96 @@ mod tests {
         assert!(
             delayed_sacrifice,
             "expected a CreateDelayedTrigger with Sacrifice inside in the parsed chain"
+        );
+    }
+
+    /// Issue #2424: Goryo's Vengeance — "That creature gains haste. Exile it at
+    /// the beginning of the next end step." must bind to the returned legendary
+    /// creature, not the spell source.
+    #[test]
+    fn goryos_vengeance_reanimation_haste_and_delayed_exile() {
+        let def = parse_effect_chain(
+            "return target legendary creature card from your graveyard to the battlefield. that creature gains haste. exile it at the beginning of the next end step.",
+            AbilityKind::Spell,
+        );
+
+        fn find_change_zone_to_battlefield(def: &AbilityDefinition) -> Option<&AbilityDefinition> {
+            if matches!(
+                &*def.effect,
+                Effect::ChangeZone {
+                    destination: Zone::Battlefield,
+                    ..
+                }
+            ) {
+                return Some(def);
+            }
+            if let Some(sub) = def.sub_ability.as_ref() {
+                if let Some(found) = find_change_zone_to_battlefield(sub) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let parent = find_change_zone_to_battlefield(&def)
+            .expect("expected ChangeZone to Battlefield parent");
+        assert!(
+            parent.forward_result,
+            "Goryo's-style anaphor sub-chain must set forward_result"
+        );
+
+        fn haste_targets_parent(def: &AbilityDefinition) -> bool {
+            match &*def.effect {
+                Effect::GenericEffect {
+                    target,
+                    static_abilities,
+                    ..
+                } => {
+                    let outer = matches!(target, Some(TargetFilter::ParentTarget));
+                    let inner = static_abilities.iter().any(|s| {
+                        matches!(s.affected.as_ref(), Some(TargetFilter::ParentTarget))
+                            && s.modifications.iter().any(|m| {
+                                matches!(
+                                    m,
+                                    ContinuousModification::AddKeyword { keyword }
+                                        if matches!(keyword, Keyword::Haste)
+                                )
+                            })
+                    });
+                    outer || inner
+                }
+                Effect::CreateDelayedTrigger { effect, .. } => haste_targets_parent(effect),
+                _ => def.sub_ability.as_deref().is_some_and(haste_targets_parent),
+            }
+        }
+
+        fn delayed_exile_targets_parent(def: &AbilityDefinition) -> bool {
+            match &*def.effect {
+                Effect::CreateDelayedTrigger { effect, .. } => match &*effect.effect {
+                    Effect::ChangeZone {
+                        destination: Zone::Exile,
+                        target: TargetFilter::ParentTarget,
+                        ..
+                    } => true,
+                    other => delayed_exile_targets_parent(&AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        other.clone(),
+                    )),
+                },
+                _ => def
+                    .sub_ability
+                    .as_deref()
+                    .is_some_and(delayed_exile_targets_parent),
+            }
+        }
+
+        assert!(
+            haste_targets_parent(&def),
+            "haste grant must target ParentTarget (the returned creature)"
+        );
+        assert!(
+            delayed_exile_targets_parent(&def),
+            "delayed exile must target ParentTarget (the returned creature)"
         );
     }
 
