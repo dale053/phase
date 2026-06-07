@@ -276,9 +276,10 @@ fn detect_optional_you_may(
     parsed: &ParsedAbilities,
     diagnostics: &mut Vec<OracleDiagnostic>,
 ) {
-    // Only the bare "you may [verb]" optional-effect form. We exclude
-    // "if you may" / "you may have" / "you may cast" patterns where the "may"
-    // belongs to a different grammatical construction.
+    // Only the bare "you may [verb]" optional-effect form. "you may cast" is
+    // NOT excluded at this scan level — the optionality is satisfied on the
+    // AST-walk side via `any_ability_is_optional` checking `casting_options`,
+    // `CastFromZone`, `GrantCastingPermission`, and `CastCopyOfCard`.
     // allow-noncombinator: swallow detector marker scan on classified text
     if !cleaned.contains("you may ") {
         return;
@@ -366,6 +367,13 @@ fn trigger_tree_has_optional(trigger: &TriggerDefinition) -> bool {
 /// the structural shape of "you may reveal X. If you don't, ..." — the
 /// player's reveal choice IS the "may" decision, with the decline branch
 /// handling the "if you don't" alternative.
+///
+/// CR 118.9b + CR 707.12: `CastCopyOfCard` encodes "you may cast the copy
+/// without paying its mana cost" — CR 118.9b makes the alternative cost
+/// optional; the resolver presents a TrackedSet
+/// `ChooseFromZoneChoice { up_to: true }` — choosing 0 is the decline path.
+/// The def-level `optional` flag is correctly false (`fold_cast_copy_of_card_defs`
+/// hardcodes it); the "may" lives in the CR 707.12 cast step.
 fn effect_has_internal_optionality(effect: &Effect) -> bool {
     match effect {
         // CR 701.23j: Outside-game searches are optional at the selection
@@ -375,6 +383,19 @@ fn effect_has_internal_optionality(effect: &Effect) -> bool {
         Effect::Dig { up_to: true, .. }
         | Effect::GrantCastingPermission { .. }
         | Effect::CastFromZone { .. }
+        // CR 118.9b + CR 707.12: CastCopyOfCard encodes "you may cast the copy
+        // without paying its mana cost" — CR 118.9b makes the alternative cost
+        // optional; the resolver presents a TrackedSet
+        // `ChooseFromZoneChoice { up_to: true }` — choosing 0 is the decline
+        // path. Restricted to TrackedSet-target forms (what
+        // `fold_cast_copy_of_card_defs` actually produces); `TrackedSetFiltered`
+        // is included as defensive forward coverage for any future parser path.
+        // The Cipher runtime path uses a pre-resolved target with no optional
+        // gate and is correctly excluded.
+        | Effect::CastCopyOfCard {
+            target: TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. },
+            ..
+        }
         | Effect::PayCost { .. }
         | Effect::RevealHand {
             choice_optional: true,
@@ -2430,8 +2451,11 @@ mod tests {
     use super::{def_tree_has_optional, def_tree_has_unimplemented, trigger_tree_has_optional};
     use crate::parser::oracle::parse_oracle_text;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
-    use crate::types::ability::{AbilityDefinition, Effect, OutsideGameSourcePool};
+    use crate::types::ability::{AbilityDefinition, Effect, OutsideGameSourcePool, TargetFilter};
+    use crate::types::identifiers::TrackedSetId;
+    use crate::types::mana::ManaCost;
     use crate::types::statics::StaticMode;
+    use crate::types::zones::Zone;
 
     fn parse(text: &str, types: &[&str]) -> crate::parser::oracle::ParsedAbilities {
         parse_named(text, "Test Card", types)
@@ -3537,5 +3561,141 @@ mod tests {
             &["Artifact"],
         );
         assert!(!has_swallowed_detector(&parsed, "Duration_UntilEndOfTurn"));
+    }
+
+    /// CR 118.9b + CR 707.12: `CastCopyOfCard` encodes the "you may cast the
+    /// copy without paying its mana cost" permission internally, so
+    /// `effect_has_internal_optionality` must classify the TrackedSet-target
+    /// form (the only shape the parser produces) as carrying its own
+    /// optionality (analogous to `CastFromZone`). The def-level `optional` flag
+    /// stays false; the "may" is presented by the resolver as a TrackedSet
+    /// `ChooseFromZoneChoice { up_to: true }`.
+    #[test]
+    fn effect_has_internal_optionality_cast_copy_of_card() {
+        let effect = Effect::CastCopyOfCard {
+            target: TargetFilter::TrackedSet {
+                id: TrackedSetId(0),
+            },
+            cost: ManaCost::zero(),
+        };
+        assert!(super::effect_has_internal_optionality(&effect));
+    }
+
+    /// Recursive walk mirroring the module's `def_tree_has_*` predicates:
+    /// does any def in the tree carry a `CastCopyOfCard` effect?
+    fn def_tree_has_cast_copy_of_card(def: &AbilityDefinition) -> bool {
+        if matches!(def.effect.as_ref(), Effect::CastCopyOfCard { .. }) {
+            return true;
+        }
+        if def
+            .sub_ability
+            .as_deref()
+            .is_some_and(def_tree_has_cast_copy_of_card)
+        {
+            return true;
+        }
+        if def
+            .else_ability
+            .as_deref()
+            .is_some_and(def_tree_has_cast_copy_of_card)
+        {
+            return true;
+        }
+        def.mode_abilities
+            .iter()
+            .any(def_tree_has_cast_copy_of_card)
+    }
+
+    fn parsed_has_cast_copy_of_card(parsed: &crate::parser::oracle::ParsedAbilities) -> bool {
+        parsed.abilities.iter().any(def_tree_has_cast_copy_of_card)
+            || parsed.triggers.iter().any(|t| {
+                t.execute
+                    .as_deref()
+                    .is_some_and(def_tree_has_cast_copy_of_card)
+            })
+    }
+
+    /// Issue #2273: Mizzix's Mastery folds "copy it. You may cast the copy
+    /// without paying its mana cost" into `CastCopyOfCard`; the comma+and
+    /// continuation must not trip the `Optional_YouMay` swallow detector now
+    /// that `CastCopyOfCard` carries its own internal optionality.
+    #[test]
+    fn optional_you_may_accepts_mizzix_mastery_cast_copy() {
+        let parsed = parse_named(
+            "Exile target card that's an instant or sorcery from your graveyard. \
+             For each card exiled this way, copy it. You may cast the copy \
+             without paying its mana cost.",
+            "Mizzix's Mastery",
+            &["Sorcery"],
+        );
+
+        // Structural guard: `check_swallowed_clauses` early-returns when any
+        // ability is Unimplemented, so the `Optional_YouMay` assertion could
+        // otherwise pass vacuously. Assert the parse actually folded the
+        // exile+copy+cast chain into a `CastCopyOfCard` effect so the swallow
+        // assertion exercises the real CastCopyOfCard optionality path.
+        assert!(
+            parsed_has_cast_copy_of_card(&parsed),
+            "expected a CastCopyOfCard effect in the parsed ability chain, got {:?}",
+            parsed.abilities
+        );
+        assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+    }
+
+    /// Issue #2273: Narset's attack trigger ends a sentence before "You may cast
+    /// the copy …". In the *trigger* context the exile+copy currently folds to
+    /// `ChangeZone → CopySpell { retarget: KeepOriginalTargets }` and the
+    /// "You may cast the copy without paying its mana cost" sentence is dropped,
+    /// so `Optional_YouMay` still fires. The primary `CastCopyOfCard`
+    /// optionality fix (verified by the Mizzix spell-context test above) does
+    /// NOT cover this because the trigger fold never produces `CastCopyOfCard`.
+    ///
+    /// **Status:** ignored — the trigger-context fold to `CastCopyOfCard` is a
+    /// separate parser gap (in the trigger/sequence fold, out of scope for the
+    /// swallow_check optionality fix). Tracked as issue #2273 follow-up.
+    #[test]
+    #[ignore = "trigger-context exile+copy folds to CopySpell, not CastCopyOfCard; \
+                trigger fold gap is out of scope for the swallow_check fix (issue #2273 follow-up)"]
+    fn optional_you_may_accepts_narset_attack_cast_copy() {
+        let parsed = parse_named(
+            "Creatures you control have prowess.\n\
+             Whenever Narset attacks, exile target noncreature, nonland card with \
+             mana value less than Narset's power from a graveyard and copy it. \
+             You may cast the copy without paying its mana cost.",
+            "Narset, Enlightened Exile",
+            &["Creature"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+
+        let trigger = parsed
+            .triggers
+            .iter()
+            .find(|t| t.execute.is_some())
+            .expect("expected Narset's attack trigger with an execute body");
+        let execute = trigger
+            .execute
+            .as_deref()
+            .expect("attack trigger execute body");
+        assert!(
+            matches!(
+                execute.effect.as_ref(),
+                Effect::ChangeZone {
+                    destination: Zone::Exile,
+                    ..
+                }
+            ),
+            "expected ChangeZone(Exile), got {:?}",
+            execute.effect
+        );
+        let cast_copy = execute
+            .sub_ability
+            .as_deref()
+            .expect("expected CastCopyOfCard sub-ability after the exile");
+        assert!(
+            matches!(cast_copy.effect.as_ref(), Effect::CastCopyOfCard { .. }),
+            "expected CastCopyOfCard, got {:?}",
+            cast_copy.effect
+        );
     }
 }

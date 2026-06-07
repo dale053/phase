@@ -300,6 +300,7 @@ mod tests {
     use crate::types::ability::{
         PreventionAmount, PtValue, QuantityExpr, QuantityRef, ShieldKind, TypedFilter,
     };
+    use crate::types::card_type::CoreType;
     use crate::types::game_state::ChosenDamageSource;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::keywords::Keyword;
@@ -710,6 +711,13 @@ mod tests {
             "Creature".to_string(),
             Zone::Battlefield,
         );
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
 
         let ability = ResolvedAbility::new(
             Effect::PreventDamage {

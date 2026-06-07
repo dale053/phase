@@ -727,6 +727,14 @@
       "dontPay": "Nie płać",
       "takeEffect": "Przyjmij efekt"
     },
+    "spliceOffer": {
+      "title": "Połącz z Arcane?",
+      "subtitle": "Wybierz kartę do ujawnienia i połączenia z tym czarem albo rzuć go bez łączenia.",
+      "spliceCard": "Połącz {{name}}",
+      "decline": "Nie łącz",
+      "declineDescription": "Rzuć czar bez dodawania tekstu innej karty.",
+      "unknownCard": "Karta #{{id}}"
+    },
     "activationCost": {
       "title": "Wybierz koszt aktywacji"
     },
@@ -1235,9 +1243,11 @@
   "cascadeChoice": {
     "cascadeEyebrow": "Cascade",
     "discoverEyebrow": "Discover",
+    "rippleEyebrow": "Ripple",
     "title": "Rzucić {{name}}?",
     "subtitleCascade": "Cascade wygnało {{name}} (wartość many poniżej {{sourceMv}}). Rzuć go bez płacenia jego kosztu many lub odmów i przetasuj wszystkie {{total}} wygnanych kart na spód swojej biblioteki.",
     "subtitleDiscover": "Discover wygnało {{name}}. Rzuć go bez płacenia jego kosztu many lub weź go do ręki i przetasuj pozostałe {{missCount}} wygnanych kart na spód swojej biblioteki.",
+    "subtitleRipple": "Ripple ujawniło {{name}}. Rzuć go bez płacenia jego kosztu many lub odmów i umieść wszystkie {{total}} ujawnionych kart na spodzie swojej biblioteki w losowej kolejności.",
     "castNamed": "Rzuć {{name}}",
     "castSuffix": "(bez płacenia jego kosztu many)",
     "putIntoHand": "Weź do ręki",
@@ -1268,6 +1278,7 @@
     "variantForetell": "Rzuć z Foretell",
     "variantOverload": "Rzuć z Overload",
     "variantBestow": "Rzuć z Bestow",
+    "variantFuse": "Rzuć z Fuse",
     "variantFallback": "Rzuć z {{type}}"
   },
   "categoryChoice": {
@@ -1436,6 +1447,9 @@
   "proliferate": {
     "proliferateTitle": "Proliferate",
     "proliferateSubtitle": "Wybierz dowolną liczbę trwałych i graczy ze znacznikami. Każdy wybrany cel otrzymuje po jednym dodatkowym znaczniku każdego rodzaju, który już tam jest.",
+    "timeTravelTitle": "Podróż w czasie",
+    "timeTravelRemoveSubtitle": "Wybierz dowolną liczbę kwalifikujących się obiektów, z których usunąć znacznik czasu.",
+    "timeTravelAddSubtitle": "Wybierz dowolną liczbę pozostałych kwalifikujących się obiektów, na które dodać znacznik czasu.",
     "chooseObjectsTitle": "Wybierz trwałe",
     "chooseObjectsSubtitle": "Wybierz dowolną liczbę trwałych. Płacisz koszt za każdego wybranego.",
     "selectAll": "Wszystko",

@@ -11,6 +11,13 @@ use crate::types::zones::Zone;
 use super::game_object::GameObject;
 use super::printed_cards::{apply_back_face_to_object, snapshot_object_face};
 
+/// CR 111.7 / CR 111.8: A token outside the battlefield ceases to exist at
+/// the next SBA, and can't change zones before then. Stack tokens are excluded
+/// so spell copies can finish resolving before the next SBA check.
+pub(super) fn token_is_outside_battlefield_and_stack(obj: &GameObject) -> bool {
+    obj.is_token && obj.zone != Zone::Battlefield && obj.zone != Zone::Stack
+}
+
 /// CR 603.10a + CR 603.6e: Capture a snapshot of every attachment on `obj` at the
 /// moment of the zone change. The snapshot records each attachment's current
 /// controller and kind (Aura/Equipment) so that look-back triggers of the form
@@ -224,6 +231,18 @@ fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zon
             state.layers_dirty.mark_full();
         }
 
+        // CR 400.7d + CR 702.150a: Compleated's Phyrexian life-payment count
+        // is cast metadata. Preserve it while the cast object moves to the
+        // stack, and while the resolving permanent spell becomes the
+        // battlefield object whose ETB counter replacement will consume it.
+        // Every other zone change creates an object with no memory of that
+        // payment.
+        let preserve_phyrexian_life_paid =
+            to == Zone::Stack || (from == Zone::Stack && to == Zone::Battlefield);
+        if !preserve_phyrexian_life_paid {
+            obj_mut.phyrexian_life_paid = 0;
+        }
+
         // CR 122.2: Counters cease to exist when an object changes zones.
         obj_mut.counters.clear();
     }
@@ -241,6 +260,13 @@ fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zon
         crate::game::layers::mark_layers_full(state);
         super::layers::prune_host_left_effects(state, object_id);
         super::layers::prune_affected_object_left_effects(state, object_id);
+        // CR 613.1 + CR 400.7: Copy effects are pruned above, but layer-derived
+        // characteristics (name, types, abilities) persist on the object until
+        // explicitly reset. Revert to printed baseline so graveyard/exile objects
+        // do not retain copied identity (Vesuva legend-rule sacrifice).
+        if let Some(obj) = state.objects.get_mut(&object_id) {
+            obj.revert_layered_characteristics_to_base();
+        }
         for tapped in state.lands_tapped_for_mana.values_mut() {
             tapped.retain(|&id| id != object_id);
         }
@@ -305,6 +331,21 @@ pub fn move_to_zone(
     mut to: Zone,
     events: &mut Vec<GameEvent>,
 ) {
+    // CR 111.8: A token that has left the battlefield can't move to another zone
+    // or come back onto the battlefield — "if such a token would change zones, it
+    // remains in its current zone instead." It ceases to exist at the next SBA
+    // (CR 111.7, enforced in sba.rs). Without this guard a single-resolution
+    // flicker ("exile target permanent, then return it") on a token would return
+    // it before the cease-to-exist SBA runs. The Stack carve-out matches the
+    // CR 111.7 SBA so a copy of a spell still resolves off the stack normally.
+    if state
+        .objects
+        .get(&object_id)
+        .is_some_and(token_is_outside_battlefield_and_stack)
+    {
+        return;
+    }
+
     // CR 903.9a: A fresh zone change resets the "declined zone return" flag
     // so the owner gets a new choice opportunity if the commander moves again.
     state.commander_declined_zone_return.remove(&object_id);
@@ -667,6 +708,15 @@ pub fn move_to_library_at_index(
     index: Option<usize>,
     events: &mut Vec<GameEvent>,
 ) {
+    // CR 111.8: A token that has left the battlefield can't move to another zone.
+    if state
+        .objects
+        .get(&object_id)
+        .is_some_and(token_is_outside_battlefield_and_stack)
+    {
+        return;
+    }
+
     // CR 903.9a: A fresh zone change resets the "declined zone return" flag.
     state.commander_declined_zone_return.remove(&object_id);
 
@@ -936,6 +986,73 @@ mod tests {
             Zone::Battlefield,
         );
         assert!(state.battlefield.contains(&id));
+    }
+
+    /// CR 111.8: A token that has left the battlefield can't move to another zone
+    /// or come back onto the battlefield; it remains in its current zone and
+    /// ceases to exist at the next SBA (CR 111.7). A single-resolution flicker
+    /// ("exile target permanent, then return it") on a token therefore must NOT
+    /// bring it back — modeled here as the two zone changes such an effect makes,
+    /// battlefield -> exile then exile -> battlefield, with no SBA in between.
+    #[test]
+    fn token_that_left_battlefield_cannot_return() {
+        let mut state = setup();
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Cat".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&id).unwrap().is_token = true;
+
+        let mut events = Vec::new();
+        // Flicker step 1: the token leaves the battlefield (exiled).
+        move_to_zone(&mut state, id, Zone::Exile, &mut events);
+        assert_eq!(state.objects[&id].zone, Zone::Exile);
+
+        // Flicker step 2 (same resolution, no SBA between): attempt to return it.
+        move_to_zone(&mut state, id, Zone::Battlefield, &mut events);
+
+        // CR 111.8: it stays in exile; it must not re-enter the battlefield.
+        assert_eq!(
+            state.objects[&id].zone,
+            Zone::Exile,
+            "CR 111.8: a token that left the battlefield can't return"
+        );
+        assert!(
+            !state.battlefield.contains(&id),
+            "returned token must not be on the battlefield"
+        );
+    }
+
+    /// CR 111.8: A token that has left the battlefield can't move into a
+    /// library before the next SBA removes it.
+    #[test]
+    fn token_that_left_battlefield_cannot_move_to_library_position() {
+        let mut state = setup();
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Cat".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&id).unwrap().is_token = true;
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, id, Zone::Exile, &mut events);
+        move_to_library_position(&mut state, id, true, &mut events);
+
+        assert_eq!(
+            state.objects[&id].zone,
+            Zone::Exile,
+            "CR 111.8: a token that left the battlefield can't move into a library"
+        );
+        assert!(
+            !state.players[0].library.contains(&id),
+            "token must not be inserted into its owner's library"
+        );
     }
 
     #[test]

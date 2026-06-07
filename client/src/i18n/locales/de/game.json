@@ -727,6 +727,14 @@
       "dontPay": "Nicht bezahlen",
       "takeEffect": "Den Effekt hinnehmen"
     },
+    "spliceOffer": {
+      "title": "An Arkan koppeln?",
+      "subtitle": "Wähle eine Karte, die du vorzeigst und in diesen Zauberspruch einkoppelst, oder wirke ohne Kopplung.",
+      "spliceCard": "{{name}} einkoppeln",
+      "decline": "Nicht einkoppeln",
+      "declineDescription": "Wirke den Zauberspruch, ohne den Text einer anderen Karte hinzuzufügen.",
+      "unknownCard": "Karte #{{id}}"
+    },
     "activationCost": {
       "title": "Aktivierungskosten wählen"
     },
@@ -1235,9 +1243,11 @@
   "cascadeChoice": {
     "cascadeEyebrow": "Kaskade",
     "discoverEyebrow": "Entdecken",
+    "rippleEyebrow": "Ripple",
     "title": "{{name}} wirken?",
     "subtitleCascade": "Kaskade hat {{name}} ins Exil geschickt (Manawert unter {{sourceMv}}). Wirke es, ohne seine Manakosten zu bezahlen, oder lehne ab und mische alle {{total}} ins Exil geschickten Karten unter deine Bibliothek.",
     "subtitleDiscover": "Entdecken hat {{name}} ins Exil geschickt. Wirke es, ohne seine Manakosten zu bezahlen, oder nimm es auf deine Hand und mische die anderen {{missCount}} ins Exil geschickten Karten unter deine Bibliothek.",
+    "subtitleRipple": "Ripple hat {{name}} aufgedeckt. Wirke es, ohne seine Manakosten zu bezahlen, oder lehne ab und lege alle {{total}} aufgedeckten Karten in zufälliger Reihenfolge unter deine Bibliothek.",
     "castNamed": "{{name}} wirken",
     "castSuffix": "(ohne seine Manakosten zu bezahlen)",
     "putIntoHand": "Auf die Hand nehmen",
@@ -1268,6 +1278,7 @@
     "variantForetell": "Aus Vorhersagen wirken",
     "variantOverload": "Mit Überladen wirken",
     "variantBestow": "Mit Verleihen wirken",
+    "variantFuse": "Mit Verschmelzen wirken",
     "variantFallback": "Mit {{type}} wirken"
   },
   "categoryChoice": {
@@ -1436,6 +1447,9 @@
   "proliferate": {
     "proliferateTitle": "Wuchern",
     "proliferateSubtitle": "Wähle eine beliebige Anzahl bleibender Karten und Spieler mit Marken. Jedes gewählte Ziel erhält eine weitere Marke jeder Art, die bereits dort vorhanden ist.",
+    "timeTravelTitle": "Zeitreise",
+    "timeTravelRemoveSubtitle": "Wähle eine beliebige Anzahl gültiger Objekte, von denen eine Zeitmarke entfernt werden soll.",
+    "timeTravelAddSubtitle": "Wähle eine beliebige Anzahl verbleibender gültiger Objekte, auf die eine Zeitmarke gelegt werden soll.",
     "chooseObjectsTitle": "Bleibende Karten wählen",
     "chooseObjectsSubtitle": "Wähle eine beliebige Anzahl bleibender Karten. Du zahlst für jede gewählte Karte Kosten.",
     "selectAll": "Alle",

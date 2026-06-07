@@ -317,6 +317,7 @@ fn rewrite_bound_x_in_mana_production(
         | ManaProduction::ChoiceAmongExiledColors { .. }
         | ManaProduction::ChoiceAmongCombinations { .. }
         | ManaProduction::DistinctColorsAmongPermanents { .. }
+        | ManaProduction::AnyOneColorAmongPermanents { .. }
         | ManaProduction::TriggerEventManaType => 0,
     }
 }

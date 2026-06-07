@@ -1588,6 +1588,51 @@ fn collect_pending_triggers(
                 }));
             }
 
+            // CR 702.60a + CR 702.60b: Ripple — synthesized "when you cast this
+            // spell" trigger off the just-cast spell, one per Ripple instance,
+            // each carrying that instance's N. Mirrors the Cascade synthesis above.
+            let ripple_instances: Vec<u32> =
+                super::casting::effective_spell_keywords(state, *caster, *cast_obj_id)
+                    .into_iter()
+                    .filter_map(|k| match k {
+                        Keyword::Ripple(n) => Some(n),
+                        _ => None,
+                    })
+                    .collect();
+            let ripple_controller = state
+                .objects
+                .get(cast_obj_id)
+                .map(|o| o.controller)
+                .unwrap_or(*caster);
+            for n in ripple_instances {
+                let ripple_trig_def = TriggerDefinition::new(TriggerMode::SpellCast)
+                    .description("Ripple".to_string())
+                    .condition(TriggerCondition::WasCast { zone: None });
+                let ripple_ability = ResolvedAbility::new(
+                    Effect::Ripple { count: n },
+                    Vec::new(),
+                    *cast_obj_id,
+                    ripple_controller,
+                );
+                let timestamp = state.next_timestamp() as u32;
+                pending.push(PendingTriggerContext::single(PendingTrigger {
+                    source_id: *cast_obj_id,
+                    controller: ripple_controller,
+                    condition: ripple_trig_def.condition,
+                    ability: ripple_ability,
+                    timestamp,
+                    target_constraints: Vec::new(),
+                    distribute: None,
+                    trigger_event: Some(event.clone()),
+                    modal: None,
+                    mode_abilities: vec![],
+                    description: ripple_trig_def.description,
+                    may_trigger_origin: None,
+                    subject_match_count: None,
+                    die_result: None,
+                }));
+            }
+
             // CR 702.153a: Casualty triggers when the spell is cast with the
             // cost paid. Applies to both printed Casualty (obj.additional_cost
             // is set) and dynamically granted Casualty (e.g. from Silverquill).
@@ -1665,6 +1710,74 @@ fn collect_pending_triggers(
                     modal: None,
                     mode_abilities: vec![],
                     description: Some("Casualty".to_string()),
+                    may_trigger_origin: None,
+                    subject_match_count: None,
+                    die_result: None,
+                }));
+            }
+
+            // CR 702.78a: Conspire's copy trigger is synthesized onto printed
+            // Conspire cards by `synthesize_conspire`. Dynamically granted
+            // Conspire (StaticMode::CastWithKeyword — Wort, the Raidmother /
+            // Rassilon, the War President) has no face-level trigger, so mirror
+            // the dynamic Casualty seam here and reuse the canonical Conspire
+            // ability definition. Skip cards with a printed Conspire keyword:
+            // those already carry the face-synthesized copy trigger.
+            let dynamically_granted_conspire_instances = state
+                .objects
+                .get(cast_obj_id)
+                .filter(|obj| !obj.keywords.iter().any(|k| matches!(k, Keyword::Conspire)))
+                .and_then(|obj| {
+                    let paid = state
+                        .stack
+                        .iter()
+                        .find(|entry| entry.id == *cast_obj_id)
+                        .is_some_and(|entry| {
+                            entry
+                                .ability()
+                                .is_some_and(|ability| ability.context.additional_cost_paid)
+                        });
+                    paid.then_some(obj.controller)
+                })
+                .map(|controller| {
+                    let n =
+                        super::casting::effective_spell_keywords(state, controller, *cast_obj_id)
+                            .iter()
+                            .filter(|keyword| matches!(keyword, Keyword::Conspire))
+                            .count();
+                    (n, controller)
+                })
+                .unwrap_or((0, PlayerId(0)));
+            // CR 702.78b: multiple Conspire instances require per-instance separate
+            // payment, but the engine tracks a single aggregate
+            // `additional_cost_paid` flag, so N instances produce N copies off one
+            // payment here (Casualty-parity). Both grantors today grant at most one
+            // instance (StaticMode upsert), so N=1 is the only live path; this
+            // mirrors `synthesize_conspire`'s count>1 deferral.
+            for _ in 0..dynamically_granted_conspire_instances.0 {
+                let mut conspire_ability = build_resolved_from_def(
+                    &crate::database::synthesis::conspire_copy_ability_definition(),
+                    *cast_obj_id,
+                    dynamically_granted_conspire_instances.1,
+                );
+                // CR 702.78a: surface the paid additional cost on the copy ability's
+                // OWN context so the embedded `additional_cost_paid_any` condition
+                // (re-evaluated at resolution against this copy, not the source
+                // spell) passes. Omitting this fizzles every granted-Conspire copy.
+                conspire_ability.context.additional_cost_paid = true;
+                let timestamp = state.next_timestamp() as u32;
+                pending.push(PendingTriggerContext::single(PendingTrigger {
+                    source_id: *cast_obj_id,
+                    controller: dynamically_granted_conspire_instances.1,
+                    condition: None,
+                    ability: conspire_ability,
+                    timestamp,
+                    target_constraints: Vec::new(),
+                    distribute: None,
+                    trigger_event: Some(event.clone()),
+                    modal: None,
+                    mode_abilities: vec![],
+                    description: Some("Conspire".to_string()),
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
@@ -13571,6 +13684,101 @@ pub mod tests {
                 )
             }),
             "paid granted casualty should create a copy trigger"
+        );
+    }
+
+    /// CR 702.78a: Conspire granted by a `CastWithKeyword` static (Wort, the
+    /// Raidmother) with its additional cost paid must enqueue a copy-on-cast
+    /// trigger, exactly like granted Casualty. Discriminates CHANGE 3 — without
+    /// the granted-Conspire block in `process_triggers`, no copy trigger is
+    /// produced.
+    #[test]
+    fn granted_conspire_triggers_copy_when_paid() {
+        let mut state = setup();
+        let caster = PlayerId(0);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            caster,
+            "Conspire Grantor".to_string(),
+            Zone::Battlefield,
+        );
+        let grant = StaticDefinition::new(StaticMode::CastWithKeyword {
+            keyword: Keyword::Conspire,
+        })
+        .affected(TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Instant).controller(ControllerRef::You),
+        ));
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(grant);
+
+        let spell = create_object(
+            &mut state,
+            CardId(2),
+            caster,
+            "Test Instant".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            obj.cast_from_zone = Some(Zone::Hand);
+        }
+        let mut ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            spell,
+            caster,
+        );
+        // CR 702.78a: the conspire cost was paid — surfaced on the cast spell's
+        // stack-entry context, which the granted-Conspire block reads to gate
+        // the copy trigger.
+        ability.context.additional_cost_paid = true;
+        state.stack.push_back(StackEntry {
+            id: spell,
+            source_id: spell,
+            controller: caster,
+            kind: StackEntryKind::Spell {
+                card_id: CardId(2),
+                ability: Some(ability),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+
+        process_triggers(
+            &mut state,
+            &[GameEvent::SpellCast {
+                object_id: spell,
+                controller: caster,
+                card_id: CardId(2),
+            }],
+        );
+
+        // CR 702.78a: the copy trigger must exist AND its ability context must
+        // carry additional_cost_paid = true (CHANGE 3 binding requirement) so the
+        // embedded `additional_cost_paid_any` condition passes at resolution.
+        let copy_trigger_paid = state.stack.iter().any(|entry| {
+            matches!(
+                &entry.kind,
+                StackEntryKind::TriggeredAbility { ability, .. }
+                    if matches!(
+                        ability.effect,
+                        Effect::CopySpell { target: TargetFilter::SelfRef, .. }
+                    ) && ability.context.additional_cost_paid
+            )
+        });
+        assert!(
+            copy_trigger_paid,
+            "paid granted conspire should create a copy trigger whose context has \
+             additional_cost_paid = true"
         );
     }
 

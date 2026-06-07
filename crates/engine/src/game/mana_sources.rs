@@ -598,10 +598,20 @@ pub fn display_land_mana_pips(
             // permanents you control".
             ManaProduction::DistinctColorsAmongPermanents { filter } => {
                 let colors = super::effects::mana::distinct_colors_among_permanents(
-                    state, None, controller, object_id, filter,
+                    state, None, object_id, filter,
                 );
                 if !colors.is_empty() {
                     push(&mut pips, ManaPip::CombinationOfColors(colors));
+                }
+            }
+            // CR 106.1: Determine distinct colors among matching permanents to display
+            // pips.
+            ManaProduction::AnyOneColorAmongPermanents { filter, .. } => {
+                let colors = super::effects::mana::distinct_colors_among_permanents(
+                    state, None, object_id, filter,
+                );
+                if !colors.is_empty() {
+                    push(&mut pips, ManaPip::OneOfColors(colors));
                 }
             }
             // CR 603.7c + CR 106.3: Resolves only inside a TapsForMana
@@ -1151,12 +1161,17 @@ fn mana_options_from_production(
         // you control". Delegates to the shared resolver so the cost-payment path
         // and direct activation see identical option sets.
         ManaProduction::DistinctColorsAmongPermanents { filter } => {
-            super::effects::mana::distinct_colors_among_permanents(
-                state, None, controller, object_id, filter,
-            )
-            .iter()
-            .map(mana_color_to_type)
-            .collect()
+            super::effects::mana::distinct_colors_among_permanents(state, None, object_id, filter)
+                .iter()
+                .map(mana_color_to_type)
+                .collect()
+        }
+        // CR 106.1: Determine available mana options from colors among matching permanents.
+        ManaProduction::AnyOneColorAmongPermanents { filter, .. } => {
+            super::effects::mana::distinct_colors_among_permanents(state, None, object_id, filter)
+                .iter()
+                .map(mana_color_to_type)
+                .collect()
         }
         // CR 603.7c + CR 106.3: "add one mana of any type that land produced"
         // resolves only inside a triggered ability (TapsForMana). For the mana

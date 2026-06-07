@@ -727,6 +727,14 @@
       "dontPay": "No pagar",
       "takeEffect": "Aceptar el efecto"
     },
+    "spliceOffer": {
+      "title": "¿Empalmar con arcano?",
+      "subtitle": "Elige una carta para revelar y empalmar en este hechizo, o lánzalo sin empalmar.",
+      "spliceCard": "Empalmar {{name}}",
+      "decline": "No empalmar",
+      "declineDescription": "Lanza el hechizo sin añadir el texto de otra carta.",
+      "unknownCard": "Carta #{{id}}"
+    },
     "activationCost": {
       "title": "Elegir coste de activación"
     },
@@ -1235,9 +1243,11 @@
   "cascadeChoice": {
     "cascadeEyebrow": "Cascada",
     "discoverEyebrow": "Descubrir",
+    "rippleEyebrow": "Ripple",
     "title": "¿Lanzar {{name}}?",
     "subtitleCascade": "Cascada exilió {{name}} (valor de maná inferior a {{sourceMv}}). Lánzala sin pagar su coste de maná, o rechaza y baraja las {{total}} cartas exiliadas hacia el fondo de tu biblioteca.",
     "subtitleDiscover": "Descubrir exilió {{name}}. Lánzala sin pagar su coste de maná, o ponla en tu mano y baraja las otras {{missCount}} cartas exiliadas hacia el fondo de tu biblioteca.",
+    "subtitleRipple": "Ripple reveló {{name}}. Lánzala sin pagar su coste de maná, o rehúsa y pon las {{total}} cartas reveladas en el fondo de tu biblioteca en orden aleatorio.",
     "castNamed": "Lanzar {{name}}",
     "castSuffix": "(sin pagar su coste de maná)",
     "putIntoHand": "Poner en la mano",
@@ -1268,6 +1278,7 @@
     "variantForetell": "Lanzar desde Predecir",
     "variantOverload": "Lanzar con Sobrecargar",
     "variantBestow": "Lanzar con Otorgar",
+    "variantFuse": "Lanzar con Fusión",
     "variantFallback": "Lanzar con {{type}}"
   },
   "categoryChoice": {
@@ -1436,6 +1447,9 @@
   "proliferate": {
     "proliferateTitle": "Proliferar",
     "proliferateSubtitle": "Elige cualquier número de permanentes y jugadores con contadores. Cada objetivo elegido recibe un contador más de cada tipo que ya tenga.",
+    "timeTravelTitle": "Viaje en el Tiempo",
+    "timeTravelRemoveSubtitle": "Elige cualquier número de objetos elegibles de los que retirar un contador de tiempo.",
+    "timeTravelAddSubtitle": "Elige cualquier número de objetos elegibles restantes a los que añadir un contador de tiempo.",
     "chooseObjectsTitle": "Elegir permanentes",
     "chooseObjectsSubtitle": "Elige cualquier número de permanentes. Pagas un coste por cada uno elegido.",
     "selectAll": "Todos",

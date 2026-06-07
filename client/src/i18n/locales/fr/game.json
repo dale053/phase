@@ -727,6 +727,14 @@
       "dontPay": "Ne pas payer",
       "takeEffect": "Subir l'effet"
     },
+    "spliceOffer": {
+      "title": "Imprégner d’arcane ?",
+      "subtitle": "Choisissez une carte à révéler et à imprégner dans ce sort, ou lancez-le sans imprégnation.",
+      "spliceCard": "Imprégner {{name}}",
+      "decline": "Ne pas imprégner",
+      "declineDescription": "Lancez le sort sans ajouter le texte d’une autre carte.",
+      "unknownCard": "Carte #{{id}}"
+    },
     "activationCost": {
       "title": "Choisir le coût d'activation"
     },
@@ -1235,9 +1243,11 @@
   "cascadeChoice": {
     "cascadeEyebrow": "Cascade",
     "discoverEyebrow": "Découverte",
+    "rippleEyebrow": "Ripple",
     "title": "Lancer {{name}} ?",
     "subtitleCascade": "Cascade a exilé {{name}} (valeur de mana inférieure à {{sourceMv}}). Lancez-le sans payer son coût de mana, ou refusez et mélangez les {{total}} cartes exilées au-dessous de votre bibliothèque.",
     "subtitleDiscover": "Découverte a exilé {{name}}. Lancez-le sans payer son coût de mana, ou mettez-le dans votre main et mélangez les {{missCount}} autres cartes exilées au-dessous de votre bibliothèque.",
+    "subtitleRipple": "Ripple a révélé {{name}}. Lancez-le sans payer son coût de mana, ou refusez et placez les {{total}} cartes révélées au-dessous de votre bibliothèque dans un ordre aléatoire.",
     "castNamed": "Lancer {{name}}",
     "castSuffix": "(sans payer son coût de mana)",
     "putIntoHand": "Mettre en main",
@@ -1268,6 +1278,7 @@
     "variantForetell": "Lancer depuis la Prédiction",
     "variantOverload": "Lancer avec Surcharge",
     "variantBestow": "Lancer avec Don",
+    "variantFuse": "Lancer avec Fusion",
     "variantFallback": "Lancer avec {{type}}"
   },
   "categoryChoice": {
@@ -1436,6 +1447,9 @@
   "proliferate": {
     "proliferateTitle": "Prolifération",
     "proliferateSubtitle": "Choisissez n'importe quel nombre de permanents et de joueurs ayant des marqueurs. Chaque cible choisie reçoit un marqueur de plus de chaque sorte déjà présente.",
+    "timeTravelTitle": "Voyage temporel",
+    "timeTravelRemoveSubtitle": "Choisissez n'importe quel nombre d'objets éligibles auxquels retirer un marqueur temps.",
+    "timeTravelAddSubtitle": "Choisissez n'importe quel nombre d'objets éligibles restants auxquels ajouter un marqueur temps.",
     "chooseObjectsTitle": "Choisir des permanents",
     "chooseObjectsSubtitle": "Choisissez n'importe quel nombre de permanents. Vous payez un coût pour chacun choisi.",
     "selectAll": "Tout",

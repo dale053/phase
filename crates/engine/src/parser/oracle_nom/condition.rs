@@ -915,6 +915,9 @@ fn parse_source_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         // Must precede `parse_source_is_type` so the specific "is attached to a creature"
         // predicate wins over generic "is <type>" dispatch.
         parse_source_attached_to_creature,
+        // CR 303.4 + CR 604.1 + CR 613.1g: "~ is enchanted by exactly N
+        // Aura(s)" / "N or more Auras" (Timber Paladin tiered static P/T gates).
+        parse_source_enchanted_by_aura_count,
         // CR 122.1: "<subject> has <quantity> <counter_type> counter(s) on it"
         // — covers Unleash/Outlast/Renown bodies, Primordial Hydra's trample gate,
         // and every "as long as it has …" counter-comparator static.
@@ -946,6 +949,39 @@ fn parse_source_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         parse_source_power_toughness_condition,
     ))
     .parse(input)
+}
+
+/// CR 303.4: Parse "<subject> is enchanted by exactly N Aura(s)" or
+/// "N or more Auras" into an `ObjectCount` + `AttachedToSource` gate.
+fn parse_source_enchanted_by_aura_count(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = parse_source_subject(input)?;
+    let (rest, _) = tag("is enchanted by ").parse(rest)?;
+    let (rest, (comparator, n)) = alt((
+        map((tag("exactly "), parse_number), |(_, n)| {
+            (Comparator::EQ, n)
+        }),
+        map(parse_ge_threshold, |n| (Comparator::GE, n)),
+    ))
+    .parse(rest)?;
+    let (rest, _) = alt((tag("Auras"), tag("Aura"))).parse(rest.trim_start())?;
+    let aura_filter = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![
+            TypeFilter::Enchantment,
+            TypeFilter::Subtype("Aura".to_string()),
+        ],
+        controller: None,
+        properties: vec![FilterProp::AttachedToSource],
+    });
+    Ok((
+        rest,
+        make_quantity_comparison(
+            QuantityRef::ObjectCount {
+                filter: aura_filter,
+            },
+            comparator,
+            n,
+        ),
+    ))
 }
 
 /// CR 122.1: Parse "<subject> has <quantity> [type] counter[s] on it" into a
@@ -2916,7 +2952,7 @@ fn parse_youve_life_history_condition(input: &str) -> OracleResult<'_, StaticCon
 fn parse_youve_combat_history_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     // "you've attacked this turn" / "you've attacked with a creature this turn"
     value(
-        make_quantity_ge(QuantityRef::AttackedThisTurn, 1),
+        make_quantity_ge(QuantityRef::AttackedThisTurn { filter: None }, 1),
         alt((
             tag("attacked with a creature this turn"),
             tag("attacked this turn"),
@@ -3259,7 +3295,7 @@ fn parse_combat_history_condition(input: &str) -> OracleResult<'_, StaticConditi
     alt((
         // "you attacked this turn" (without "you've" prefix)
         value(
-            make_quantity_ge(QuantityRef::AttackedThisTurn, 1),
+            make_quantity_ge(QuantityRef::AttackedThisTurn { filter: None }, 1),
             alt((
                 tag("you attacked with a creature this turn"),
                 tag("you attacked this turn"),
@@ -4383,7 +4419,11 @@ fn parse_you_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
             tag("lose life this turn"),
         ),
         value(
-            make_quantity_comparison(QuantityRef::AttackedThisTurn, Comparator::EQ, 0),
+            make_quantity_comparison(
+                QuantityRef::AttackedThisTurn { filter: None },
+                Comparator::EQ,
+                0,
+            ),
             tag("attack this turn"),
         ),
         // CR 606.1 + CR 603.4: "you didn't activate a loyalty ability of a
@@ -6707,6 +6747,48 @@ mod tests {
         let (rest, c) = parse_inner_condition("enchanted creature is attacking").unwrap();
         assert_eq!(rest, "");
         assert_eq!(c, StaticCondition::SourceIsAttacking);
+    }
+
+    #[test]
+    fn test_source_enchanted_by_plural_aura_count() {
+        let (rest, c) = parse_inner_condition("~ is enchanted by 3 or more Auras").unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            comparator, rhs, ..
+        } = c
+        else {
+            panic!("expected QuantityComparison, got {c:?}");
+        };
+        assert_eq!(comparator, Comparator::GE);
+        assert_eq!(rhs, QuantityExpr::Fixed { value: 3 });
+    }
+
+    #[test]
+    fn test_source_enchanted_by_exactly_one_aura() {
+        let (rest, c) = parse_inner_condition("~ is enchanted by exactly one Aura").unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            comparator, rhs, ..
+        } = c
+        else {
+            panic!("expected QuantityComparison, got {c:?}");
+        };
+        assert_eq!(comparator, Comparator::EQ);
+        assert_eq!(rhs, QuantityExpr::Fixed { value: 1 });
+    }
+
+    #[test]
+    fn test_source_enchanted_by_exactly_two_auras() {
+        let (rest, c) = parse_inner_condition("~ is enchanted by exactly two Auras").unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            comparator, rhs, ..
+        } = c
+        else {
+            panic!("expected QuantityComparison, got {c:?}");
+        };
+        assert_eq!(comparator, Comparator::EQ);
+        assert_eq!(rhs, QuantityExpr::Fixed { value: 2 });
     }
 
     #[test]
@@ -9046,7 +9128,7 @@ mod tests {
                 assert!(matches!(
                     lhs,
                     QuantityExpr::Ref {
-                        qty: QuantityRef::AttackedThisTurn
+                        qty: QuantityRef::AttackedThisTurn { filter: None }
                     }
                 ));
                 assert_eq!(comparator, Comparator::EQ);

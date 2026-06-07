@@ -2,7 +2,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::char;
-use nom::combinator::{all_consuming, map, opt, rest as nom_rest, value};
+use nom::combinator::{all_consuming, map, map_opt, not, opt, rest as nom_rest, value};
 use nom::multi::many1;
 use nom::sequence::{delimited, preceded, separated_pair, terminated};
 use nom::Parser;
@@ -39,6 +39,30 @@ where
 pub(super) fn try_parse_for_each_color_mana_public(text: &str) -> Option<Effect> {
     let lower = text.to_lowercase();
     try_parse_for_each_color_mana(text, &lower)
+}
+
+/// CR 106.1 + CR 109.1: Parse the permanent filter tail of
+/// "mana of any color among [type-phrase]" (Mox Amber class).
+fn try_parse_any_color_among_permanents_filter(
+    after_color: &str,
+    after_lower: &str,
+) -> Option<TargetFilter> {
+    let trimmed_lower = after_lower.trim().trim_end_matches('.').trim();
+    let (rest, _) = tag::<_, _, OracleError<'_>>("among ")
+        .parse(trimmed_lower)
+        .ok()?;
+    let type_lower = rest.trim();
+    if type_lower.is_empty() {
+        return None;
+    }
+    let prefix_len = trimmed_lower.len() - rest.len();
+    let trimmed_original = after_color.trim().trim_end_matches('.').trim();
+    let type_text = trimmed_original.get(prefix_len..)?.trim();
+    let (filter, remainder) = parse_type_phrase(type_text);
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+        return None;
+    }
+    Some(filter)
 }
 
 /// CR 106.1 + CR 109.1: Recognize "For each color among [type-phrase], add one
@@ -320,6 +344,20 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
                 ManaProduction::ChoiceAmongExiledColors {
                     source: LinkedExileScope::ThisObject,
                 }
+            } else if let Some(filter) =
+                try_parse_any_color_among_permanents_filter(after_color.trim(), &after_lower)
+            {
+                ManaProduction::AnyOneColorAmongPermanents {
+                    count,
+                    filter,
+                    contribution,
+                }
+            } else if nom_on_lower(after_color.trim(), &after_lower, |i| {
+                value((), tag("among ")).parse(i)
+            })
+            .is_some()
+            {
+                return None;
             } else if nom_on_lower(after_color.trim(), &after_lower, |i| {
                 // CR 903.4 + CR 903.4f: "any color in your commander('s/s')
                 // color identity" — Path of Ancestry, Study Hall. Colors
@@ -1045,13 +1083,37 @@ fn scan_mana_production_type(
                     tag("mana of any color among the exiled cards"),
                 )),
             ),
+            // CR 106.1 + CR 109.1: Parse "mana of any [one] color among [permanents]"
+            map_opt(
+                preceded(
+                    alt((
+                        tag::<_, _, OracleError<'_>>("mana of any one color among "),
+                        tag("mana of any color among "),
+                    )),
+                    nom_rest,
+                ),
+                |type_text: &str| {
+                    let (filter, remainder) = parse_type_phrase(type_text.trim());
+                    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+                        return None;
+                    }
+                    Some(ManaProduction::AnyOneColorAmongPermanents {
+                        count: count.clone(),
+                        filter,
+                        contribution,
+                    })
+                },
+            ),
             value(
                 ManaProduction::AnyOneColor {
                     count: count.clone(),
                     color_options: all_mana_colors(),
                     contribution,
                 },
-                alt((tag("mana of any one color"), tag("mana of any color"))),
+                terminated(
+                    alt((tag("mana of any one color"), tag("mana of any color"))),
+                    not(tag(" among ")),
+                ),
             ),
             value(
                 ManaProduction::AnyCombination {

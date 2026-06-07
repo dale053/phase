@@ -1131,6 +1131,21 @@ pub enum ManaProduction {
     /// control, add one mana of that color." Mirrors the structure of
     /// `QuantityRef::DistinctColorsAmongPermanents`.
     DistinctColorsAmongPermanents { filter: TargetFilter },
+    /// CR 106.1 + CR 109.1: Produce N mana of one chosen color from the distinct
+    /// colors present among permanents matching `filter`. Mox Amber class:
+    /// "{T}: Add one mana of any color among legendary creatures and
+    /// planeswalkers you control." Colors resolve dynamically at activation
+    /// time; CR 106.5 applies when no matching permanent is colored.
+    AnyOneColorAmongPermanents {
+        #[serde(default = "default_quantity_one")]
+        count: QuantityExpr,
+        filter: TargetFilter,
+        #[serde(
+            default = "default_mana_contribution",
+            skip_serializing_if = "is_default_mana_contribution"
+        )]
+        contribution: ManaContribution,
+    },
     /// CR 603.7c + CR 106.3: Produce one mana of the same type as the mana
     /// produced by the triggering `ManaAdded` event. Used by `TapsForMana`
     /// triggers of the form "add one mana of any type that land produced"
@@ -1235,6 +1250,13 @@ impl<'de> serde::Deserialize<'de> for ManaProduction {
                     DistinctColorsAmongPermanents {
                         filter: TargetFilter,
                     },
+                    AnyOneColorAmongPermanents {
+                        #[serde(default = "default_quantity_one")]
+                        count: QuantityExpr,
+                        filter: TargetFilter,
+                        #[serde(default = "default_mana_contribution")]
+                        contribution: ManaContribution,
+                    },
                     TriggerEventManaType,
                 }
                 let helper: ManaProductionHelper =
@@ -1304,6 +1326,15 @@ impl<'de> serde::Deserialize<'de> for ManaProduction {
                     ManaProductionHelper::DistinctColorsAmongPermanents { filter } => {
                         ManaProduction::DistinctColorsAmongPermanents { filter }
                     }
+                    ManaProductionHelper::AnyOneColorAmongPermanents {
+                        count,
+                        filter,
+                        contribution,
+                    } => ManaProduction::AnyOneColorAmongPermanents {
+                        count,
+                        filter,
+                        contribution,
+                    },
                     ManaProductionHelper::TriggerEventManaType => {
                         ManaProduction::TriggerEventManaType
                     }
@@ -1702,13 +1733,17 @@ pub enum CastPermissionConstraint {
 /// and `RemainExiled` — the marker still arms the CR 608.2g timing bypass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolutionCastCleanup {
-    /// Cards exiled during the dig that were not the hit; they go to the
-    /// bottom of the library in a random order on resolution completion.
+    /// Cards exiled/revealed during the dig that were not the hit.
     /// Empty for Suspend's self-free-cast (no dig).
     pub exiled_misses: Vec<super::identifiers::ObjectId>,
     /// Where the hit goes if the player declines or the cast-time MV check
     /// rejects the cast.
     pub reject_action: ResolutionMvRejectAction,
+    /// What happens after the hit is successfully cast. Cascade/Discover bottom
+    /// their misses immediately; Ripple may need to offer additional same-named
+    /// cards from the same reveal first (CR 702.60a).
+    #[serde(default)]
+    pub success_action: ResolutionCastSuccessAction,
 }
 
 /// CR 608.2g: Disposition of a during-resolution card that is not cast.
@@ -1724,6 +1759,20 @@ pub enum ResolutionMvRejectAction {
     /// reached if a future during-resolution free cast adds a constraint. "If
     /// you don't [cast it], it remains exiled" — the card stays in exile.
     RemainExiled,
+}
+
+/// CR 608.2g: Follow-up after a during-resolution cast succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResolutionCastSuccessAction {
+    /// Cascade/Discover: cast hit is gone, so bottom the dig misses now.
+    #[default]
+    BottomMisses,
+    /// CR 702.60a: Ripple can cast any number of same-named revealed cards. Keep
+    /// offering the remaining hits before bottoming the non-hit revealed cards.
+    RippleOfferRemaining {
+        remaining_hits: Vec<super::identifiers::ObjectId>,
+    },
 }
 
 /// When a delayed triggered ability fires (CR 603.7).
@@ -2306,6 +2355,10 @@ pub enum FilterProp {
     /// "historic card" subjects, mirroring `FilterProp::Modified` for
     /// CR 700.9's "modified" predicate.
     Historic,
+    /// CR 700.6: Matches objects that are not historic (negation of `Historic`).
+    /// Used for "nonhistoric" / "not historic" in compound type phrases such as
+    /// Desynchronization's "nonland, nonhistoric permanent".
+    NotHistoric,
     /// Matches objects whose name differs from all objects matching the inner filter
     /// that the evaluating controller controls on the battlefield.
     /// Used for "with a different name than each [type] you control" (e.g. Light-Paws).
@@ -3306,10 +3359,16 @@ pub enum QuantityRef {
     /// A number chosen as the source entered the battlefield (e.g., Talion, the Kindly Lord).
     /// Resolved from the source object's `ChosenAttribute::Number`.
     ChosenNumber,
-    /// CR 508.1a: Number of creatures the controller attacked with this turn.
-    /// Used for "if you attacked this turn" and "for each creature you attacked
-    /// with this turn" patterns.
-    AttackedThisTurn,
+    /// CR 508.1a: Number of creatures the controller attacked with this turn,
+    /// optionally narrowed by `filter` (e.g. "attacked with a token / a
+    /// commander / a Wolf"). `None` counts all attacking creatures (the bare
+    /// "if you attacked this turn" / "for each creature you attacked with this
+    /// turn" patterns); `Some(filter)` counts only this-turn attackers matching
+    /// `filter`, resolved against `state.creatures_attacked_this_turn`.
+    AttackedThisTurn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<TargetFilter>,
+    },
     /// CR 603.4: Whether the controller descended this turn (permanent card entered graveyard).
     DescendedThisTurn,
     /// CR 606.1 + CR 603.4: Number of loyalty abilities the scoped player has
@@ -4962,7 +5021,11 @@ impl AbilityCost {
         match self {
             AbilityCost::Mana { .. }
             | AbilityCost::PayLife { .. }
-            | AbilityCost::Sacrifice { .. } => true,
+            | AbilityCost::Sacrifice { .. }
+            // CR 702.24a + CR 118.12: Discard's per-counter-scaled count is
+            // folded by `expand_per_counter` and paid by the `remaining`
+            // re-prompt loop in `handle_unless_payment` end-to-end.
+            | AbilityCost::Discard { .. } => true,
             // CR 118.12a: OneOf at the base must be a disjunction of mana
             // costs; mixed-shape disjunctions are not yet expanded into a
             // payable per-counter form.
@@ -7143,6 +7206,13 @@ pub enum Effect {
     /// time (the cascade spell is on the stack when cascade resolves per CR 702.85a),
     /// so no threshold parameter is stored on the variant itself.
     Cascade,
+    /// CR 702.60a: Ripple N — when you cast this spell, reveal the top N cards of
+    /// your library; you may cast any with the same name as this spell without
+    /// paying their mana cost, then put the rest on the bottom.
+    /// The source spell's name is read from `ability.source_id` at resolve time.
+    Ripple {
+        count: u32,
+    },
     /// CR 702.94a: Miracle trigger resolution — offers the player the chance to
     /// cast the source card from hand for its miracle cost. Carries the cost so
     /// the resolution handler can populate `WaitingFor::CastOffer` (Miracle).
@@ -7376,7 +7446,7 @@ pub enum Effect {
     },
     /// CR 701.48a: Learn — you may discard a card to draw a card, or get a Lesson from outside the game.
     Learn,
-    /// CR 702.166a: Forage — exile three cards from your graveyard or sacrifice a Food.
+    /// CR 701.61a: Forage — exile three cards from your graveyard or sacrifice a Food.
     Forage,
     /// CR 702.163a: Collect evidence N — exile cards with total mana value N or more from graveyard.
     CollectEvidence {
@@ -8325,6 +8395,7 @@ impl Effect {
             | Effect::RevealUntil { .. }
             | Effect::Discover { .. }
             | Effect::Cascade
+            | Effect::Ripple { .. }
             | Effect::MiracleCast { .. }
             | Effect::MadnessCast { .. }
             | Effect::GiftDelivery { .. }
@@ -8528,6 +8599,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::RevealUntil { .. } => "RevealUntil",
         Effect::Discover { .. } => "Discover",
         Effect::Cascade => "Cascade",
+        Effect::Ripple { .. } => "Ripple",
         Effect::MiracleCast { .. } => "MiracleCast",
         Effect::MadnessCast { .. } => "MadnessCast",
         Effect::PutAtLibraryPosition { .. } => "PutAtLibraryPosition",
@@ -8718,6 +8790,7 @@ pub enum EffectKind {
     RevealUntil,
     Discover,
     Cascade,
+    Ripple,
     MiracleCast,
     MadnessCast,
     PutAtLibraryPosition,
@@ -8913,6 +8986,7 @@ impl From<&Effect> for EffectKind {
             Effect::RevealUntil { .. } => EffectKind::RevealUntil,
             Effect::Discover { .. } => EffectKind::Discover,
             Effect::Cascade => EffectKind::Cascade,
+            Effect::Ripple { .. } => EffectKind::Ripple,
             Effect::MiracleCast { .. } => EffectKind::MiracleCast,
             Effect::MadnessCast { .. } => EffectKind::MadnessCast,
             Effect::PutAtLibraryPosition { .. } => EffectKind::PutAtLibraryPosition,
@@ -11499,8 +11573,10 @@ pub enum CombatDamageScope {
 }
 
 /// CR 614.1a: Which player(s) a replacement effect applies to, scoped relative
-/// to the replacement source's controller. `valid_player: None` keeps the
-/// controller-only default; `Some(You)` is the explicit controller scope,
+/// to the replacement source player. For permanents/spells this is the source's
+/// controller; for cards outside the battlefield/stack, CR 109.4 + CR 108.4a
+/// make this the owner. `valid_player: None` keeps the source-player default;
+/// `Some(You)` is the explicit source-player scope,
 /// `Some(Opponent)` an opponent-scoped replacement (Tainted Remedy), and
 /// `Some(AnyPlayer)` a global all-players replacement (Rain of Gore).
 ///
@@ -11509,9 +11585,9 @@ pub enum CombatDamageScope {
 /// `valid_player` values (`"You"` / `"Opponent"`) deserialize unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplacementPlayerScope {
-    /// The replacement source's controller.
+    /// The replacement source player.
     You,
-    /// Any opponent of the replacement source's controller.
+    /// Any opponent of the replacement source player.
     Opponent,
     /// Every player in the game, regardless of who controls the source.
     AnyPlayer,
@@ -11621,7 +11697,7 @@ pub struct ReplacementDefinition {
     /// CR 614.1a: Restricts which player this replacement applies to.
     /// "an opponent would gain life" → Some(Opponent); "a spell or ability would
     /// cause its controller to gain life" (Rain of Gore) → Some(AnyPlayer).
-    /// None = applies to the replacement source's controller only.
+    /// None = applies to the replacement source player only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_player: Option<ReplacementPlayerScope>,
     /// Marks this replacement as consumed (one-shot). Skipped by find_applicable_replacements.
@@ -12986,7 +13062,7 @@ mod tests {
             ],
         }
         .supports_cumulative_upkeep_payment());
-        assert!(!AbilityCost::Discard {
+        assert!(AbilityCost::Discard {
             count: QuantityExpr::Fixed { value: 1 },
             filter: None,
             random: false,

@@ -727,6 +727,14 @@
       "dontPay": "Non pagare",
       "takeEffect": "Subisci l'effetto"
     },
+    "spliceOffer": {
+      "title": "Unire ad Arcano?",
+      "subtitle": "Scegli una carta da rivelare e unire a questa magia, oppure lanciala senza unire.",
+      "spliceCard": "Unisci {{name}}",
+      "decline": "Non unire",
+      "declineDescription": "Lancia la magia senza aggiungere il testo di un’altra carta.",
+      "unknownCard": "Carta #{{id}}"
+    },
     "activationCost": {
       "title": "Scegli il costo di attivazione"
     },
@@ -1235,9 +1243,11 @@
   "cascadeChoice": {
     "cascadeEyebrow": "Cascata",
     "discoverEyebrow": "Scoperta",
+    "rippleEyebrow": "Ripple",
     "title": "Lanciare {{name}}?",
     "subtitleCascade": "Cascata ha esiliato {{name}} (valore di mana sotto {{sourceMv}}). Lanciala senza pagare il suo costo di mana, o rifiuta e rimescola tutte le {{total}} carte esiliate in fondo al tuo grimorio.",
     "subtitleDiscover": "Scoperta ha esiliato {{name}}. Lanciala senza pagare il suo costo di mana, o mettila nella tua mano e rimescola le altre {{missCount}} carte esiliate in fondo al tuo grimorio.",
+    "subtitleRipple": "Ripple ha rivelato {{name}}. Lanciala senza pagare il suo costo di mana, oppure rifiuta e metti tutte le {{total}} carte rivelate in fondo al tuo grimorio in ordine casuale.",
     "castNamed": "Lancia {{name}}",
     "castSuffix": "(senza pagare il suo costo di mana)",
     "putIntoHand": "Metti in mano",
@@ -1268,6 +1278,7 @@
     "variantForetell": "Lancia da Predire",
     "variantOverload": "Lancia con Sovraccarico",
     "variantBestow": "Lancia con Conferire",
+    "variantFuse": "Lancia con Fusione",
     "variantFallback": "Lancia con {{type}}"
   },
   "categoryChoice": {
@@ -1436,6 +1447,9 @@
   "proliferate": {
     "proliferateTitle": "Proliferare",
     "proliferateSubtitle": "Scegli un numero qualsiasi di permanenti e giocatori con segnalini. Ogni bersaglio scelto riceve un altro segnalino di ciascun tipo già presente.",
+    "timeTravelTitle": "Viaggio Temporale",
+    "timeTravelRemoveSubtitle": "Scegli un numero qualsiasi di oggetti idonei da cui rimuovere un segnalino tempo.",
+    "timeTravelAddSubtitle": "Scegli un numero qualsiasi di oggetti idonei rimanenti a cui aggiungere un segnalino tempo.",
     "chooseObjectsTitle": "Scegli permanenti",
     "chooseObjectsSubtitle": "Scegli un numero qualsiasi di permanenti. Paghi un costo per ciascuno scelto.",
     "selectAll": "Tutti",

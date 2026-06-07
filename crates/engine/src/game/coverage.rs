@@ -612,6 +612,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::Modified => parts.push("modified".into()),
             // CR 700.6
             FilterProp::Historic => parts.push("historic".into()),
+            FilterProp::NotHistoric => parts.push("nonhistoric".into()),
             // CR 903.3d
             FilterProp::IsCommander => parts.push("commander".into()),
             FilterProp::ToughnessGTPower => parts.push("toughness > power".into()),
@@ -1184,7 +1185,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         }
         QuantityRef::TurnsTaken => "turns taken".into(),
         QuantityRef::ChosenNumber => "chosen number".into(),
-        QuantityRef::AttackedThisTurn => "attacked this turn".into(),
+        QuantityRef::AttackedThisTurn { .. } => "attacked this turn".into(),
         QuantityRef::DescendedThisTurn => "descended this turn".into(),
         QuantityRef::LoyaltyAbilitiesActivatedThisTurn { player } => {
             format!("loyalty abilities activated this turn ({player:?})")
@@ -1432,6 +1433,13 @@ fn fmt_mana_production(mp: &ManaProduction) -> String {
         }
         ManaProduction::DistinctColorsAmongPermanents { filter } => {
             format!("1 of each color among {}", fmt_target(filter))
+        }
+        ManaProduction::AnyOneColorAmongPermanents { count, filter, .. } => {
+            format!(
+                "1 of any color among {} x{}",
+                fmt_target(filter),
+                fmt_quantity(count)
+            )
         }
         ManaProduction::TriggerEventManaType => "1 of the triggering mana's type".to_string(),
     }
@@ -2289,6 +2297,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         // CR 702.85a: Cascade takes no parameters — source MV is read from the
         // stack object at resolution time.
         Effect::Cascade => {}
+        Effect::Ripple { .. } => {}
         // CR 702.94a: MiracleCast is an internal engine effect, not parsed from Oracle text.
         Effect::MiracleCast { .. } => {}
         // CR 702.35a: MadnessCast is synthesized from Keyword::Madness.
@@ -5422,7 +5431,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::DamageDealtThisTurn { .. } => ("DamageDealtThisTurn", Handled),
         QuantityRef::TurnsTaken => ("TurnsTaken", Unhandled),
         QuantityRef::ChosenNumber => ("ChosenNumber", Unhandled),
-        QuantityRef::AttackedThisTurn => ("AttackedThisTurn", Handled),
+        QuantityRef::AttackedThisTurn { .. } => ("AttackedThisTurn", Handled),
         QuantityRef::DescendedThisTurn => ("DescendedThisTurn", Unhandled),
         QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. } => {
             ("LoyaltyAbilitiesActivatedThisTurn", Handled)
@@ -9976,13 +9985,15 @@ mod tests {
 
     #[test]
     fn unsupported_cumulative_upkeep_cost_counts_as_keyword_gap() {
+        // CR 702.24a: Exile-base cumulative upkeep is still unsupported by the
+        // unless-payment pipeline (Discard became supported once the per-counter
+        // discard payment chain landed), so it remains a coverage gap.
         let mut face = make_face();
         face.keywords
-            .push(Keyword::CumulativeUpkeep(AbilityCost::Discard {
-                count: QuantityExpr::Fixed { value: 1 },
+            .push(Keyword::CumulativeUpkeep(AbilityCost::Exile {
+                count: 1,
+                zone: None,
                 filter: None,
-                random: false,
-                self_ref: false,
             }));
 
         let gaps = card_face_gaps(&face);
