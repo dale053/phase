@@ -341,6 +341,9 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
         GameAction::ChooseOption { choice, .. } => {
             bound_string("ChooseOption.choice", choice)?;
         }
+        GameAction::SubmitSpellbookDraft { card } => {
+            bound_string("SubmitSpellbookDraft.card", card)?;
+        }
         GameAction::Debug(debug_action) => {
             guard_debug_action_payload(debug_action)?;
         }
@@ -405,6 +408,7 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
         | GameAction::DiscoverChoice { .. }
         | GameAction::CascadeChoice { .. }
         | GameAction::RippleChoice { .. }
+        | GameAction::FreeCastWindowChoice { .. }
         | GameAction::ChooseTopOrBottom { .. }
         // CR 702.140c: mutate merge side carries a single typed enum — nothing
         // client-controlled to bound.

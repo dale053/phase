@@ -625,7 +625,10 @@ fn parse_search_target_player(lower: &str) -> Option<TargetFilter> {
                     TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
                     tag("target opponent's "),
                 ),
-                value(TargetFilter::Player, tag("target player's ")),
+                value(
+                    TargetFilter::Typed(TypedFilter::default()),
+                    tag("target player's "),
+                ),
                 value(
                     TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
                     tag("an opponent's "),
@@ -2812,7 +2815,10 @@ mod tests {
             &mut ParseContext::default(),
         );
         assert!(details.target_player.is_some());
-        assert_eq!(details.target_player.unwrap(), TargetFilter::Player);
+        let TargetFilter::Typed(target_player) = details.target_player.unwrap() else {
+            panic!("expected typed target-player library owner");
+        };
+        assert_eq!(target_player.controller, None);
     }
 
     #[test]
@@ -2824,6 +2830,15 @@ mod tests {
         );
         assert!(details.target_player.is_some());
         assert_eq!(details.count, QuantityExpr::Fixed { value: 3 });
+    }
+
+    #[test]
+    fn search_that_players_library_without_context_does_not_surface_player_target() {
+        let details = parse_search_library_details(
+            "search that player's library for a card with the same name as that permanent",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(details.target_player, None);
     }
 
     #[test]

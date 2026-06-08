@@ -10,7 +10,7 @@ use crate::types::ability::{
 };
 use crate::types::card::{LayoutKind, PrintedCardRef, TokenImageRef};
 use crate::types::card_type::{CardType, CoreType};
-use crate::types::counter::CounterType;
+use crate::types::counter::{counter_map_serde, CounterType};
 use crate::types::definitions::Definitions;
 use crate::types::game_state::{AttackDeclarationRecord, GameState, LKISnapshot};
 use crate::types::identifiers::{CardId, ObjectId};
@@ -334,6 +334,7 @@ pub struct GameObject {
     pub pair_controller: Option<PlayerId>,
 
     // Counters
+    #[serde(with = "counter_map_serde")]
     pub counters: HashMap<CounterType, u32>,
 
     // Characteristics
@@ -386,6 +387,12 @@ pub struct GameObject {
     /// metadata copied from `CardFace`; game rules never read it directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_related_token_ids: Vec<String>,
+
+    /// Alchemy spellbook — the fixed list of card names this object can draft
+    /// from, copied from `CardFace::metadata.spellbook`. Read by the
+    /// `DraftFromSpellbook` resolver to present the choice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spellbook: Vec<String>,
 
     // Back face data for double-faced cards (DFCs)
     pub back_face: Option<BackFaceData>,
@@ -771,6 +778,17 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_from_zone: Option<Zone>,
 
+    /// CR 614.1a + CR 608.2n: When true, this spell is exiled instead of being
+    /// put into its owner's graveyard any time it would leave the stack
+    /// ("if those spells would be put into your graveyard, exile them instead").
+    /// Set on a spell cast via `Effect::FreeCastFromZones` with the exile rider
+    /// (Invoke Calamity); read by the stack-resolution router. Unlike the
+    /// keyword-driven `CastingVariant` exile riders, this is a per-object marker
+    /// so it survives the during-resolution cast finalize regardless of the
+    /// spell's origin zone or casting variant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exile_from_stack_instead_of_graveyard: bool,
+
     /// CR 305.1 + CR 603.4: Transient field tracking the zone a land was played
     /// from. Consumed by ETB trigger processing for conditions like "without
     /// being played"; permanents put onto the battlefield by effects leave this
@@ -906,6 +924,9 @@ impl GameObject {
         if self.base_loyalty.is_none() && self.loyalty.is_some() {
             self.base_loyalty = self.loyalty;
         }
+        if self.base_name.is_empty() && !self.name.is_empty() {
+            self.base_name = self.name.clone();
+        }
         if self.base_card_types == CardType::default() && self.card_types != CardType::default() {
             self.base_card_types = self.card_types.clone();
         }
@@ -981,6 +1002,7 @@ impl GameObject {
             base_printed_ref: None,
             token_image_ref: None,
             source_related_token_ids: Vec::new(),
+            spellbook: Vec::new(),
             back_face: None,
             specialize_faces: None,
             specialized_color: None,
@@ -1053,6 +1075,7 @@ impl GameObject {
             room_unlocks: None,
             class_level: None,
             cast_from_zone: None,
+            exile_from_stack_instead_of_graveyard: false,
             played_from_zone: None,
             mana_spent_to_cast: false,
             colors_spent_to_cast: ColoredManaCount::default(),

@@ -1702,6 +1702,8 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         | Effect::Regenerate { target } => {
             d.push(("target".into(), fmt_target(target)));
         }
+        // CR 702.50a: EpicCopy's parameters live in its snapshotted ability.
+        Effect::EpicCopy { .. } => {}
         Effect::DestroyAll { target, .. }
         | Effect::TapAll { target }
         | Effect::UntapAll { target }
@@ -2101,6 +2103,30 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             d.push(("target".into(), fmt_target(target)));
             if *without_paying_mana_cost {
                 d.push(("free cast".into(), "yes".into()));
+            }
+        }
+        Effect::FreeCastFromZones {
+            count,
+            max_total_mv,
+            filter,
+            zones,
+            exile_instead_of_graveyard,
+        } => {
+            d.push(("count".into(), count.to_string()));
+            if let Some(mv) = max_total_mv {
+                d.push(("total mana value".into(), mv.to_string()));
+            }
+            d.push(("filter".into(), fmt_target(filter)));
+            d.push((
+                "zones".into(),
+                zones
+                    .iter()
+                    .map(|z| format!("{z:?}"))
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            ));
+            if *exile_instead_of_graveyard {
+                d.push(("exile instead of graveyard".into(), "yes".into()));
             }
         }
         Effect::RollDie {
@@ -2510,6 +2536,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         | Effect::Incubate { .. }
         | Effect::TimeTravel
         | Effect::Conjure { .. }
+        | Effect::DraftFromSpellbook { .. }
         | Effect::AddPendingETBCounters { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::ChooseOneOf { .. }
@@ -8426,6 +8453,7 @@ mod tests {
     };
     use crate::types::card_type::CardType;
     use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::keywords::KeywordKind;
     use crate::types::player::PlayerId;
     use crate::types::replacements::ReplacementEvent;
     use crate::types::statics::{BlockExceptionKind, ProhibitionScope};
@@ -10027,6 +10055,39 @@ mod tests {
             .find(|item| item.category == ParseCategory::Keyword)
             .expect("keyword parse item");
         assert!(keyword.supported);
+    }
+
+    #[test]
+    fn alternative_keyword_cost_static_remains_runtime_coverage_gap() {
+        let mut face = make_face();
+        face.oracle_text = Some("You may pay {0} rather than pay cycling costs.".to_string());
+        face.static_abilities.push(
+            StaticDefinition::new(StaticMode::AlternativeKeywordCost {
+                keyword: KeywordKind::Cycling,
+                cost: AbilityCost::Mana {
+                    cost: ManaCost::generic(0),
+                },
+                frequency: None,
+            })
+            .description("You may pay {0} rather than pay cycling costs.".to_string()),
+        );
+
+        let gaps = card_face_gaps(&face);
+        assert!(
+            gaps.iter()
+                .any(|gap| gap == "Static:AlternativeKeywordCost(Cycling)"),
+            "runtime-deferred AlternativeKeywordCost must remain a coverage gap: {gaps:?}"
+        );
+
+        let parse_details = build_parse_details_for_face(&face);
+        let static_item = parse_details
+            .iter()
+            .find(|item| item.category == ParseCategory::Static)
+            .expect("static parse item");
+        assert!(
+            !static_item.supported,
+            "runtime-deferred AlternativeKeywordCost must not be marked supported"
+        );
     }
 
     /// Regression: cards with a concrete `AdditionalCost` + one spell ability

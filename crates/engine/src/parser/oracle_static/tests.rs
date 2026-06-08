@@ -304,6 +304,79 @@ fn cant_attack_split_declines_scoped_restrictions() {
     );
 }
 
+/// CR 508.1c / CR 509.1b: A grant followed by "and can't attack or block"
+/// (Immovable Rod, Fog on the Barrow-Downs) must produce both the leading
+/// clause's static(s) and a companion `CantAttackOrBlock` static sharing the
+/// same affected set.
+#[test]
+fn cant_attack_or_block_splits_from_loses_all_abilities() {
+    let defs = parse_static_line_multi(
+        "Enchanted creature loses all abilities and can't attack or block.",
+    );
+    assert!(
+        defs.iter().any(|d| d.mode == StaticMode::CantAttackOrBlock),
+        "expected CantAttackOrBlock, got {:?}",
+        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
+    );
+    assert!(
+        defs.iter()
+            .any(|d| matches!(d.mode, StaticMode::Continuous)),
+        "leading loses-all-abilities clause must be preserved"
+    );
+}
+
+/// CR 508.1c / CR 509.1b: A type-change "is a [type]" followed by "and can't
+/// attack or block" also splits, with the CantAttackOrBlock companion sharing
+/// the enchanted-creature subject.
+#[test]
+fn cant_attack_or_block_splits_from_type_change() {
+    let defs = parse_static_line_multi("Enchanted creature is a Frog and can't attack or block.");
+    assert!(
+        defs.iter().any(|d| d.mode == StaticMode::CantAttackOrBlock),
+        "expected CantAttackOrBlock, got {:?}",
+        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
+    );
+    // The companion must target the same enchanted-creature subject.
+    let lockout = defs
+        .iter()
+        .find(|d| d.mode == StaticMode::CantAttackOrBlock)
+        .unwrap();
+    assert!(
+        lockout.affected.is_some(),
+        "CantAttackOrBlock companion must carry an affected filter"
+    );
+}
+
+/// CR 508.1c / CR 509.1b: The bare "can't attack" and "can't block" split
+/// functions must still fire unaffected — the new "attack or block" handler
+/// must not over-match and suppress them.
+#[test]
+fn cant_attack_or_block_split_does_not_suppress_siblings() {
+    let cant_attack = parse_static_line_multi("Enchanted creature gets +2/+2 and can't attack.");
+    assert!(
+        cant_attack.iter().any(|d| d.mode == StaticMode::CantAttack),
+        "bare can't-attack split must still produce CantAttack"
+    );
+    assert!(
+        !cant_attack
+            .iter()
+            .any(|d| d.mode == StaticMode::CantAttackOrBlock),
+        "bare can't-attack split must NOT produce CantAttackOrBlock"
+    );
+
+    let cant_block = parse_static_line_multi("Enchanted creature gets +2/+2 and can't block.");
+    assert!(
+        cant_block.iter().any(|d| d.mode == StaticMode::CantBlock),
+        "bare can't-block split must still produce CantBlock"
+    );
+    assert!(
+        !cant_block
+            .iter()
+            .any(|d| d.mode == StaticMode::CantAttackOrBlock),
+        "bare can't-block split must NOT produce CantAttackOrBlock"
+    );
+}
+
 /// CR 701.21: Assault Suit — "Equipped creature gets +2/+2, has haste, can't
 /// attack you or planeswalkers you control, and can't be sacrificed." must
 /// include an `Other("CantBeSacrificed")` static alongside the +2/+2 grant.
@@ -1802,6 +1875,38 @@ fn ghalta_self_cost_reduction_is_active_from_command_zone() {
     else {
         panic!("expected dynamic self-spell ReduceCost, got {:?}", def.mode);
     };
+    assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+    assert_eq!(
+        def.active_zones,
+        vec![Zone::Hand, Zone::Stack, Zone::Command]
+    );
+}
+
+#[test]
+fn self_cost_reduction_where_x_distinct_named_lands_uses_static_cost_seam() {
+    let def = parse_static_line(
+        "This spell costs {X} less to cast, where X is the number of differently named lands you control.",
+    )
+    .unwrap();
+
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        amount,
+        dynamic_count:
+            Some(QuantityRef::ObjectCountDistinct {
+                filter: TargetFilter::Typed(filter),
+                qualities,
+            }),
+        ..
+    } = def.mode
+    else {
+        panic!("expected dynamic self-spell ReduceCost, got {:?}", def.mode);
+    };
+
+    assert_eq!(amount, ManaCost::generic(1));
+    assert!(filter.type_filters.contains(&TypeFilter::Land));
+    assert_eq!(filter.controller, Some(ControllerRef::You));
+    assert_eq!(qualities, vec![SharedQuality::Name]);
     assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
     assert_eq!(
         def.active_zones,
@@ -5298,6 +5403,34 @@ fn continuous_mods_grant_keyword_and_cant_be_blocked() {
             }
         )),
         "missing CantBeBlocked grant in {mods:?}"
+    );
+}
+
+/// CR 509.1b + CR 613.4b: Atomic Microsizer — evasion restriction and base P/T
+/// set must parse from one compound predicate.
+#[test]
+fn continuous_mods_cant_be_blocked_and_has_base_pt() {
+    let mods = parse_continuous_modifications(
+        "can't be blocked this turn and has base power and toughness 1/1 until end of turn",
+    );
+    assert!(
+        mods.iter().any(|m| matches!(
+            m,
+            ContinuousModification::AddStaticMode {
+                mode: StaticMode::CantBeBlocked
+            }
+        )),
+        "missing CantBeBlocked grant in {mods:?}"
+    );
+    assert!(
+        mods.iter()
+            .any(|m| matches!(m, ContinuousModification::SetPower { value: 1 })),
+        "missing SetPower(1) in {mods:?}"
+    );
+    assert!(
+        mods.iter()
+            .any(|m| matches!(m, ContinuousModification::SetToughness { value: 1 })),
+        "missing SetToughness(1) in {mods:?}"
     );
 }
 

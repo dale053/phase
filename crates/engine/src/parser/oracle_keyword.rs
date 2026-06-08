@@ -19,7 +19,8 @@ use crate::types::ability::{
     TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::keywords::{
-    BloodthirstValue, BuybackCost, CyclingCost, FlashbackCost, Keyword, WardCost,
+    normalize_bands_with_other_quality, BloodthirstValue, BuybackCost, CyclingCost, FlashbackCost,
+    Keyword, WardCost,
 };
 use crate::types::mana::{ManaCost, ManaCostShard};
 use crate::types::zones::Zone;
@@ -298,11 +299,6 @@ pub(crate) fn extract_keyword_line(
             // Prefix match: Oracle text has more detail (e.g. "protection from red").
             // Extract the full parameterized keyword.
             if let Some(kw) = parse_keyword_from_oracle(&lower) {
-                if matches!(kw, Keyword::Ripple(_))
-                    && mtgjson_keyword_names.contains(&keyword_display_name(&kw))
-                {
-                    continue;
-                }
                 new_keywords.push(kw);
                 continue;
             }
@@ -384,6 +380,9 @@ fn parse_mtgjson_missing_standalone_keyword_line(line: &str) -> Option<Vec<Keywo
         // standalone keyword line MTGJSON does not surface in its `keywords` array,
         // so it must be recovered from the Oracle line here.
         Keyword::TotemArmor => Some(vec![keyword]),
+        // CR 702.22: "Bands with other [quality]" carries the quality in Oracle
+        // text; MTGJSON's keyword list has no typed payload to preserve it.
+        Keyword::BandsWithOther(_) => Some(vec![keyword]),
         _ => None,
     }
 }
@@ -1301,6 +1300,13 @@ pub(crate) fn parse_keyword_from_oracle(text: &str) -> Option<Keyword> {
         return Some(Keyword::TotemArmor);
     }
 
+    if let Ok((quality, _)) = tag::<_, _, OracleError<'_>>("bands with other ").parse(text) {
+        let normalized = normalize_bands_with_other_quality(quality);
+        if !normalized.is_empty() {
+            return Some(Keyword::BandsWithOther(normalized));
+        }
+    }
+
     // For parameterized keywords, find the first space to split name from parameter.
     // Oracle format: "protection from multicolored" → name="protection", rest="from multicolored"
     // Oracle format: "ward {2}" → name="ward", rest="{2}"
@@ -1390,6 +1396,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::StartYourEngines => "start your engines!".to_string(),
         Keyword::Soulbond => "soulbond".to_string(),
         Keyword::Banding => "banding".to_string(),
+        Keyword::BandsWithOther(quality) => format!("bands with other {}", quality.to_lowercase()),
         // CR 702.24a: Cumulative upkeep's display includes its base cost so
         // tooltips and AI hint text show the actual payment ("cumulative upkeep
         // — {1}", "cumulative upkeep — Pay 2 life", etc.) instead of a bare
@@ -1971,6 +1978,25 @@ mod tests {
         assert_eq!(parse_keyword_from_oracle("ripple 4 extra"), None);
     }
 
+    #[test]
+    fn parse_keyword_from_oracle_bands_with_other_quality() {
+        assert_eq!(
+            parse_keyword_from_oracle("bands with other wolves"),
+            Some(Keyword::BandsWithOther("Wolf".to_string()))
+        );
+        assert_eq!(
+            parse_keyword_from_oracle("bands with other legends"),
+            Some(Keyword::BandsWithOther("Legend".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_keyword_line_bands_with_other_quality() {
+        let result = extract_keyword_line("Bands with other Wolves", &[])
+            .expect("bands with other should parse from Oracle keyword line");
+        assert_eq!(result, vec![Keyword::BandsWithOther("Wolf".to_string())]);
+    }
+
     /// CR 702.48a: Offering — the Oracle line "<Subtype> offering (...)" carries
     /// the quality that the bare MTGJSON "Offering" keyword name lacks. Previously
     /// no arm matched, so Keyword::Offering was never produced and the cast path
@@ -1995,15 +2021,16 @@ mod tests {
     }
 
     #[test]
-    fn extract_keyword_line_ripple_does_not_duplicate_mtgjson_keyword() {
+    fn extract_keyword_line_ripple_preserves_oracle_depth() {
         let mtgjson_kws = vec!["ripple".to_string()];
 
         let result = extract_keyword_line("Ripple 4", &mtgjson_kws)
             .expect("Ripple N line should be recognized as a keyword line");
 
-        assert!(
-            result.is_empty(),
-            "MTGJSON already carries Keyword::Ripple; Oracle validation must not add a duplicate"
+        assert_eq!(
+            result,
+            vec![Keyword::Ripple(4)],
+            "Oracle text carries the ripple depth that MTGJSON's bare keyword omits"
         );
     }
 
@@ -3338,6 +3365,61 @@ mod tests {
             };
             assert_eq!(tf.controller, Some(ControllerRef::You));
         }
+    }
+
+    /// CR 702.5a: "Enchant creature or Food" (Sugar Coat, BLB) — Food is an
+    /// artifact subtype, not a core card type, so it requires explicit support
+    /// in `parse_enchant_type_leg`. The result must be a two-leg `Or` filter
+    /// covering both creatures and Food artifacts.
+    #[test]
+    fn extract_enchant_creature_or_food_subtype() {
+        let kw = super::try_parse_multi_type_enchant("Enchant creature or Food")
+            .expect("\"Enchant creature or Food\" should parse");
+        let Keyword::Enchant(TargetFilter::Or { ref filters }) = kw else {
+            panic!("expected Keyword::Enchant(Or), got {kw:?}");
+        };
+        assert_eq!(filters.len(), 2, "expected two legs");
+        let types: Vec<_> = filters
+            .iter()
+            .map(|f| match f {
+                TargetFilter::Typed(tf) => tf.type_filters.clone(),
+                other => panic!("expected Typed leg, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                vec![TypeFilter::Creature],
+                vec![TypeFilter::Subtype("Food".to_string())],
+            ]
+        );
+    }
+
+    /// CR 702.5a: Artifact subtypes must parse as enchant target legs through
+    /// the canonical subtype classifier, not a hand-maintained token subset.
+    #[test]
+    fn extract_enchant_artifact_subtypes() {
+        for subtype in crate::types::card_type::ARTIFACT_SUBTYPES {
+            let line = format!("Enchant creature or {subtype}");
+            let kw = super::try_parse_multi_type_enchant(&line)
+                .unwrap_or_else(|| panic!("\"{}\" should parse", line));
+            let Keyword::Enchant(TargetFilter::Or { filters }) = kw else {
+                panic!("expected Or for {subtype}");
+            };
+            assert_eq!(filters.len(), 2);
+            let TargetFilter::Typed(tf) = &filters[1] else {
+                panic!("expected Typed artifact subtype leg for {subtype}");
+            };
+            assert_eq!(
+                tf.type_filters,
+                vec![TypeFilter::Subtype((*subtype).to_string())]
+            );
+        }
+
+        assert!(
+            super::try_parse_multi_type_enchant("Enchant creature or Goblin").is_none(),
+            "creature subtypes must not be accepted as artifact enchant target legs"
+        );
     }
 
     // ── Cumulative upkeep display (CR 702.24a) ──

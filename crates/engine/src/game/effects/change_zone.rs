@@ -13,7 +13,7 @@ use crate::types::game_state::{
     ExileLink, ExileLinkKind, GameState, PendingCounterPostAction, WaitingFor,
     ZoneDeliveryExileTracking,
 };
-use crate::types::identifiers::{ObjectId, TrackedSetId};
+use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::ProposedEvent;
@@ -84,18 +84,14 @@ pub fn shuffle_library(state: &mut GameState, player: PlayerId, events: &mut Vec
 /// in the library/hand — so an interactive `ChangeZone` selecting "from among"
 /// such a set must scan the members' actual zone, not the battlefield default.
 ///
-/// The `TrackedSetId(0)` sentinel resolves to the most recent non-empty set,
-/// mirroring the binding pass in `resolve` (CR 603.7). Returns `None` when the
+/// The `TrackedSetId(0)` sentinel resolves through the same chain-first binding
+/// authority as `matches_target_filter` (CR 603.7). Returns `None` when the
 /// filter is not tracked-set-backed or the set is empty/unbound.
 fn tracked_set_member_zone(state: &GameState, filter: &TargetFilter) -> Option<Zone> {
-    let id = match filter {
+    let filter = crate::game::targeting::resolve_tracked_set_sentinel(state, filter.clone());
+    let id = match &filter {
         TargetFilter::TrackedSet { id } | TargetFilter::TrackedSetFiltered { id, .. } => *id,
         _ => return None,
-    };
-    let id = if id == TrackedSetId(0) {
-        crate::game::targeting::latest_tracked_set_id(state)?
-    } else {
-        id
     };
     state
         .tracked_object_sets
@@ -213,7 +209,7 @@ pub(crate) fn apply_zone_delivery_tail(
     duration: Option<&Duration>,
     exile_tracking: ZoneDeliveryExileTracking,
     events: &mut Vec<GameEvent>,
-) {
+) -> ZoneDeliveryResult {
     // CR 701.24a: To shuffle a library, randomize the cards within it so that
     // no player knows their order.
     if to == Zone::Library {
@@ -233,7 +229,7 @@ pub(crate) fn apply_zone_delivery_tail(
                 _ if matches!(exile_tracking, ZoneDeliveryExileTracking::TrackBySource) => {
                     ExileLinkKind::TrackedBySource
                 }
-                _ => return,
+                _ => return ZoneDeliveryResult::Done,
             };
             state.exile_links.push(ExileLink {
                 exiled_id: object_id,
@@ -247,15 +243,25 @@ pub(crate) fn apply_zone_delivery_tail(
     // (`ChangeZone`) in the same way stack resolution and land play already
     // do, so as-enters work such as "enters prepared" or persisted choices
     // applies before triggers and priority.
+    //
+    // CR 614.12a: A Devour as-enters sacrifice surfaces its own interactive
+    // `EffectZoneChoice` here. Surface that pause to the caller via
+    // `NeedsChoice` so the mass/single zone-change loop stashes the remaining
+    // co-entering members and resumes after the choice (instead of dropping
+    // them, issue #535 class).
     if state.post_replacement_continuation.is_some() {
-        let _ = crate::game::engine_replacement::apply_pending_post_replacement_effect(
+        let waiting_for = crate::game::engine_replacement::apply_pending_post_replacement_effect(
             state,
             Some(object_id),
             None,
             Some(crate::types::replacements::ReplacementEvent::Moved),
             events,
         );
+        if matches!(waiting_for, Some(WaitingFor::EffectZoneChoice { .. })) {
+            return replacement_pause_delivery_result(state);
+        }
     }
+    ZoneDeliveryResult::Done
 }
 
 fn aura_enchant_filter(state: &GameState, object_id: ObjectId) -> Option<TargetFilter> {
@@ -368,6 +374,16 @@ pub(crate) fn deliver_replaced_zone_change(
         } else {
             Vec::new()
         };
+
+        // CR 614.12a + CR 614.13a: snapshot the pre-entry eligible pool the instant
+        // before the FIRST co-entering devourer enters; persisted (is_none gate) so all
+        // co-entering devourers share it. Excludes self + every co-arriver.
+        if to == Zone::Battlefield
+            && state.devour_eligible_snapshot.is_none()
+            && crate::game::engine_replacement::object_has_devour_replacement(state, object_id)
+        {
+            state.devour_eligible_snapshot = Some(state.battlefield.iter().copied().collect());
+        }
 
         zones::move_to_zone(state, object_id, to, events);
         if to == Zone::Battlefield || from == Zone::Battlefield {
@@ -530,7 +546,7 @@ pub(crate) fn deliver_replaced_zone_change(
                 );
             }
         }
-        apply_zone_delivery_tail(
+        return apply_zone_delivery_tail(
             state,
             object_id,
             from,
@@ -546,10 +562,13 @@ pub(crate) fn deliver_replaced_zone_change(
 }
 
 fn replacement_pause_delivery_result(state: &GameState) -> ZoneDeliveryResult {
-    if let WaitingFor::ReplacementChoice { player, .. } = &state.waiting_for {
-        ZoneDeliveryResult::NeedsChoice(*player)
-    } else {
-        ZoneDeliveryResult::NeedsChoice(state.active_player)
+    match &state.waiting_for {
+        WaitingFor::ReplacementChoice { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
+        // CR 614.12a: a Devour as-enters sacrifice surfaced its own
+        // `EffectZoneChoice`; carry its chooser so the caller's `park_waiting_for`
+        // doesn't clobber the already-surfaced prompt.
+        WaitingFor::EffectZoneChoice { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
+        _ => ZoneDeliveryResult::NeedsChoice(state.active_player),
     }
 }
 
@@ -1037,18 +1056,28 @@ pub fn resolve(
                     }
                 }
                 ZoneMoveResult::NeedsChoice(player) => {
+                    // CR 614.12a: single-pick branch (Random single / single-eligible)
+                    // has NO stash/drain, so KEEP the counter-pause EffectResolved
+                    // append — it is the ONLY resume-path EffectResolved emit (the
+                    // synchronous Done-branch emit below does NOT run on the pause
+                    // path). Only the wait-state setter changes to `park_waiting_for`
+                    // so a Devour as-enters sacrifice `EffectZoneChoice` already
+                    // surfaced by the move isn't clobbered.
                     append_effect_resolved_after_counter_pause(
                         state,
                         EffectKind::from(&ability.effect),
                         ability.source_id,
                     );
-                    state.waiting_for =
-                        crate::game::replacement::replacement_choice_waiting_for(player, state);
+                    crate::game::replacement::park_waiting_for(state, player);
                     return Ok(());
                 }
                 ZoneMoveResult::NeedsAuraAttachmentChoice => return Ok(()),
             }
 
+            // CR 614.13a: single-pick entry completed (Done branch) — clear the
+            // pre-entry Devour snapshot (its lifetime = this entry event). The
+            // pause arm above returned before reaching here.
+            let _ = state.devour_eligible_snapshot.take();
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),
                 source_id: ability.source_id,
@@ -1091,18 +1120,28 @@ pub fn resolve(
                     }
                 }
                 ZoneMoveResult::NeedsChoice(player) => {
+                    // CR 614.12a: single-pick branch (Random single / single-eligible)
+                    // has NO stash/drain, so KEEP the counter-pause EffectResolved
+                    // append — it is the ONLY resume-path EffectResolved emit (the
+                    // synchronous Done-branch emit below does NOT run on the pause
+                    // path). Only the wait-state setter changes to `park_waiting_for`
+                    // so a Devour as-enters sacrifice `EffectZoneChoice` already
+                    // surfaced by the move isn't clobbered.
                     append_effect_resolved_after_counter_pause(
                         state,
                         EffectKind::from(&ability.effect),
                         ability.source_id,
                     );
-                    state.waiting_for =
-                        crate::game::replacement::replacement_choice_waiting_for(player, state);
+                    crate::game::replacement::park_waiting_for(state, player);
                     return Ok(());
                 }
                 ZoneMoveResult::NeedsAuraAttachmentChoice => return Ok(()),
             }
 
+            // CR 614.13a: single-pick entry completed (Done branch) — clear the
+            // pre-entry Devour snapshot (its lifetime = this entry event). The
+            // pause arm above returned before reaching here.
+            let _ = state.devour_eligible_snapshot.take();
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),
                 source_id: ability.source_id,
@@ -1147,6 +1186,19 @@ pub fn resolve(
         track_exiled_by_source,
     };
     let _ = owner_library; // routing handled by move_to_zone (CR 400.7)
+
+    // CR 614.12a + CR 614.13a: same pre-loop snapshot as the mass path, for a
+    // targeted multi-`ChangeZone` co-entry that brings in one or more devourers.
+    // Captured before any member enters so every co-arriver (and the devourers
+    // themselves) is excluded regardless of iteration order.
+    if dest_zone == Zone::Battlefield
+        && state.devour_eligible_snapshot.is_none()
+        && targeted_objects
+            .iter()
+            .any(|id| crate::game::engine_replacement::object_has_devour_replacement(state, *id))
+    {
+        state.devour_eligible_snapshot = Some(state.battlefield.iter().copied().collect());
+    }
 
     for (i, obj_id) in targeted_objects.iter().enumerate() {
         if dest_zone == Zone::Exile {
@@ -1208,14 +1260,19 @@ pub fn resolve(
                         track_exiled_by_source: ctx.track_exiled_by_source,
                         effect_kind: EffectKind::from(&ability.effect),
                     });
-                state.waiting_for =
-                    crate::game::replacement::replacement_choice_waiting_for(player, state);
+                // CR 614.12a: park (don't clobber) — a Devour as-enters sacrifice
+                // may already have surfaced its own `EffectZoneChoice`.
+                crate::game::replacement::park_waiting_for(state, player);
                 // EffectResolved is emitted by the drain after the loop completes —
                 // do NOT emit here.
                 return Ok(());
             }
         }
     }
+
+    // CR 614.13a: targeted multi-ChangeZone co-entry completed without pausing —
+    // clear the pre-entry Devour snapshot (its lifetime = this entry event).
+    let _ = state.devour_eligible_snapshot.take();
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&ability.effect),
@@ -1343,8 +1400,12 @@ pub fn resolve_all(
             let extracted = target.extract_zones();
             let scan_zones = if extracted.len() > 1 {
                 extracted
+            } else if let Some(origin) = origin {
+                vec![*origin]
+            } else if let Some(zone) = tracked_set_member_zone(state, target) {
+                vec![zone]
             } else {
-                vec![origin.unwrap_or(Zone::Battlefield)]
+                vec![Zone::Battlefield]
             };
             (scan_zones, *destination, target.clone(), *enter_tapped)
         }
@@ -1496,9 +1557,27 @@ pub fn resolve_all(
         state.tracked_object_sets.remove(id);
     }
 
+    // CR 614.12a + CR 614.13a: when a mass entry brings in one or more devourers
+    // simultaneously, snapshot the eligible pool BEFORE any co-entering member
+    // enters — `state.objects` is unordered, so an ordinary co-arriver may be
+    // processed before the devourer; capturing at devourer-entry time would then
+    // wrongly include that already-entered co-arriver. Capture pre-loop (when the
+    // battlefield is still the pre-entry set) so every co-arriver is excluded.
+    // `is_none`-gated so a nested/resumed pass doesn't re-capture; cleared on the
+    // event-completion paths below.
+    if dest_zone == Zone::Battlefield
+        && state.devour_eligible_snapshot.is_none()
+        && matching
+            .iter()
+            .any(|id| crate::game::engine_replacement::object_has_devour_replacement(state, *id))
+    {
+        state.devour_eligible_snapshot = Some(state.battlefield.iter().copied().collect());
+    }
+
     let mut moved_count: i32 = 0;
     let mut departed: Vec<ObjectId> = Vec::new();
-    for obj_id in matching {
+    for (i, obj_id) in matching.iter().enumerate() {
+        let obj_id = *obj_id;
         // CR 400.3: Each object's actual current zone is the source zone for the
         // move. Single-zone callers pass `origin_zones = [zone]`; multi-zone
         // callers (e.g. "search graveyard, hand, and library") let each object's
@@ -1555,18 +1634,55 @@ pub fn resolve_all(
                 }
             }
             ZoneMoveResult::NeedsChoice(player) => {
-                append_effect_resolved_after_counter_pause(
-                    state,
-                    EffectKind::from(&ability.effect),
-                    ability.source_id,
-                );
-                state.waiting_for =
-                    crate::game::replacement::replacement_choice_waiting_for(player, state);
+                // CR 614.12a + CR 614.13: a Devour as-enters sacrifice surfaced its
+                // own `EffectZoneChoice` (or a counter-pause replacement choice).
+                // Stash the unprocessed co-entering members so
+                // `drain_pending_change_zone_iteration` resumes the mass move after
+                // the player resolves this choice — without the stash, every member
+                // after the first NeedsChoice would be silently dropped (issue #535
+                // class). The drain owns the single trailing EffectResolved, so we do
+                // NOT emit it here (mirrors the targeted loop's contract).
+                //
+                // NOTE (pre-existing face_down residual, extended not regressed):
+                // `process_one_zone_move` (the drain's mover) hardcodes
+                // `face_down=None`, while this mass loop passes
+                // `face_down_profile.as_ref()`. Resumed members of a face-down mass
+                // entry (the Cyber-Controller class) therefore lose their face-down
+                // profile. This carrier gap predates this change.
+                state.pending_change_zone_iteration =
+                    Some(crate::types::game_state::PendingChangeZoneIteration {
+                        remaining: matching[i + 1..].to_vec(),
+                        source_id: ability.source_id,
+                        controller: ability.controller,
+                        origin: None,
+                        destination: dest_zone,
+                        enter_transformed: false,
+                        enter_tapped,
+                        enters_under_player,
+                        enters_attacking: false,
+                        enter_with_counters: vec![],
+                        duration: ability.duration.clone(),
+                        track_exiled_by_source,
+                        effect_kind: EffectKind::from(&ability.effect),
+                    });
+                crate::game::replacement::park_waiting_for(state, player);
                 return Ok(());
             }
-            ZoneMoveResult::NeedsAuraAttachmentChoice => return Ok(()),
+            ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                // CR 614.13a: this terminal early-exit ends the mass-entry event
+                // (no stash/resume), so the pre-entry Devour snapshot's lifetime is
+                // over — clear it so it can't leak into a later sacrifice.
+                let _ = state.devour_eligible_snapshot.take();
+                return Ok(());
+            }
         }
     }
+
+    // CR 614.13a: the whole co-entry event completed without pausing — clear the
+    // pre-entry Devour snapshot (its lifetime = this one ChangeZone-to-battlefield
+    // event). NOT cleared on the NeedsChoice pause above (the paused devourer's
+    // sacrifice + remaining co-entering members still need it).
+    let _ = state.devour_eligible_snapshot.take();
 
     // CR 603.10a + CR 608.2f: Every battlefield-origin object that left did so as
     // part of the same mass zone-change event, so leaves-the-battlefield observers
@@ -1645,7 +1761,7 @@ mod tests {
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
     use crate::types::game_state::{StackEntry, StackEntryKind, ZoneChangeRecord};
-    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
     use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
     use crate::types::statics::{ProhibitionScope, StaticMode};
@@ -5618,6 +5734,133 @@ mod tests {
         // The land stays in P1's graveyard.
         assert_eq!(state.objects[&land].zone, Zone::Graveyard);
         assert_eq!(state.objects[&land].owner, PlayerId(1));
+    }
+
+    /// CR 701.20b: Tracked-set mass moves without an explicit origin
+    /// must scan the tracked objects' actual zone, not the battlefield default.
+    /// Zimone-style "revealed this way" cards leave the revealed cards in the
+    /// library until the follow-up `ChangeZoneAll` routes them by type.
+    #[test]
+    fn change_zone_all_tracked_set_without_origin_uses_member_zone() {
+        let mut state = GameState::new_two_player(42);
+        let land = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Tracked Land".to_string(),
+            Zone::Library,
+        );
+        state.objects.get_mut(&land).unwrap().card_types.core_types = vec![CoreType::Land];
+        let creature = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(0),
+            "Tracked Creature".to_string(),
+            Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+
+        let set_id = TrackedSetId(state.next_tracked_set_id);
+        state.next_tracked_set_id += 1;
+        state
+            .tracked_object_sets
+            .insert(set_id, vec![land, creature]);
+
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: None,
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSetFiltered {
+                    id: TrackedSetId(0),
+                    filter: Box::new(TargetFilter::Typed(TypedFilter::land())),
+                },
+                enters_under: None,
+                enter_tapped: true,
+                face_down_profile: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve_all(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.objects[&land].zone, Zone::Battlefield);
+        assert!(state.objects[&land].tapped);
+        assert_eq!(state.objects[&creature].zone, Zone::Library);
+    }
+
+    /// CR 603.7: `TrackedSetId(0)` must bind through `chain_tracked_set_id`
+    /// before falling back to the globally latest tracked set, matching the
+    /// target-filter resolver used by `matches_target_filter`.
+    #[test]
+    fn change_zone_all_tracked_set_zone_uses_chain_binding() {
+        let mut state = GameState::new_two_player(42);
+        let chain_land = create_object(
+            &mut state,
+            CardId(20),
+            PlayerId(0),
+            "Chain Land".to_string(),
+            Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&chain_land)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Land];
+        let latest_land = create_object(
+            &mut state,
+            CardId(21),
+            PlayerId(0),
+            "Latest Land".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&latest_land)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Land];
+
+        let chain_set = TrackedSetId(5);
+        let latest_set = TrackedSetId(9);
+        state
+            .tracked_object_sets
+            .insert(chain_set, vec![chain_land]);
+        state
+            .tracked_object_sets
+            .insert(latest_set, vec![latest_land]);
+        state.chain_tracked_set_id = Some(chain_set);
+
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: None,
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSetFiltered {
+                    id: TrackedSetId(0),
+                    filter: Box::new(TargetFilter::Typed(TypedFilter::land())),
+                },
+                enters_under: None,
+                enter_tapped: false,
+                face_down_profile: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve_all(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.objects[&chain_land].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&latest_land].zone, Zone::Graveyard);
     }
 
     /// CR 708.2a: An empty milled set (no eligible cards) is a clean no-op.
