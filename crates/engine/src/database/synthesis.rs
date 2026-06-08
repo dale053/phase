@@ -9,8 +9,7 @@ use crate::parser::oracle_keyword::{keyword_display_name, parse_keyword_from_ora
 use crate::parser::oracle_util::{apply_bracket_mode, strip_reminder_text, BracketMode};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
-    ActivationRestriction, AdditionalCost, AdditionalCostPaymentSource,
-    AdditionalCostRepeatability, AggregateFunction,
+    ActivationRestriction, AdditionalCost, AdditionalCostPaymentSource, AggregateFunction,
     AttackScope, AttackSubject, CardPlayMode, CastFromZoneDriver, CastManaObjectScope,
     CastManaSpentMetric, CastVariantPaid, ChoiceType, Comparator, ContinuousModification,
     ControllerRef, CopyRetargetPermission, CounterTriggerFilter, DamageKindFilter,
@@ -17915,6 +17914,7 @@ mod backup_synthesis_tests {
 #[cfg(test)]
 mod squad_synthesis_tests {
     use super::*;
+    use crate::types::ability::AdditionalCostRepeatability;
     use crate::types::mana::ManaCostShard;
 
     /// CR 702.157a: Squad synthesizes a repeatable optional additional cost and
@@ -18028,6 +18028,7 @@ mod squad_synthesis_tests {
 #[cfg(test)]
 mod replicate_synthesis_tests {
     use super::*;
+    use crate::types::ability::AdditionalCostRepeatability;
     use crate::types::mana::ManaCostShard;
 
     /// CR 702.56a: Replicate synthesizes a repeatable optional additional cost

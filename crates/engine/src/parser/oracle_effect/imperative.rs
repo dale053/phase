@@ -3693,34 +3693,6 @@ pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst>
         }
     }
 
-    if let Some((
-        Effect::ChangeZone {
-            origin,
-            destination,
-            target,
-            enters_under,
-            enter_tapped,
-            enter_transformed,
-            enters_attacking,
-            up_to,
-            enter_with_counters,
-            ..
-        },
-        choice_count,
-    )) = super::try_parse_put_zone_change_parts(lower, text)
-    {
-        return Some(PutImperativeAst::ZoneChange {
-            origin,
-            destination,
-            target,
-            enters_under,
-            enter_tapped: enter_tapped.is_tapped(),
-            enter_transformed,
-            enters_attacking,
-            up_to,
-            choice_count: choice_count.map(Box::new),
-            enter_with_counters,
-        });
     if let Some((effect, choice_count)) = super::try_parse_put_zone_change_parts(lower, text) {
         return match effect {
             Effect::ChangeZoneAll {
@@ -3735,7 +3707,7 @@ pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst>
                 destination,
                 target,
                 enters_under,
-                enter_tapped,
+                enter_tapped: enter_tapped.is_tapped(),
             }),
             Effect::ChangeZone {
                 origin,
@@ -3753,7 +3725,7 @@ pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst>
                 destination,
                 target,
                 enters_under,
-                enter_tapped,
+                enter_tapped: enter_tapped.is_tapped(),
                 enter_transformed,
                 enters_attacking,
                 up_to,
@@ -3788,7 +3760,7 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
             destination,
             target,
             enters_under,
-            enter_tapped,
+            enter_tapped: crate::types::zones::EtbTapState::from_legacy_bool(enter_tapped),
             face_down_profile: None,
         },
         PutImperativeAst::ZoneChange {

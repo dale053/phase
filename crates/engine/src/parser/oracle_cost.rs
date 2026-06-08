@@ -718,7 +718,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
                 target: TargetFilter::SelfRef,
                 card_filter: TargetFilter::Any,
                 count: None,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 choice_optional: false,
             }),
         };

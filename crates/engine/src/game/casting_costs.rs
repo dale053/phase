@@ -11404,7 +11404,8 @@ it for each time it was kicked.\n{T}: Add {C} for each charge counter on this ar
                     matches!(
                         cost,
                         AdditionalCost::Kicker {
-                            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
+                            repeatability:
+                                crate::types::ability::AdditionalCostRepeatability::Repeatable,
                             ..
                         }
                     ),
@@ -11428,7 +11429,8 @@ it for each time it was kicked.\n{T}: Add {C} for each charge counter on this ar
                     matches!(
                         cost,
                         AdditionalCost::Kicker {
-                            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
+                            repeatability:
+                                crate::types::ability::AdditionalCostRepeatability::Repeatable,
                             ..
                         }
                     ),
@@ -11561,7 +11563,8 @@ many tokens that are copies of it.)";
                     cost,
                     AdditionalCost::Optional {
                         cost: AbilityCost::Mana { .. },
-                        repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
+                        repeatability:
+                            crate::types::ability::AdditionalCostRepeatability::Repeatable,
                     }
                 ));
                 assert_eq!(times_kicked, 0);
@@ -11722,7 +11725,8 @@ its replicate cost was paid.)\nDraw a card.";
                         cost,
                         AdditionalCost::Optional {
                             cost: AbilityCost::Mana { .. },
-                            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
+                            repeatability:
+                                crate::types::ability::AdditionalCostRepeatability::Repeatable,
                         }
                     ),
                     "replicate must surface a repeatable Optional mana cost: {cost:?}"
@@ -11783,7 +11787,8 @@ its replicate cost was paid.)\nDraw a card.";
                         cost,
                         AdditionalCost::Optional {
                             cost: AbilityCost::Mana { .. },
-                            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
+                            repeatability:
+                                crate::types::ability::AdditionalCostRepeatability::Repeatable,
                         }
                     ),
                     "granted Replicate must surface a repeatable Optional mana cost: {cost:?}"

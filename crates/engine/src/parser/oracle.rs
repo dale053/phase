@@ -11016,9 +11016,13 @@ mod tests {
                     costs
                 );
                 assert!(
-                    costs
-                        .iter()
-                        .any(|c| matches!(c, AbilityCost::Discard { self_scope: crate::types::ability::DiscardSelfScope::SourceCard, .. })),
+                    costs.iter().any(|c| matches!(
+                        c,
+                        AbilityCost::Discard {
+                            self_scope: crate::types::ability::DiscardSelfScope::SourceCard,
+                            ..
+                        }
+                    )),
                     "Channel cost should include self-ref discard, got {:?}",
                     costs
                 );
@@ -11982,7 +11986,10 @@ mod tests {
             } => {
                 assert_eq!(*origin, Some(crate::types::zones::Zone::Library));
                 assert_eq!(*destination, crate::types::zones::Zone::Battlefield);
-                assert!(enter_tapped.is_tapped(), "searched land should enter tapped");
+                assert!(
+                    enter_tapped.is_tapped(),
+                    "searched land should enter tapped"
+                );
             }
             other => panic!("Expected ChangeZone, got {other:?}"),
         }
@@ -12055,7 +12062,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*destination, crate::types::zones::Zone::Hand);
-                assert!(!enter_tapped.is_tapped(), "search-to-hand should not be tapped");
+                assert!(
+                    !enter_tapped.is_tapped(),
+                    "search-to-hand should not be tapped"
+                );
             }
             other => panic!("Expected ChangeZone to Hand, got {other:?}"),
         }

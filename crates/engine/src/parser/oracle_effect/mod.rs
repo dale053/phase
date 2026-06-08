@@ -16759,7 +16759,9 @@ fn try_parse_put_zone_change_parts(
                         destination,
                         target,
                         enters_under,
-                        enter_tapped,
+                        enter_tapped: crate::types::zones::EtbTapState::from_legacy_bool(
+                            enter_tapped,
+                        ),
                         face_down_profile: None,
                     },
                     choice_count,
@@ -26905,7 +26907,10 @@ mod tests {
             );
         };
         assert_eq!(*dest1, crate::types::zones::Zone::Battlefield);
-        assert!(enter_tapped.is_tapped(), "lands must enter battlefield tapped");
+        assert!(
+            enter_tapped.is_tapped(),
+            "lands must enter battlefield tapped"
+        );
         match target1 {
             TargetFilter::TrackedSetFiltered { id: _, filter } => match filter.as_ref() {
                 TargetFilter::Typed(tf) => {
@@ -41541,7 +41546,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(destination, Zone::Battlefield);
-                assert!(enter_tapped.is_tapped(), "expected enter_tapped.is_tapped()");
+                assert!(
+                    enter_tapped.is_tapped(),
+                    "expected enter_tapped.is_tapped()"
+                );
                 assert!(enters_attacking, "expected enters_attacking");
             }
             other => panic!("expected ChangeZone, got {other:?}"),
@@ -41760,7 +41768,10 @@ mod tests {
             } => {
                 assert_eq!(destination, Zone::Battlefield);
                 assert_eq!(enters_under, Some(ControllerRef::You));
-                assert!(enter_tapped.is_tapped(), "expected enter_tapped.is_tapped()");
+                assert!(
+                    enter_tapped.is_tapped(),
+                    "expected enter_tapped.is_tapped()"
+                );
                 assert!(enters_attacking, "expected enters_attacking");
             }
             other => panic!("expected ChangeZone, got {other:?}"),
@@ -41784,7 +41795,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(enters_under, Some(ControllerRef::You));
-                assert!(enter_tapped.is_tapped(), "expected enter_tapped.is_tapped()");
+                assert!(
+                    enter_tapped.is_tapped(),
+                    "expected enter_tapped.is_tapped()"
+                );
                 assert!(
                     !enters_attacking,
                     "bare tapped without 'and attacking' must not set attacking"

@@ -5080,13 +5080,12 @@ pub mod tests {
     use crate::types::ability::{
         AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AdditionalCost,
         AggregateFunction, AttackersDeclaredCountSubject, CardSelectionMode, ChosenAttribute,
-        ChosenSubtypeKind, DiscardSelfScope,
-        CommanderOwnership, Comparator, ContinuousModification, ControllerRef,
-        DelayedTriggerCondition, Duration, Effect, FilterProp, KickerVariant, MultiTargetSpec,
-        PaymentCost, PlayerFilter, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef,
-        ResolvedAbility, SearchSelectionConstraint, SharedQuality, SharedQualityRelation,
-        StaticCondition, StaticDefinition, TargetFilter, TargetRef, TriggerCondition,
-        TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
+        ChosenSubtypeKind, CommanderOwnership, Comparator, ContinuousModification, ControllerRef,
+        DelayedTriggerCondition, DiscardSelfScope, Duration, Effect, FilterProp, KickerVariant,
+        MultiTargetSpec, PaymentCost, PlayerFilter, PlayerScope, PtStat, PtValueScope,
+        QuantityExpr, QuantityRef, ResolvedAbility, SearchSelectionConstraint, SharedQuality,
+        SharedQualityRelation, StaticCondition, StaticDefinition, TargetFilter, TargetRef,
+        TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;

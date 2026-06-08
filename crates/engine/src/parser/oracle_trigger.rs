@@ -21013,7 +21013,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*destination, Zone::Battlefield);
-                assert!(enter_tapped.is_tapped(), "expected enter_tapped.is_tapped()");
+                assert!(
+                    enter_tapped.is_tapped(),
+                    "expected enter_tapped.is_tapped()"
+                );
                 assert!(*enters_attacking, "expected enters_attacking");
             }
             other => panic!("expected ChangeZone, got {other:?}"),
