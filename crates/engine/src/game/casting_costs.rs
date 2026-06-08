@@ -119,7 +119,8 @@ pub(crate) fn handle_decide_additional_cost(
         }
         (
             Some(AdditionalCost::Optional {
-                repeatable: true, ..
+                repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
+                ..
             }),
             _,
         ) => {
@@ -133,7 +134,8 @@ pub(crate) fn handle_decide_additional_cost(
         (
             None,
             AdditionalCost::Optional {
-                repeatable: true, ..
+                repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
+                ..
             },
         ) => {
             let mut pending = pending;
@@ -156,7 +158,7 @@ pub(crate) fn handle_decide_additional_cost(
         // CR 702.33a: Kicker is an optional additional cost.
         AdditionalCost::Optional {
             cost,
-            repeatable: false,
+            repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
         } => {
             if pay {
                 ability.context.additional_cost_paid = true;
@@ -168,7 +170,8 @@ pub(crate) fn handle_decide_additional_cost(
             }
         }
         AdditionalCost::Optional {
-            repeatable: true, ..
+            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
+            ..
         } => {
             unreachable!("repeatable optional costs are handled before generic optional costs")
         }
@@ -218,7 +221,7 @@ pub(crate) fn handle_decide_additional_cost(
         && matches!(
             updated_pending.additional_cost_flow,
             Some(AdditionalCost::Optional {
-                repeatable: false,
+                repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
                 ..
             })
         )
@@ -402,13 +405,13 @@ fn handle_decide_kicker_cost(
     pay: bool,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    let Some((variant, cost, repeatable)) = next_kicker_option(state, player, &pending) else {
+    let Some((variant, cost, repeatability)) = next_kicker_option(state, player, &pending) else {
         pending.additional_cost_flow = None;
         return finish_pending_cost_or_cast(state, player, pending, events);
     };
 
     if !pay {
-        if repeatable {
+        if repeatability.is_repeatable() {
             pending.additional_cost_flow = None;
         } else if !pending.declined_kickers.contains(&variant) {
             pending.declined_kickers.push(variant);
@@ -429,16 +432,28 @@ fn next_kicker_option(
     state: &GameState,
     player: PlayerId,
     pending: &PendingCast,
-) -> Option<(KickerVariant, AbilityCost, bool)> {
-    let Some(AdditionalCost::Kicker { costs, repeatable }) = &pending.additional_cost_flow else {
+) -> Option<(
+    KickerVariant,
+    AbilityCost,
+    crate::types::ability::AdditionalCostRepeatability,
+)> {
+    let Some(AdditionalCost::Kicker {
+        costs,
+        repeatability,
+    }) = &pending.additional_cost_flow
+    else {
         return None;
     };
 
-    if *repeatable {
+    if repeatability.is_repeatable() {
         let cost = costs.first()?.clone();
         return cost
             .is_payable(state, player, pending.object_id)
-            .then_some((KickerVariant::First, cost, true));
+            .then_some((
+                KickerVariant::First,
+                cost,
+                crate::types::ability::AdditionalCostRepeatability::Repeatable,
+            ));
     }
 
     for (index, cost) in costs.iter().enumerate() {
@@ -453,7 +468,11 @@ fn next_kicker_option(
             continue;
         }
         if cost.is_payable(state, player, pending.object_id) {
-            return Some((variant, cost.clone(), false));
+            return Some((
+                variant,
+                cost.clone(),
+                crate::types::ability::AdditionalCostRepeatability::Once,
+            ));
         }
     }
 
@@ -493,7 +512,7 @@ fn next_repeatable_additional_cost(
 ) -> Option<AbilityCost> {
     let Some(AdditionalCost::Optional {
         cost,
-        repeatable: true,
+        repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
     }) = &pending.additional_cost_flow
     else {
         return None;
@@ -547,7 +566,7 @@ fn finish_pending_cost_or_cast(
     if matches!(
         pending.additional_cost_flow,
         Some(AdditionalCost::Optional {
-            repeatable: true,
+            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
             ..
         })
     ) {
@@ -557,7 +576,7 @@ fn finish_pending_cost_or_cast(
                 player,
                 cost: AdditionalCost::Optional {
                     cost: current_cost,
-                    repeatable: true,
+                    repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
                 },
                 times_kicked,
                 pending_cast: Box::new(pending),
@@ -571,7 +590,8 @@ fn finish_pending_cost_or_cast(
         Some(AdditionalCost::Kicker { .. })
     ) {
         if pending.deferred_target_selection {
-            if let Some((_, current_cost, repeatable)) = next_kicker_option(state, player, &pending)
+            if let Some((_, current_cost, repeatability)) =
+                next_kicker_option(state, player, &pending)
             {
                 // CR 702.33c/d: present the live Kicker cost (not a laundered
                 // Optional) so the frontend can render a kicker-aware modal and
@@ -581,7 +601,7 @@ fn finish_pending_cost_or_cast(
                     player,
                     cost: AdditionalCost::Kicker {
                         costs: vec![current_cost],
-                        repeatable,
+                        repeatability,
                     },
                     times_kicked,
                     pending_cast: Box::new(pending),
@@ -594,7 +614,8 @@ fn finish_pending_cost_or_cast(
                 return pay_additional_cost(state, player, cost, pending, events);
             }
         }
-        if let Some((_, current_cost, repeatable)) = next_kicker_option(state, player, &pending) {
+        if let Some((_, current_cost, repeatability)) = next_kicker_option(state, player, &pending)
+        {
             // CR 702.33c/d: present the live Kicker cost (not a laundered Optional)
             // so the frontend renders the kicker re-prompt with the running kick count.
             let times_kicked = pending.ability.context.kickers_paid.len() as u32;
@@ -602,7 +623,7 @@ fn finish_pending_cost_or_cast(
                 player,
                 cost: AdditionalCost::Kicker {
                     costs: vec![current_cost],
-                    repeatable,
+                    repeatability,
                 },
                 times_kicked,
                 pending_cast: Box::new(pending),
@@ -619,13 +640,13 @@ fn finish_pending_cost_or_cast(
     // handle_decide_additional_cost so the general deferred path below fires.
     if let Some(AdditionalCost::Optional {
         cost: ref optional_cost,
-        repeatable: false,
+        repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
     }) = pending.additional_cost_flow
     {
         if pending.deferred_target_selection {
             let optional_cost = AdditionalCost::Optional {
                 cost: optional_cost.clone(),
-                repeatable: false,
+                repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
             };
             return Ok(WaitingFor::OptionalCostChoice {
                 player,
@@ -645,7 +666,8 @@ fn finish_pending_cost_or_cast(
             Some(
                 AdditionalCost::Kicker { .. }
                     | AdditionalCost::Optional {
-                        repeatable: true,
+                        repeatability:
+                            crate::types::ability::AdditionalCostRepeatability::Repeatable,
                         ..
                     }
             )
@@ -850,11 +872,15 @@ pub(crate) fn begin_deferred_target_selection(
 
 fn next_declared_kicker_cost(pending: &mut PendingCast) -> Option<AbilityCost> {
     let additional = pending.additional_cost_flow.as_ref()?;
-    let AdditionalCost::Kicker { costs, repeatable } = additional else {
+    let AdditionalCost::Kicker {
+        costs,
+        repeatability,
+    } = additional
+    else {
         return None;
     };
     let variant = pending.declared_kickers_to_pay.pop()?;
-    if *repeatable {
+    if repeatability.is_repeatable() {
         return costs.first().cloned();
     }
     let index = match variant {
@@ -1928,7 +1954,11 @@ pub(super) fn begin_modal_additional_cost_declaration(
         .objects
         .get(&object_id)
         .and_then(|obj| obj.additional_cost.clone());
-    let Some(AdditionalCost::Kicker { costs, repeatable }) = additional else {
+    let Some(AdditionalCost::Kicker {
+        costs,
+        repeatability,
+    }) = additional
+    else {
         let mut capped =
             modal_choice_for_player(state, player, object_id, &modal, &ability.context);
         capped.max_choices = capped.max_choices.min(capped.mode_count);
@@ -1955,7 +1985,10 @@ pub(super) fn begin_modal_additional_cost_declaration(
     pending.origin_zone = origin_zone;
     pending.payment_mode = payment_mode;
     pending.deferred_modal_choice = Some(modal);
-    pending.additional_cost_flow = Some(AdditionalCost::Kicker { costs, repeatable });
+    pending.additional_cost_flow = Some(AdditionalCost::Kicker {
+        costs,
+        repeatability,
+    });
     finish_pending_cost_or_cast(state, player, pending, events)
 }
 
@@ -1979,7 +2012,11 @@ pub(super) fn begin_target_dependent_additional_cost_declaration(
         .objects
         .get(&object_id)
         .and_then(|obj| obj.additional_cost.clone());
-    let Some(AdditionalCost::Kicker { costs, repeatable }) = additional else {
+    let Some(AdditionalCost::Kicker {
+        costs,
+        repeatability,
+    }) = additional
+    else {
         return pay_and_push(
             state,
             player,
@@ -2005,7 +2042,10 @@ pub(super) fn begin_target_dependent_additional_cost_declaration(
     pending.origin_zone = origin_zone;
     pending.payment_mode = payment_mode;
     pending.deferred_target_selection = true;
-    pending.additional_cost_flow = Some(AdditionalCost::Kicker { costs, repeatable });
+    pending.additional_cost_flow = Some(AdditionalCost::Kicker {
+        costs,
+        repeatability,
+    });
     finish_pending_cost_or_cast(state, player, pending, events)
 }
 
@@ -2294,7 +2334,10 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
                     events,
                 );
             }
-            AdditionalCost::Kicker { costs, repeatable } => {
+            AdditionalCost::Kicker {
+                costs,
+                repeatability,
+            } => {
                 let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
                 pending.base_cost = base_cost.clone();
                 pending.casting_variant = casting_variant;
@@ -2307,7 +2350,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
                 }
                 pending.additional_cost_flow = Some(AdditionalCost::Kicker {
                     costs: costs.clone(),
-                    repeatable: *repeatable,
+                    repeatability: *repeatability,
                 });
                 if !pending.ability.context.kickers_paid.is_empty() {
                     pending.declared_kickers_to_pay = pending
@@ -2323,7 +2366,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
             }
             AdditionalCost::Optional {
                 cost: repeatable_cost,
-                repeatable: true,
+                repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
             } => {
                 let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
                 pending.base_cost = base_cost.clone();
@@ -2334,13 +2377,13 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
                 pending.payment_mode = payment_mode;
                 pending.additional_cost_flow = Some(AdditionalCost::Optional {
                     cost: repeatable_cost.clone(),
-                    repeatable: true,
+                    repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
                 });
                 return finish_pending_cost_or_cast(state, player, pending, events);
             }
             AdditionalCost::Optional {
                 cost: opt_cost,
-                repeatable: false,
+                repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
             } => {
                 let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
                 pending.base_cost = base_cost.clone();
@@ -3356,7 +3399,7 @@ pub(super) fn effective_casualty_additional_cost(
             ])),
             count: 1,
         },
-        repeatable: false,
+        repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
     })
 }
 
@@ -3377,7 +3420,7 @@ pub(super) fn effective_conspire_additional_cost(
                 count: 2,
                 filter: crate::database::synthesis::conspire_tap_filter(),
             },
-            repeatable: false,
+            repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
         })
 }
 
@@ -3396,7 +3439,7 @@ pub(super) fn effective_replicate_additional_cost(
         })?;
     Some(AdditionalCost::Optional {
         cost: AbilityCost::Mana { cost },
-        repeatable: true,
+        repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
     })
 }
 
@@ -3460,7 +3503,7 @@ pub(super) fn effective_offering_additional_cost(
     let quality = effective_offering_quality(state, player, object_id)?;
     Some(AdditionalCost::Optional {
         cost: offering_sacrifice_cost(&quality),
-        repeatable: false,
+        repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
     })
 }
 
@@ -3649,8 +3692,8 @@ pub(super) fn retrace_discard_land_cost() -> AbilityCost {
     AbilityCost::Discard {
         count: QuantityExpr::Fixed { value: 1 },
         filter: Some(TargetFilter::Typed(TypedFilter::land())),
-        random: false,
-        self_ref: false,
+        selection: crate::types::ability::CardSelectionMode::Chosen,
+        self_scope: crate::types::ability::DiscardSelfScope::FromHand,
     }
 }
 
@@ -3670,8 +3713,8 @@ pub(super) fn jumpstart_discard_card_cost() -> AbilityCost {
     AbilityCost::Discard {
         count: QuantityExpr::Fixed { value: 1 },
         filter: None,
-        random: false,
-        self_ref: false,
+        selection: crate::types::ability::CardSelectionMode::Chosen,
+        self_scope: crate::types::ability::DiscardSelfScope::FromHand,
     }
 }
 
@@ -6919,23 +6962,23 @@ mod tests {
                     },
                 },
             ],
-            repeatable: false,
+            repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
         });
 
-        let (variant, _, repeatable) =
+        let (variant, _, repeatability) =
             next_kicker_option(&state, PlayerId(0), &pending).expect("first kicker option");
         assert_eq!(variant, KickerVariant::First);
-        assert!(!repeatable);
+        assert!(repeatability.is_once());
 
         pending
             .ability
             .context
             .kickers_paid
             .push(KickerVariant::First);
-        let (variant, _, repeatable) =
+        let (variant, _, repeatability) =
             next_kicker_option(&state, PlayerId(0), &pending).expect("second kicker option");
         assert_eq!(variant, KickerVariant::Second);
-        assert!(!repeatable);
+        assert!(repeatability.is_once());
     }
 
     #[test]
@@ -6951,7 +6994,7 @@ mod tests {
                     generic: 1,
                 },
             }],
-            repeatable: true,
+            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
         });
 
         pending
@@ -6965,10 +7008,10 @@ mod tests {
             .kickers_paid
             .push(KickerVariant::First);
 
-        let (variant, _, repeatable) =
+        let (variant, _, repeatability) =
             next_kicker_option(&state, PlayerId(0), &pending).expect("repeatable kicker option");
         assert_eq!(variant, KickerVariant::First);
-        assert!(repeatable);
+        assert!(repeatability.is_repeatable());
     }
 
     #[test]
@@ -7054,7 +7097,7 @@ mod tests {
             WaitingFor::OptionalCostChoice { cost, .. } => match cost {
                 AdditionalCost::Optional {
                     cost: AbilityCost::Sacrifice { target, count },
-                    repeatable: false,
+                    repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
                 } => {
                     assert_eq!(count, 1);
                     match target {
@@ -7169,7 +7212,7 @@ mod tests {
             WaitingFor::OptionalCostChoice { cost, .. } => match cost {
                 AdditionalCost::Optional {
                     cost: AbilityCost::TapCreatures { count, filter },
-                    repeatable: false,
+                    repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
                 } => {
                     assert_eq!(count, 2, "conspire taps exactly two creatures");
                     match filter {
@@ -7804,7 +7847,7 @@ mod tests {
             state.players[0].mana_pool.add(ManaUnit {
                 color,
                 source_id: floated_source,
-                snow: false,
+                supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
                 grants: vec![],
@@ -7871,7 +7914,7 @@ mod tests {
         state.players[0].mana_pool.add(ManaUnit {
             color: ManaType::Blue,
             source_id: ObjectId(99),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),
             grants: vec![],
@@ -9716,7 +9759,7 @@ mod tests {
             state.players[0].mana_pool.add(ManaUnit {
                 color: ManaType::Colorless,
                 source_id: ObjectId(99),
-                snow: false,
+                supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
                 grants: vec![],
@@ -11228,7 +11271,7 @@ it for each time it was kicked.\n{T}: Add {C} for each charge counter on this ar
             p0.mana_pool.add(ManaUnit {
                 color: ManaType::Colorless,
                 source_id: ObjectId(0),
-                snow: false,
+                supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
                 grants: vec![],
@@ -11249,7 +11292,7 @@ it for each time it was kicked.\n{T}: Add {C} for each charge counter on this ar
             p0.mana_pool.add(ManaUnit {
                 color: ManaType::White,
                 source_id: ObjectId(0),
-                snow: false,
+                supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
                 grants: vec![],
@@ -11298,7 +11341,7 @@ it for each time it was kicked.\n{T}: Add {C} for each charge counter on this ar
                     matches!(
                         cost,
                         AdditionalCost::Kicker {
-                            repeatable: true,
+                            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
                             ..
                         }
                     ),
@@ -11322,7 +11365,7 @@ it for each time it was kicked.\n{T}: Add {C} for each charge counter on this ar
                     matches!(
                         cost,
                         AdditionalCost::Kicker {
-                            repeatable: true,
+                            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
                             ..
                         }
                     ),
@@ -11455,7 +11498,7 @@ many tokens that are copies of it.)";
                     cost,
                     AdditionalCost::Optional {
                         cost: AbilityCost::Mana { .. },
-                        repeatable: true,
+                        repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
                     }
                 ));
                 assert_eq!(times_kicked, 0);
@@ -11616,7 +11659,7 @@ its replicate cost was paid.)\nDraw a card.";
                         cost,
                         AdditionalCost::Optional {
                             cost: AbilityCost::Mana { .. },
-                            repeatable: true,
+                            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
                         }
                     ),
                     "replicate must surface a repeatable Optional mana cost: {cost:?}"
@@ -11677,7 +11720,7 @@ its replicate cost was paid.)\nDraw a card.";
                         cost,
                         AdditionalCost::Optional {
                             cost: AbilityCost::Mana { .. },
-                            repeatable: true,
+                            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
                         }
                     ),
                     "granted Replicate must surface a repeatable Optional mana cost: {cost:?}"
@@ -12200,7 +12243,7 @@ its replicate cost was paid.)\nDraw a card.";
                         cost,
                         AdditionalCost::Optional {
                             cost: AbilityCost::Sacrifice { count: 1, .. },
-                            repeatable: false,
+                            repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
                         }
                     ),
                     "expected optional Spirit sacrifice, got {cost:?}"

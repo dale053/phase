@@ -3209,7 +3209,7 @@ mod tests {
             tf.properties.contains(&FilterProp::HasAttachment {
                 kind: AttachmentKind::Aura,
                 controller: None,
-                exclude_source: true,
+                exclude_source: crate::types::ability::SourceExclusion::Exclude,
             }),
             "expected FilterProp::HasAttachment {{ Aura, exclude_source }}; got {:?}",
             tf.properties

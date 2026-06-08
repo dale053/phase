@@ -164,7 +164,7 @@ pub(crate) fn parse_kicker_additional_cost_line(raw: &str, lower: &str) -> Optio
     if repeatable {
         return Some(AdditionalCost::Kicker {
             costs: vec![parse_kicker_cost_payload(raw_after_prefix)?],
-            repeatable: true,
+            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
         });
     }
 
@@ -185,7 +185,7 @@ pub(crate) fn parse_kicker_additional_cost_line(raw: &str, lower: &str) -> Optio
 
     Some(AdditionalCost::Kicker {
         costs,
-        repeatable: false,
+        repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
     })
 }
 

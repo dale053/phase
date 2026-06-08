@@ -1664,8 +1664,8 @@ fn parse_unless_discard_cost(discard_tail: &str) -> Option<AbilityCost> {
                 return Some(AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false,
+                    selection: crate::types::ability::CardSelectionMode::Chosen,
+                    self_scope: crate::types::ability::DiscardSelfScope::FromHand,
                 });
             }
         }
@@ -1674,8 +1674,8 @@ fn parse_unless_discard_cost(discard_tail: &str) -> Option<AbilityCost> {
             return Some(AbilityCost::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 filter: Some(filter),
-                random: false,
-                self_ref: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                self_scope: crate::types::ability::DiscardSelfScope::FromHand,
             });
         }
     }
@@ -1986,8 +1986,8 @@ fn parse_unless_they_discard_cost(input: &str) -> Option<(AbilityCost, &str)> {
                 AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false,
+                    selection: crate::types::ability::CardSelectionMode::Chosen,
+                    self_scope: crate::types::ability::DiscardSelfScope::FromHand,
                 },
                 after,
             ));
@@ -1999,8 +1999,8 @@ fn parse_unless_they_discard_cost(input: &str) -> Option<(AbilityCost, &str)> {
             AbilityCost::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 filter: Some(filter),
-                random: false,
-                self_ref: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                self_scope: crate::types::ability::DiscardSelfScope::FromHand,
             },
             after,
         ));
@@ -7546,7 +7546,7 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
             FilterProp::HasAttachment {
                 kind: AttachmentKind::Aura,
                 controller: Some(ControllerRef::You),
-                exclude_source: false,
+                exclude_source: crate::types::ability::SourceExclusion::Include,
             },
         ),
         (
@@ -7554,7 +7554,7 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
             FilterProp::HasAttachment {
                 kind: AttachmentKind::Aura,
                 controller: Some(ControllerRef::You),
-                exclude_source: false,
+                exclude_source: crate::types::ability::SourceExclusion::Include,
             },
         ),
         (
@@ -7562,7 +7562,7 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
             FilterProp::HasAttachment {
                 kind: AttachmentKind::Equipment,
                 controller: Some(ControllerRef::You),
-                exclude_source: false,
+                exclude_source: crate::types::ability::SourceExclusion::Include,
             },
         ),
         (
@@ -7570,7 +7570,7 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
             FilterProp::HasAttachment {
                 kind: AttachmentKind::Equipment,
                 controller: Some(ControllerRef::You),
-                exclude_source: false,
+                exclude_source: crate::types::ability::SourceExclusion::Include,
             },
         ),
     ];
@@ -11190,11 +11190,11 @@ mod tests {
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
         AbilityCondition, AbilityCost, AbilityKind, AggregateFunction, BounceSelection,
-        CastingPermission, ChosenAttribute, Comparator, ContinuousModification, ControllerRef,
-        CountScope, DamageModification, DamageSource, DelayedTriggerCondition, Duration, Effect,
-        FilterProp, ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat, PtValue,
-        PtValueScope, QuantityExpr, QuantityRef, SharedQuality, TargetFilter, TypeFilter,
-        TypedFilter,
+        CardSelectionMode, CastingPermission, ChosenAttribute, Comparator, ContinuousModification,
+        ControllerRef, CountScope, DamageModification, DamageSource, DelayedTriggerCondition,
+        DiscardSelfScope, Duration, Effect, FilterProp, ManaSpendPermission, ObjectScope,
+        PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
+        SharedQuality, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::game_state::WaitingFor;
@@ -17883,8 +17883,8 @@ mod tests {
                 AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false
+                    selection: CardSelectionMode::Chosen,
+                    self_scope: DiscardSelfScope::FromHand
                 }
             ),
             "cost should be DiscardCard, got {:?}",
@@ -18712,8 +18712,8 @@ mod tests {
                 AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false
+                    selection: CardSelectionMode::Chosen,
+                    self_scope: DiscardSelfScope::FromHand
                 }
             ),
             "cost should be DiscardCard, got {:?}",
@@ -18868,8 +18868,8 @@ mod tests {
                 AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false
+                    selection: CardSelectionMode::Chosen,
+                    self_scope: DiscardSelfScope::FromHand
                 }
             ),
             "cost should be DiscardCard, got {:?}",
@@ -20962,7 +20962,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*destination, Zone::Battlefield);
-                assert!(*enter_tapped, "expected enter_tapped");
+                assert!(enter_tapped.is_tapped(), "expected enter_tapped.is_tapped()");
                 assert!(*enters_attacking, "expected enters_attacking");
             }
             other => panic!("expected ChangeZone, got {other:?}"),
@@ -20987,7 +20987,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*destination, Zone::Battlefield);
-                assert!(*enter_tapped);
+                assert!(enter_tapped.is_tapped());
                 assert!(*enters_attacking);
             }
             other => panic!("expected ChangeZone, got {other:?}"),
@@ -21409,7 +21409,7 @@ mod tests {
             Effect::ChangeZone {
                 destination: Zone::Battlefield,
                 enters_under: Some(ControllerRef::You),
-                enter_tapped: true,
+                enter_tapped: crate::types::zones::EtbTapState::Tapped,
                 enters_attacking: true,
                 ..
             } => {} // expected
