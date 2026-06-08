@@ -44019,6 +44019,36 @@ mod snapshot_tests {
 }
 
 #[test]
+fn issue_2406_chaos_warp_owner_library_shuffle_and_reveal() {
+    let def = parse_effect_chain(
+        "The owner of target permanent shuffles it into their library, then reveals the top card of that library. If it's a permanent card, they put it onto the battlefield.",
+        AbilityKind::Spell,
+    );
+    let Effect::ChangeZone {
+        owner_library: true,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected owner-library ChangeZone, got {:?}", def.effect);
+    };
+    let shuffle = def.sub_ability.as_ref().expect("shuffle sub");
+    assert_eq!(
+        shuffle.effect.target_filter(),
+        Some(&TargetFilter::ParentTargetOwner)
+    );
+    let reveal = shuffle
+        .sub_ability
+        .as_ref()
+        .expect("reveal sub")
+        .effect
+        .as_ref();
+    let Effect::RevealTop { player, count: 1 } = reveal else {
+        panic!("expected RevealTop of owner's library, got {reveal:?}");
+    };
+    assert_eq!(*player, TargetFilter::ParentTargetOwner);
+}
+
+#[test]
 fn issue_2402_hazel_copy_target_token_trigger_parses() {
     let def = parse_trigger_line(
         "At the beginning of your end step, create a token that's a copy of target token you control. If that token is a Squirrel, instead create two tokens that are copies of it.",
