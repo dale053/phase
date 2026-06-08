@@ -4418,6 +4418,11 @@ pub enum ParsedCondition {
         zone: crate::types::zones::Zone,
         count: usize,
     },
+    ZoneCoreTypeCardCountAtLeast {
+        zone: crate::types::zones::Zone,
+        core_type: CoreType,
+        count: usize,
+    },
     ZoneSubtypeCardCountAtLeast {
         zone: crate::types::zones::Zone,
         subtype: String,

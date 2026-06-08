@@ -98,8 +98,8 @@ pub(crate) fn is_pay_life_as_colored_mana_pattern(lower: &str) -> bool {
 /// when the gate is unrecognized.
 /// Verified: CR 702.29a (docs/MagicCompRules.txt:4202), CR 702.122a (docs/MagicCompRules.txt:4870).
 pub(crate) fn is_alternative_keyword_cost_pattern(lower: &str) -> bool {
-    (lower_starts_with(lower, "you may ") || lower_starts_with(lower, "as long as "))
-        && scan_contains(lower, "you may ")
+    (lower_starts_with(lower, "you may ")
+        || (lower_starts_with(lower, "as long as ") && scan_contains(lower, "you may ")))
         && scan_contains(lower, "rather than pay")
         && (scan_contains(lower, "cycling cost") || scan_contains(lower, "crew cost"))
 }

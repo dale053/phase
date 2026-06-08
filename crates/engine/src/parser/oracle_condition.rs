@@ -583,25 +583,32 @@ fn parse_hand_condition(text: &str) -> Option<ParsedCondition> {
     {
         return Some(ParsedCondition::HandSizeExact { count: 0 });
     }
-    // "you have no [subtype] cards in hand" — e.g. "you have no land cards in hand".
-    // CR 601.3: Cast restriction — hand contains no cards of the given subtype.
-    // Uses Not { ZoneSubtypeCardCountAtLeast { Hand, subtype, 1 } } to express
-    // "count of [subtype] cards in hand == 0". Note: ZoneSubtypeCardCountAtLeast { count: 0 }
-    // evaluates as always-true in the runtime evaluator; we use count: 1 + Not here.
+    // "you have no [kind] cards in hand" — e.g. "you have no land cards in hand".
+    // CR 601.3: Cast restriction — hand contains no cards of the given core type
+    // or subtype. Use count: 1 + Not because count-at-least 0 is always true.
     // Verified: CR 601.3 (docs/MagicCompRules.txt:2475).
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("you have no ").parse(text) {
-        if let Ok((_, subtype_raw)) = terminated(
+        if let Ok((_, kind_raw)) = terminated(
             take_until::<_, _, OracleError<'_>>(" card"),
             alt((tag(" cards in hand"), tag(" card in hand"))),
         )
         .parse(rest)
         {
-            let subtype = subtype_raw.trim().to_string();
-            if !subtype.is_empty() {
+            let kind = kind_raw.trim();
+            if let Some(core_type) = parse_core_type_word(kind) {
+                return Some(ParsedCondition::Not {
+                    condition: Box::new(ParsedCondition::ZoneCoreTypeCardCountAtLeast {
+                        zone: Zone::Hand,
+                        core_type,
+                        count: 1,
+                    }),
+                });
+            }
+            if !kind.is_empty() {
                 return Some(ParsedCondition::Not {
                     condition: Box::new(ParsedCondition::ZoneSubtypeCardCountAtLeast {
                         zone: Zone::Hand,
-                        subtype,
+                        subtype: kind.to_string(),
                         count: 1,
                     }),
                 });

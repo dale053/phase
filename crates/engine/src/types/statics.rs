@@ -696,7 +696,7 @@ pub enum StaticMode {
     ///
     /// `frequency`: None = all activations; Some(OncePerTurn) = first per turn.
     ///
-    /// RUNTIME: passive (parser-complete, runtime hook deferred).
+    /// Parser-complete structured gap; runtime hook deferred.
     /// CR 702.29a (docs/MagicCompRules.txt:4202), CR 702.122a (docs/MagicCompRules.txt:4870),
     /// CR 118.9 (docs/MagicCompRules.txt:1014).
     AlternativeKeywordCost {

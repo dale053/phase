@@ -7651,6 +7651,46 @@ mod tests {
         );
     }
 
+    // CR 118.9 + CR 702.29a: Gavi's "first card you cycle each turn" clause
+    // routes to the once-per-turn frequency on the cycling alternative cost.
+    #[test]
+    fn gavi_alternative_cycling_cost_tracks_once_per_turn_frequency() {
+        let r = parse(
+            "You may pay {0} rather than pay the cycling cost of the first card you cycle each turn.",
+            "Gavi, Nest Warden",
+            &[],
+            &["Creature"],
+            &[],
+        );
+        let alt = r.statics.iter().find_map(|s| match &s.mode {
+            StaticMode::AlternativeKeywordCost {
+                keyword: crate::types::keywords::KeywordKind::Cycling,
+                cost,
+                frequency,
+            } => Some((cost, frequency)),
+            _ => None,
+        });
+        let (cost, frequency) = alt.unwrap_or_else(|| {
+            panic!(
+                "expected cycling AlternativeKeywordCost, statics: {:?}, warnings: {:?}",
+                r.statics, r.parse_warnings
+            )
+        });
+        assert!(
+            matches!(cost, AbilityCost::Mana { cost } if cost == &ManaCost::generic(0)),
+            "expected zero mana alternative cost, got {cost:?}"
+        );
+        assert_eq!(
+            frequency,
+            &Some(crate::types::statics::CastFrequency::OncePerTurn)
+        );
+        assert!(
+            r.parse_warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            r.parse_warnings
+        );
+    }
+
     // CR 118.9 + CR 701.20a + CR 601.3: Land Grant — "If you have no land cards in
     // hand, you may reveal your hand rather than pay this spell's mana cost."
     // routes to a conditional alternative-cost casting option whose cost is an
@@ -7675,7 +7715,18 @@ mod tests {
             Some(AbilityCost::EffectCost { ref effect })
                 if matches!(**effect, Effect::RevealHand { .. })
         ));
-        assert!(r.casting_options[0].condition.is_some());
+        assert!(matches!(
+            r.casting_options[0].condition.as_ref(),
+            Some(ParsedCondition::Not { condition })
+                if matches!(
+                    condition.as_ref(),
+                    ParsedCondition::ZoneCoreTypeCardCountAtLeast {
+                        zone: Zone::Hand,
+                        core_type: crate::types::card_type::CoreType::Land,
+                        count: 1,
+                    }
+                )
+        ));
         assert!(
             r.parse_warnings.is_empty(),
             "unexpected warnings: {:?}",

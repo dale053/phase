@@ -460,9 +460,7 @@ fn parse_alternative_keyword_cost_body(text: &str) -> Option<StaticDefinition> {
     };
 
     // Frequency: detect "the first card you [keyword] each turn" pattern.
-    let frequency = if nom_primitives::scan_contains(kw_lower, "first card you cycle each turn")
-        || nom_primitives::scan_contains(kw_lower, "first card you cycling each turn")
-    {
+    let frequency = if nom_primitives::scan_contains(kw_lower, "first card you cycle each turn") {
         Some(CastFrequency::OncePerTurn)
     } else {
         None
