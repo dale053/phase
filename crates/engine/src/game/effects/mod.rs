@@ -1238,7 +1238,8 @@ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> b
             | AbilityCondition::ScopedPlayerMatches { .. }
             | AbilityCondition::EffectOutcome {
                 signal: EffectOutcomeSignal::CurrentScopeSucceeded,
-            },
+            }
+            | AbilityCondition::Shared { .. },
         ) => false,
     }
 }
@@ -5440,6 +5441,14 @@ pub(crate) fn evaluate_condition(
             let candidate = ability.scoped_player.unwrap_or(ability.controller);
             scoped_player_matches_filter(state, ability, candidate, filter)
         }
+        AbilityCondition::Shared { condition } => crate::game::conditions::eval_condition(
+            state,
+            condition,
+            ability.controller,
+            ability.source_id,
+            None,
+            crate::types::ability::SourceIsTappedEval::RegardlessOfZone,
+        ),
     }
 }
 

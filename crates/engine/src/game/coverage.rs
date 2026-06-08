@@ -5341,6 +5341,7 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         // `evaluate_condition` (effects/mod.rs). Used by cross-scope decline-tail
         // gates (Liliana, Waker of the Dead — parent `All`, decline `Opponent`).
         AbilityCondition::ScopedPlayerMatches { .. } => ("ScopedPlayerMatches", Handled),
+        AbilityCondition::Shared { .. } => ("Shared", Handled),
     }
 }
 
@@ -5577,6 +5578,7 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::SourceInZone { .. } => ("SourceInZone", Handled),
         StaticCondition::EnchantedIsFaceDown => ("EnchantedIsFaceDown", Handled),
         StaticCondition::AdditionalCostPaid => ("AdditionalCostPaid", Handled),
+        StaticCondition::Shared { .. } => ("Shared", Handled),
     }
 }
 

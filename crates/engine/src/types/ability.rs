@@ -4120,6 +4120,92 @@ pub enum CommanderOwnership {
     Any,
 }
 
+/// Shared game-state predicates evaluated identically across static, ability, and
+/// trigger contexts. Context-specific conditions remain on the wrapper enums.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Condition {
+    And {
+        conditions: Vec<Condition>,
+    },
+    Or {
+        conditions: Vec<Condition>,
+    },
+    Not {
+        condition: Box<Condition>,
+    },
+    HasMaxSpeed,
+    IsMonarch,
+    NoMonarch,
+    HasCityBlessing,
+    SourceIsTapped,
+    SourceMatchesFilter {
+        filter: TargetFilter,
+    },
+    SourceEnteredThisTurn,
+    WasStartingPlayer {
+        controller: ControllerRef,
+    },
+    SpellCastWithVariantThisTurn {
+        variant: crate::types::game_state::CastingVariant,
+    },
+    ClassLevelGE {
+        level: u8,
+    },
+    ControlsCommander {
+        ownership: CommanderOwnership,
+    },
+    ChosenLabelIs {
+        label: String,
+    },
+    SourceInZone {
+        zone: crate::types::zones::Zone,
+    },
+    HasCounters {
+        counters: CounterMatch,
+        minimum: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maximum: Option<u32>,
+    },
+    QuantityComparison {
+        lhs: QuantityExpr,
+        comparator: Comparator,
+        rhs: QuantityExpr,
+    },
+    DayNightIs {
+        state: crate::types::game_state::DayNight,
+    },
+    DuringYourTurn,
+    SourceIsAttacking,
+    CastVariantPaid {
+        variant: CastVariantPaid,
+    },
+}
+
+impl Condition {
+    /// Wrap this predicate for use in a static-ability condition slot.
+    pub fn into_static(self) -> StaticCondition {
+        StaticCondition::Shared { condition: self }
+    }
+
+    /// Wrap this predicate for use in an ability-resolution condition slot.
+    pub fn into_ability(self) -> AbilityCondition {
+        AbilityCondition::Shared { condition: self }
+    }
+
+    /// Wrap this predicate for use in a trigger intervening-if slot.
+    pub fn into_trigger(self) -> TriggerCondition {
+        TriggerCondition::Shared { condition: self }
+    }
+}
+
+/// How `Condition::SourceIsTapped` applies the CR 110.5d battlefield zone guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceIsTappedEval {
+    OnBattlefield,
+    RegardlessOfZone,
+}
+
 /// Condition for static ability applicability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -4371,7 +4457,87 @@ pub enum StaticCondition {
     /// Hamlet Glutton's "This spell costs {2} less to cast if it's bargained." Evaluated
     /// against the in-flight cast's `additional_cost_paid` flag (`state.pending_cast`).
     AdditionalCostPaid,
+    Shared {
+        condition: Condition,
+    },
     None,
+}
+
+impl StaticCondition {
+    /// Lift context-free predicates to the shared [`Condition`] tree.
+    ///
+    /// Returns `None` for static-only variants (`DevotionGE`, `IsPresent`,
+    /// `UnlessPay`, etc.) that have no shared equivalent.
+    pub fn to_condition(&self) -> Option<Condition> {
+        match self {
+            Self::Shared { condition } => Some(condition.clone()),
+            Self::And { conditions } => {
+                let lifted: Option<Vec<Condition>> =
+                    conditions.iter().map(Self::to_condition).collect();
+                Some(Condition::And {
+                    conditions: lifted?,
+                })
+            }
+            Self::Or { conditions } => {
+                let lifted: Option<Vec<Condition>> =
+                    conditions.iter().map(Self::to_condition).collect();
+                Some(Condition::Or {
+                    conditions: lifted?,
+                })
+            }
+            Self::Not { condition } => Some(Condition::Not {
+                condition: Box::new(condition.to_condition()?),
+            }),
+            Self::ChosenLabelIs { label } => Some(Condition::ChosenLabelIs {
+                label: label.clone(),
+            }),
+            Self::QuantityComparison {
+                lhs,
+                comparator,
+                rhs,
+            } => Some(Condition::QuantityComparison {
+                lhs: lhs.clone(),
+                comparator: *comparator,
+                rhs: rhs.clone(),
+            }),
+            Self::HasMaxSpeed => Some(Condition::HasMaxSpeed),
+            Self::DayNightIs { state } => Some(Condition::DayNightIs { state: *state }),
+            Self::HasCounters {
+                counters,
+                minimum,
+                maximum,
+            } => Some(Condition::HasCounters {
+                counters: counters.clone(),
+                minimum: *minimum,
+                maximum: *maximum,
+            }),
+            Self::CastVariantPaid { variant } => {
+                Some(Condition::CastVariantPaid { variant: *variant })
+            }
+            Self::ClassLevelGE { level } => Some(Condition::ClassLevelGE { level: *level }),
+            Self::SourceIsAttacking => Some(Condition::SourceIsAttacking),
+            Self::IsMonarch => Some(Condition::IsMonarch),
+            Self::NoMonarch => Some(Condition::NoMonarch),
+            Self::HasCityBlessing => Some(Condition::HasCityBlessing),
+            Self::WasStartingPlayer { controller } => Some(Condition::WasStartingPlayer {
+                controller: controller.clone(),
+            }),
+            Self::SpellCastWithVariantThisTurn { variant } => {
+                Some(Condition::SpellCastWithVariantThisTurn { variant: *variant })
+            }
+            Self::DuringYourTurn => Some(Condition::DuringYourTurn),
+            Self::SourceEnteredThisTurn => Some(Condition::SourceEnteredThisTurn),
+            Self::ControlsCommander { ownership } => Some(Condition::ControlsCommander {
+                ownership: *ownership,
+            }),
+            Self::SourceIsTapped => Some(Condition::SourceIsTapped),
+            Self::SourceMatchesFilter { filter } => Some(Condition::SourceMatchesFilter {
+                filter: filter.clone(),
+            }),
+            Self::SourceInZone { zone } => Some(Condition::SourceInZone { zone: *zone }),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -10048,7 +10214,9 @@ pub enum AbilityCondition {
     /// a previous instruction in the same resolution. Parameterized so
     /// optional-decline and mandatory-impossible branches share one condition
     /// family instead of proliferating `IfYouDo`-style siblings.
-    EffectOutcome { signal: EffectOutcomeSignal },
+    EffectOutcome {
+        signal: EffectOutcomeSignal,
+    },
     /// CR 608.2c: "If you won" — sub_ability executes only if this ability's
     /// controller won the triggering event, such as a clash or coin flip. Falls
     /// back to `optional_effect_performed` for in-chain clash continuations
@@ -10064,17 +10232,26 @@ pub enum AbilityCondition {
     WhenYouDo,
     /// CR 603.4: "If you cast it from [zone]" — sub_ability executes only if the spell
     /// was cast from the specified zone. Evaluated against SpellContext.cast_from_zone.
-    CastFromZone { zone: Zone },
+    CastFromZone {
+        zone: Zone,
+    },
     /// CR 207.2c + CR 601.2: "if you cast this spell during your [phase/step]".
     /// `phases` is parameterized so grouped phrases like "main phase" can map to
     /// both concrete main phases without proliferating condition variants.
-    CastDuringPhase { phases: Vec<Phase> },
+    CastDuringPhase {
+        phases: Vec<Phase>,
+    },
     /// CR 601.3b + CR 702.8a: The source permanent came from a spell cast using
     /// a specific timing permission this turn.
-    CastTimingPermission { permission: CastTimingPermission },
+    CastTimingPermission {
+        permission: CastTimingPermission,
+    },
     /// CR 601.2h + CR 608.2c: "if {C} was spent to cast this spell" gates
     /// resolution on the source object's recorded paid-mana colors.
-    ManaColorSpent { color: ManaColor, minimum: u32 },
+    ManaColorSpent {
+        color: ManaColor,
+        minimum: u32,
+    },
     /// CR 608.2c: "If it's a [type] card" — gates sub_ability on the last
     /// revealed card's type, or on the just-moved card when the parent effect
     /// changed zones without revealing.
@@ -10101,12 +10278,16 @@ pub enum AbilityCondition {
     SourceEnteredThisTurn,
     /// CR 702.49 + CR 603.4: True when the source permanent entered via a ninjutsu-family
     /// activation of the specified variant this turn.
-    CastVariantPaid { variant: CastVariantPaid },
+    CastVariantPaid {
+        variant: CastVariantPaid,
+    },
     /// CR 608.2e + CR 702.49 + CR 702.190a: "Instead" override gated on the source
     /// permanent having entered via a specified cast/activation variant this turn.
     /// Unlike AdditionalCostPaidInstead (which reads SpellContext.additional_cost_paid),
     /// this reads GameObject.cast_variant_paid from the game state.
-    CastVariantPaidInstead { variant: CastVariantPaid },
+    CastVariantPaidInstead {
+        variant: CastVariantPaid,
+    },
     /// CR 608.2c: General-purpose quantity comparison condition on effects.
     /// "if its power is N or greater" / "if its toughness is less than N" etc.
     /// Composes existing `QuantityExpr` and `Comparator` building blocks.
@@ -10133,7 +10314,9 @@ pub enum AbilityCondition {
     /// CR 608.2e: "If [target] has [keyword], [override effect] instead"
     /// Checked at resolution time against the first resolved object target's keywords.
     /// Uses "Instead" override semantics: swaps the parent effect when condition is met.
-    TargetHasKeywordInstead { keyword: Keyword },
+    TargetHasKeywordInstead {
+        keyword: Keyword,
+    },
     /// CR 400.7 + CR 608.2c: "If that creature was a [type]" — gates the sub_ability on
     /// whether the target (or its last-known information if `use_lki` is true) matches the filter.
     /// Present-tense ("is a") checks current state; past-tense ("was a") checks LKI per CR 400.7.
@@ -10146,7 +10329,9 @@ pub enum AbilityCondition {
     /// CR 608.2c: "If this creature/permanent is a [type]" — gates sub_ability on whether
     /// the ability's source object matches the filter. Used by leveler-style cards
     /// (e.g. Figure of Fable) where each activated ability gates on the source's current type.
-    SourceMatchesFilter { filter: TargetFilter },
+    SourceMatchesFilter {
+        filter: TargetFilter,
+    },
     /// CR 603.4 + CR 603.6 + CR 603.10: In a trigger-body condition, match the
     /// object from the current zone-change trigger event against a filter. ETB
     /// conditions check the live object in its destination zone; death/LTB
@@ -10163,11 +10348,15 @@ pub enum AbilityCondition {
     /// sense (reveal-tribal land cycles like Fortified Beachhead / Temple of the Dragon
     /// Queen on_decline), wrap with `AbilityCondition::Not`.
     /// `filter` MUST have its `ControllerRef::You` pre-bound by the parser.
-    ControllerControlsMatching { filter: TargetFilter },
+    ControllerControlsMatching {
+        filter: TargetFilter,
+    },
     /// CR 601.2 + CR 608.2c: "if you controlled a [filter] as you cast this spell" —
     /// gates on a casting-time snapshot in `SpellContext`, not the resolution-time
     /// battlefield. The parser pre-binds `ControllerRef::You` and battlefield scope.
-    ControllerControlledMatchingAsCast { filter: TargetFilter },
+    ControllerControlledMatchingAsCast {
+        filter: TargetFilter,
+    },
     /// CR 608.2c: "If it's your turn" — gates sub_ability on whether the active player
     /// is the ability's controller. For "if it's not your turn", wrap with
     /// `AbilityCondition::Not`.
@@ -10179,7 +10368,9 @@ pub enum AbilityCondition {
     /// player" (Radiant Smite, Cindercone Smite), wrap with
     /// `AbilityCondition::Not`. `controller` selects whose start status is
     /// checked; `ControllerRef::You` is the canonical reading.
-    WasStartingPlayer { controller: ControllerRef },
+    WasStartingPlayer {
+        controller: ControllerRef,
+    },
     /// CR 702.185c + CR 608.2c: "if a spell was warped this turn" — gates a
     /// follow-up effect on whether any player cast a spell using the named
     /// alternative-cast `variant` this turn. Parameterized by `CastingVariant`
@@ -10195,11 +10386,15 @@ pub enum AbilityCondition {
     /// Evaluated by checking `state.last_zone_changed_ids` against the filter.
     /// Handles both optional-targeting parents (empty targets → empty IDs → false)
     /// and mandatory parents (type filter check on moved objects).
-    ZoneChangedThisWay { filter: TargetFilter },
+    ZoneChangedThisWay {
+        filter: TargetFilter,
+    },
     /// CR 117.1 + CR 400.7j + CR 608.2k: "if you sacrificed/exiled/discarded a
     /// [filter] this way" checks the object paid as a cost for this resolving
     /// ability using its cost-payment-time public characteristics.
-    CostPaidObjectMatchesFilter { filter: TargetFilter },
+    CostPaidObjectMatchesFilter {
+        filter: TargetFilter,
+    },
     /// CR 110.5b: "if this [permanent] is tapped" — checks the source's tapped status.
     /// For the untapped sense, wrap with `AbilityCondition::Not`.
     SourceIsTapped,
@@ -10211,17 +10406,23 @@ pub enum AbilityCondition {
     ///
     /// Used for cross-line patterns like Delirium ("If [condition], instead [effect]")
     /// where the conditional replacement and the base effect are on separate Oracle lines.
-    ConditionInstead { inner: Box<AbilityCondition> },
+    ConditionInstead {
+        inner: Box<AbilityCondition>,
+    },
     /// CR 608.2c: Compound condition — all inner conditions must be true.
     /// Mirrors `TriggerCondition::And` for ability-level conditions.
     /// Used when multiple independent checks gate the same resolution
     /// (e.g., Revolt + mana value threshold on Fatal Push).
-    And { conditions: Vec<AbilityCondition> },
+    And {
+        conditions: Vec<AbilityCondition>,
+    },
     /// CR 608.2c: Compound condition — at least one inner condition must be true.
     /// Mirrors `TriggerCondition::Or` / `StaticCondition::Or` for ability-level
     /// conditions. Used when an intervening-if or sub-ability gate is satisfied
     /// by any of several independent checks.
-    Or { conditions: Vec<AbilityCondition> },
+    Or {
+        conditions: Vec<AbilityCondition>,
+    },
     /// CR 608.2c: Logical negation — sub_ability executes when `condition` is false.
     /// Mirrors `TriggerCondition::Not` for ability-level conditions. Replaces the
     /// per-leaf `negated: bool` fields that existed on `RevealedHasCardType`,
@@ -10229,7 +10430,9 @@ pub enum AbilityCondition {
     /// `SourceIsTapped`, plus the dedicated negation variants
     /// `AdditionalCostNotPaid` and `SourceDidNotEnterThisTurn`. Used by
     /// "if you don't" / "unless you" / "if it isn't" sub-clause gates.
-    Not { condition: Box<AbilityCondition> },
+    Not {
+        condition: Box<AbilityCondition>,
+    },
     /// CR 730.2a: True when it's neither day nor night (day_night is None).
     /// Used by Daybound/Nightbound ETB initialization: "If it's neither day nor night,
     /// it becomes day as this creature enters."
@@ -10245,10 +10448,14 @@ pub enum AbilityCondition {
     /// Cleared at end-of-turn cleanup alongside other per-turn counters.
     /// Used by Omnath, Locus of Creation and the broader nth-resolution class
     /// (Ashling the Pilgrim, Nissa Resurgent Animist, Teething Wurmlet, etc.).
-    NthResolutionThisTurn { n: u32 },
+    NthResolutionThisTurn {
+        n: u32,
+    },
     /// CR 702.x: True when the source permanent does not have the specified keyword.
     /// Inverse of keyword presence check — used by "if ~ doesn't have [keyword]" gates.
-    SourceLacksKeyword { keyword: Keyword },
+    SourceLacksKeyword {
+        keyword: Keyword,
+    },
     /// CR 101.3 + CR 109.5 + CR 608.2c: True when the current per-iteration
     /// scoped player (`ResolvedAbility.scoped_player`) matches `filter`
     /// relative to the ability's controller. Used by cross-scope decline-tail
@@ -10268,10 +10475,68 @@ pub enum AbilityCondition {
     /// Outside a `player_scope` iteration (no `scoped_player` bound) the
     /// condition resolves against the ability's controller — the canonical
     /// fallback semantics for the `ScopedPlayer`/`Controller` split.
-    ScopedPlayerMatches { filter: PlayerFilter },
+    ScopedPlayerMatches {
+        filter: PlayerFilter,
+    },
+    Shared {
+        condition: Condition,
+    },
 }
 
 impl AbilityCondition {
+    /// Lift context-free predicates to the shared [`Condition`] tree.
+    pub fn to_condition(&self) -> Option<Condition> {
+        match self {
+            Self::Shared { condition } => Some(condition.clone()),
+            Self::And { conditions } => {
+                let lifted: Option<Vec<Condition>> =
+                    conditions.iter().map(Self::to_condition).collect();
+                Some(Condition::And {
+                    conditions: lifted?,
+                })
+            }
+            Self::Or { conditions } => {
+                let lifted: Option<Vec<Condition>> =
+                    conditions.iter().map(Self::to_condition).collect();
+                Some(Condition::Or {
+                    conditions: lifted?,
+                })
+            }
+            Self::Not { condition } => Some(Condition::Not {
+                condition: Box::new(condition.to_condition()?),
+            }),
+            Self::HasMaxSpeed => Some(Condition::HasMaxSpeed),
+            Self::IsMonarch => Some(Condition::IsMonarch),
+            Self::HasCityBlessing => Some(Condition::HasCityBlessing),
+            Self::WasStartingPlayer { controller } => Some(Condition::WasStartingPlayer {
+                controller: controller.clone(),
+            }),
+            Self::SpellCastWithVariantThisTurn { variant } => {
+                Some(Condition::SpellCastWithVariantThisTurn { variant: *variant })
+            }
+            Self::DayNightIs { state } => Some(Condition::DayNightIs { state: *state }),
+            Self::SourceEnteredThisTurn => Some(Condition::SourceEnteredThisTurn),
+            Self::CastVariantPaid { variant } => {
+                Some(Condition::CastVariantPaid { variant: *variant })
+            }
+            Self::QuantityCheck {
+                lhs,
+                comparator,
+                rhs,
+            } => Some(Condition::QuantityComparison {
+                lhs: lhs.clone(),
+                comparator: *comparator,
+                rhs: rhs.clone(),
+            }),
+            Self::SourceMatchesFilter { filter } => Some(Condition::SourceMatchesFilter {
+                filter: filter.clone(),
+            }),
+            Self::SourceIsTapped => Some(Condition::SourceIsTapped),
+            Self::IsYourTurn => Some(Condition::DuringYourTurn),
+            _ => None,
+        }
+    }
+
     /// CR 608.2c / CR 608.2d: "if you do", "if that player does", and "if a
     /// player does" all read the same optional-effect-performed signal.
     pub fn effect_performed() -> Self {
@@ -10515,13 +10780,17 @@ pub(crate) fn additional_cost_payment_count_matches(
 pub enum TriggerCondition {
     // -- Predicates (leaf conditions) --
     /// "if you gained life this turn" / "if you've gained N or more life this turn"
-    GainedLife { minimum: u32 },
+    GainedLife {
+        minimum: u32,
+    },
     /// "if you lost life this turn"
     LostLife,
     /// "if you descended this turn" (a permanent card was put into your graveyard)
     Descended,
     /// "if you control a [type]" — general control presence check.
-    ControlsType { filter: TargetFilter },
+    ControlsType {
+        filter: TargetFilter,
+    },
     /// CR 603.4: "if no spells were cast last turn" — werewolf transform condition.
     NoSpellsCastLastTurn,
     /// CR 603.4: "if two or more spells were cast last turn" — werewolf reverse transform.
@@ -10535,7 +10804,9 @@ pub enum TriggerCondition {
     ///   (the player named by the trigger event — drawer, tapper, etc.)
     ///
     /// Negation ("if it isn't <player>'s turn") wraps via `Not { Box::new(...) }`.
-    DuringPlayersTurn { player: PlayerFilter },
+    DuringPlayersTurn {
+        player: PlayerFilter,
+    },
     /// CR 400.7 + CR 603.4: True when the source permanent entered the
     /// battlefield this turn.
     SourceEnteredThisTurn,
@@ -10564,10 +10835,15 @@ pub enum TriggerCondition {
     SolveConditionMet,
     /// CR 716.2a: True when the source Class enchantment is at or above the given level.
     /// Used to gate continuous triggers that only become active at higher class levels.
-    ClassLevelGE { level: u8 },
+    ClassLevelGE {
+        level: u8,
+    },
     /// CR 701.52a + CR 702.159a: Visit ability on a numbered attraction line —
     /// the roll from `AttractionVisited` must fall within the printed range.
-    AttractionVisitRoll { min: u8, max: u8 },
+    AttractionVisitRoll {
+        min: u8,
+        max: u8,
+    },
 
     /// CR 601.2 + CR 603.4: reads the ENTERING object's `cast_from_zone`, never the source.
     WasCast {
@@ -10604,12 +10880,16 @@ pub enum TriggerCondition {
     /// cost was paid this turn". True when the source permanent entered via the
     /// specified cast/activation variant this turn. Negation ("unless it escaped")
     /// is expressed via `Not { Box::new(CastVariantPaid { variant }) }`.
-    CastVariantPaid { variant: CastVariantPaid },
+    CastVariantPaid {
+        variant: CastVariantPaid,
+    },
     /// CR 702.176a + CR 603.4: True while the source permanent carries the
     /// persistent marker that its named alternative cost was paid. Used for
     /// recurring battlefield triggers such as Impending's end-step time-counter
     /// removal, which must continue across turns.
-    CastVariantPaidPersistent { variant: CastVariantPaid },
+    CastVariantPaidPersistent {
+        variant: CastVariantPaid,
+    },
 
     /// CR 605.1a + CR 603.4: Event qualifier for "that isn't a mana ability"
     /// on activated-ability trigger events.
@@ -10622,18 +10902,27 @@ pub enum TriggerCondition {
     /// CR 400.7 + CR 603.10: "if it was a [type]" — true when the trigger source's
     /// last known information includes the specified core type. Used by the Glimmer cycle
     /// ("when this dies, if it was a creature, return it").
-    WasType { card_type: CoreType },
+    WasType {
+        card_type: CoreType,
+    },
 
     /// CR 603.4: "if you have N or more life" — intervening-if condition checking life total.
-    LifeTotalGE { minimum: i32 },
+    LifeTotalGE {
+        minimum: i32,
+    },
 
     /// CR 603.4: "if you control N or more [type]" — generalized control count condition.
     /// Subsumes ControlCreatures for any permanent type (artifacts, enchantments, lands, etc.).
-    ControlCount { minimum: u32, filter: TargetFilter },
+    ControlCount {
+        minimum: u32,
+        filter: TargetFilter,
+    },
 
     /// CR 603.8: "when you control no [type]" — state trigger condition.
     /// True when the controller controls no permanents matching the filter.
-    ControlsNone { filter: TargetFilter },
+    ControlsNone {
+        filter: TargetFilter,
+    },
 
     /// CR 603.4: "if you attacked this turn" — true when the controller declared attackers
     /// during this turn's combat phase.
@@ -10644,7 +10933,9 @@ pub enum TriggerCondition {
 
     /// CR 603.4: "if you cast a [type] spell this turn" — true when the controller cast
     /// a spell matching the optional filter this turn.
-    CastSpellThisTurn { filter: Option<TargetFilter> },
+    CastSpellThisTurn {
+        filter: Option<TargetFilter>,
+    },
 
     /// Quantity comparison for trigger-side intervening-if checks.
     QuantityComparison {
@@ -10666,7 +10957,9 @@ pub enum TriggerCondition {
     /// trigger ("When you cycle Radiant Smite, if you weren't the starting
     /// player, ..."). Negation is expressed via `Not`. `controller` selects
     /// whose start status is checked.
-    WasStartingPlayer { controller: ControllerRef },
+    WasStartingPlayer {
+        controller: ControllerRef,
+    },
     /// CR 702.185c: "if a spell was warped this turn" — true when any player
     /// cast a spell using the named alternative-cast `variant` this turn.
     /// Parameterized by `CastingVariant` so every "cast via X this turn"
@@ -10699,7 +10992,9 @@ pub enum TriggerCondition {
     /// Negation ("face-up") is expressed via `Not { Box::new(SourceIsFaceDown) }`.
     SourceIsFaceDown,
     /// CR 113.6b: "if this card is in [zone]" — true when the trigger source is in the given zone.
-    SourceInZone { zone: crate::types::zones::Zone },
+    SourceInZone {
+        zone: crate::types::zones::Zone,
+    },
     /// CR 122.1: "if you put a counter on a permanent this turn" — true when the controller
     /// added any counter to any permanent this turn.
     CounterAddedThisTurn,
@@ -10710,27 +11005,42 @@ pub enum TriggerCondition {
 
     /// CR 509.1a + CR 603.4: "if defending player controls no [type]" — true when the
     /// defending player in the current combat controls no permanents matching the filter.
-    DefendingPlayerControlsNone { filter: TargetFilter },
+    DefendingPlayerControlsNone {
+        filter: TargetFilter,
+    },
 
     /// CR 702.104a: "if tribute wasn't paid" — Tribute mechanic intervening-if.
     TributeNotPaid,
     /// CR 207.2c + CR 601.2: "if you cast this spell during your [phase/step]".
     /// `phases` is parameterized so grouped phrases like "main phase" can map to
     /// both concrete main phases without proliferating condition variants.
-    CastDuringPhase { phases: Vec<Phase> },
+    CastDuringPhase {
+        phases: Vec<Phase>,
+    },
     /// CR 601.3b + CR 702.8a: The source permanent came from a spell cast using
     /// a specific timing permission this turn.
-    CastTimingPermission { permission: CastTimingPermission },
+    CastTimingPermission {
+        permission: CastTimingPermission,
+    },
     /// CR 207.2c: "if at least N mana of [color] was spent to cast this spell" — Adamant.
-    ManaColorSpent { color: ManaColor, minimum: u32 },
+    ManaColorSpent {
+        color: ManaColor,
+        minimum: u32,
+    },
     /// CR 601.2b: "if no mana was spent to cast it" / "if mana from a [source] was spent"
-    ManaSpentCondition { text: String },
+    ManaSpentCondition {
+        text: String,
+    },
     /// CR 400.7: "if it had a +1/+1 counter on it" / "if it had counters on it"
-    HadCounters { counter_type: Option<CounterType> },
+    HadCounters {
+        counter_type: Option<CounterType>,
+    },
     /// CR 903.3 + CR 109.5: "if you control your commander" — owner-scoped (Lieutenant).
     /// CR 903.3d: "if you control a commander" — controller-only, any owner.
     /// The `ownership` field selects which CR condition this is.
-    ControlsCommander { ownership: CommanderOwnership },
+    ControlsCommander {
+        ownership: CommanderOwnership,
+    },
     /// CR 702.112a: "if ~ is renowned" — true when the source has been made renowned.
     SourceIsRenowned,
     /// CR 711.2a + CR 711.2b: Level-up creature trigger gating — true when the source has at least
@@ -10766,7 +11076,9 @@ pub enum TriggerCondition {
     ZoneChangeObjectIsTapped,
     /// CR 603.4 + CR 611.2b: Source-bound intervening-if predicate expressed
     /// as a normal target filter evaluated against the trigger source.
-    SourceMatchesFilter { filter: TargetFilter },
+    SourceMatchesFilter {
+        filter: TargetFilter,
+    },
 
     /// CR 614.12c + CR 607.2d + CR 603.4: True when the trigger source's
     /// persisted `ChosenAttribute::Label` matches the given anchor word.
@@ -10776,7 +11088,9 @@ pub enum TriggerCondition {
     /// battlefield, this permanent has [ability]." Mirrors
     /// `StaticCondition::ChosenLabelIs`. Checked at both fire-time and
     /// resolution-time per CR 603.4.
-    ChosenLabelIs { label: String },
+    ChosenLabelIs {
+        label: String,
+    },
 
     /// CR 506.2 + CR 508.1 + CR 508.1b + CR 603.4: Intervening-if comparison
     /// over the current attack declaration. Handles "attacks with N or more
@@ -10819,9 +11133,13 @@ pub enum TriggerCondition {
 
     // -- Combinators --
     /// All conditions must be true ("if you gained and lost life this turn")
-    And { conditions: Vec<TriggerCondition> },
+    And {
+        conditions: Vec<TriggerCondition>,
+    },
     /// Any condition must be true
-    Or { conditions: Vec<TriggerCondition> },
+    Or {
+        conditions: Vec<TriggerCondition>,
+    },
     /// CR 603.4 + CR 608.2c: Logical negation — the wrapped condition must
     /// evaluate to false. Used for "unless [phrase]" intervening-if patterns
     /// ("you lose 4 life unless you attacked this turn"
@@ -10831,7 +11149,87 @@ pub enum TriggerCondition {
     /// `AbilityCondition::Not` so trigger-side negation composes uniformly
     /// with `And`/`Or`. Replaces per-leaf `negated: bool` fields and the
     /// `NotYourTurn` / `WasNotCast` / `NotCompletedDungeon` sibling-pair variants.
-    Not { condition: Box<TriggerCondition> },
+    Not {
+        condition: Box<TriggerCondition>,
+    },
+    Shared {
+        condition: Condition,
+    },
+}
+
+impl TriggerCondition {
+    /// Lift context-free predicates to the shared [`Condition`] tree.
+    pub fn to_condition(&self) -> Option<Condition> {
+        match self {
+            Self::Shared { condition } => Some(condition.clone()),
+            Self::And { conditions } => {
+                let lifted: Option<Vec<Condition>> =
+                    conditions.iter().map(Self::to_condition).collect();
+                Some(Condition::And {
+                    conditions: lifted?,
+                })
+            }
+            Self::Or { conditions } => {
+                let lifted: Option<Vec<Condition>> =
+                    conditions.iter().map(Self::to_condition).collect();
+                Some(Condition::Or {
+                    conditions: lifted?,
+                })
+            }
+            Self::Not { condition } => Some(Condition::Not {
+                condition: Box::new(condition.to_condition()?),
+            }),
+            Self::HasMaxSpeed => Some(Condition::HasMaxSpeed),
+            Self::WasStartingPlayer { controller } => Some(Condition::WasStartingPlayer {
+                controller: controller.clone(),
+            }),
+            Self::SpellCastWithVariantThisTurn { variant } => {
+                Some(Condition::SpellCastWithVariantThisTurn { variant: *variant })
+            }
+            Self::CastVariantPaidPersistent { variant } => {
+                Some(Condition::CastVariantPaid { variant: *variant })
+            }
+            Self::ClassLevelGE { level } => Some(Condition::ClassLevelGE { level: *level }),
+            Self::SourceMatchesFilter { filter } => Some(Condition::SourceMatchesFilter {
+                filter: filter.clone(),
+            }),
+            Self::IsMonarch => Some(Condition::IsMonarch),
+            Self::NoMonarch => Some(Condition::NoMonarch),
+            Self::HasCityBlessing => Some(Condition::HasCityBlessing),
+            Self::SourceIsTapped => Some(Condition::SourceIsTapped),
+            Self::SourceInZone { zone } => Some(Condition::SourceInZone { zone: *zone }),
+            Self::HasCounters {
+                counters,
+                minimum,
+                maximum,
+            } => Some(Condition::HasCounters {
+                counters: counters.clone(),
+                minimum: *minimum,
+                maximum: *maximum,
+            }),
+            Self::ChosenLabelIs { label } => Some(Condition::ChosenLabelIs {
+                label: label.clone(),
+            }),
+            Self::ControlsCommander { ownership } => Some(Condition::ControlsCommander {
+                ownership: *ownership,
+            }),
+            Self::SourceEnteredThisTurn => Some(Condition::SourceEnteredThisTurn),
+            Self::SourceIsAttacking => Some(Condition::SourceIsAttacking),
+            Self::DuringPlayersTurn {
+                player: PlayerFilter::Controller,
+            } => Some(Condition::DuringYourTurn),
+            Self::QuantityComparison {
+                lhs,
+                comparator,
+                rhs,
+            } => Some(Condition::QuantityComparison {
+                lhs: lhs.clone(),
+                comparator: *comparator,
+                rhs: rhs.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Condition that gates whether a replacement effect applies.

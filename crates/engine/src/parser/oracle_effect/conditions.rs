@@ -18,9 +18,9 @@ use super::super::oracle_util::{parse_comparison_suffix, parse_subtype, TextPair
 use super::{parse_effect_chain, scan_contains_phrase, ParseContext};
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
-    AbilityCondition, AbilityDefinition, AbilityKind, CastVariantPaid, Comparator, ControllerRef,
-    CountScope, Duration, Effect, FilterProp, ObjectScope, PlayerScope, QuantityExpr, QuantityRef,
-    StaticCondition, TargetFilter, TypeFilter, TypedFilter,
+    AbilityCondition, AbilityDefinition, AbilityKind, CastVariantPaid, Comparator, Condition,
+    ControllerRef, CountScope, Duration, Effect, FilterProp, ObjectScope, PlayerScope,
+    QuantityExpr, QuantityRef, StaticCondition, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -2118,11 +2118,97 @@ pub(super) fn difference_expr(cond: &AbilityCondition) -> Option<QuantityExpr> {
     }
 }
 
+/// Bridge a shared [`Condition`] to an [`AbilityCondition`].
+///
+/// Variants with a direct ability-resolution equivalent map 1:1; the remainder
+/// are preserved via `AbilityCondition::Shared` for `eval_condition` at runtime.
+pub(crate) fn condition_to_ability_condition(
+    condition: &Condition,
+    ctx: &mut ParseContext,
+) -> Option<AbilityCondition> {
+    match condition {
+        Condition::And { conditions } => {
+            let mapped: Option<Vec<_>> = conditions
+                .iter()
+                .map(|c| condition_to_ability_condition(c, ctx))
+                .collect();
+            Some(AbilityCondition::And {
+                conditions: mapped?,
+            })
+        }
+        Condition::Or { conditions } => {
+            let mapped: Option<Vec<_>> = conditions
+                .iter()
+                .map(|c| condition_to_ability_condition(c, ctx))
+                .collect();
+            Some(AbilityCondition::Or {
+                conditions: mapped?,
+            })
+        }
+        Condition::Not { condition } => {
+            condition_to_ability_condition(condition, ctx).map(|inner| AbilityCondition::Not {
+                condition: Box::new(inner),
+            })
+        }
+        Condition::DuringYourTurn => Some(AbilityCondition::IsYourTurn),
+        Condition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        } => Some(AbilityCondition::QuantityCheck {
+            lhs: lhs.clone(),
+            comparator: *comparator,
+            rhs: rhs.clone(),
+        }),
+        Condition::HasMaxSpeed => Some(AbilityCondition::HasMaxSpeed),
+        Condition::WasStartingPlayer { controller } => Some(AbilityCondition::WasStartingPlayer {
+            controller: controller.clone(),
+        }),
+        Condition::SpellCastWithVariantThisTurn { variant } => {
+            Some(AbilityCondition::SpellCastWithVariantThisTurn { variant: *variant })
+        }
+        Condition::IsMonarch => Some(AbilityCondition::IsMonarch),
+        Condition::HasCityBlessing => Some(AbilityCondition::HasCityBlessing),
+        Condition::DayNightIs { state } => Some(AbilityCondition::DayNightIs { state: *state }),
+        Condition::SourceEnteredThisTurn => Some(AbilityCondition::SourceEnteredThisTurn),
+        Condition::SourceMatchesFilter { filter } => Some(AbilityCondition::SourceMatchesFilter {
+            filter: filter.clone(),
+        }),
+        Condition::SourceIsTapped => Some(AbilityCondition::SourceIsTapped),
+        Condition::CastVariantPaid { variant } => {
+            Some(AbilityCondition::CastVariantPaid { variant: *variant })
+        }
+        Condition::HasCounters {
+            counters,
+            minimum,
+            maximum,
+        } => {
+            let qty = QuantityExpr::Ref {
+                qty: match counters {
+                    CounterMatch::OfType(ct) => QuantityRef::CountersOn {
+                        scope: ObjectScope::Source,
+                        counter_type: Some(ct.clone()),
+                    },
+                    CounterMatch::Any => QuantityRef::CountersOn {
+                        scope: ObjectScope::Source,
+                        counter_type: None,
+                    },
+                },
+            };
+            Some(counter_threshold_to_condition(qty, *minimum, *maximum))
+        }
+        _ => Some(AbilityCondition::Shared {
+            condition: condition.clone(),
+        }),
+    }
+}
+
 pub(crate) fn static_condition_to_ability_condition(
     sc: &StaticCondition,
     ctx: &mut ParseContext,
 ) -> Option<AbilityCondition> {
     match sc {
+        StaticCondition::Shared { condition } => condition_to_ability_condition(condition, ctx),
         StaticCondition::DuringYourTurn => Some(AbilityCondition::IsYourTurn),
         StaticCondition::QuantityComparison {
             lhs,

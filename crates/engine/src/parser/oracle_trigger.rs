@@ -35,7 +35,7 @@ use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, AttachmentKind,
     AttackersDeclaredCountSubject, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid,
-    CoinFlipResult, Comparator, ControllerRef, CounterTriggerFilter, DamageKindFilter,
+    CoinFlipResult, Comparator, Condition, ControllerRef, CounterTriggerFilter, DamageKindFilter,
     DestinationConstraint, Effect, FilterProp, ObjectScope, OriginConstraint, PlayerFilter,
     PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, StaticCondition, TargetFilter,
     TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
@@ -2340,6 +2340,86 @@ fn substitute_another_in_expr(expr: &QuantityExpr) -> QuantityExpr {
     }
 }
 
+/// Bridge a shared [`Condition`] to a [`TriggerCondition`].
+fn condition_to_trigger_condition(condition: &Condition) -> Option<TriggerCondition> {
+    match condition {
+        Condition::And { conditions } => {
+            let mapped: Option<Vec<_>> = conditions
+                .iter()
+                .map(condition_to_trigger_condition)
+                .collect();
+            Some(TriggerCondition::And {
+                conditions: mapped?,
+            })
+        }
+        Condition::Or { conditions } => {
+            let mapped: Option<Vec<_>> = conditions
+                .iter()
+                .map(condition_to_trigger_condition)
+                .collect();
+            Some(TriggerCondition::Or {
+                conditions: mapped?,
+            })
+        }
+        Condition::Not { condition } => {
+            condition_to_trigger_condition(condition).map(|inner| TriggerCondition::Not {
+                condition: Box::new(inner),
+            })
+        }
+        Condition::DuringYourTurn => Some(TriggerCondition::DuringPlayersTurn {
+            player: PlayerFilter::Controller,
+        }),
+        Condition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        } => Some(TriggerCondition::QuantityComparison {
+            lhs: substitute_another_in_expr(lhs),
+            comparator: *comparator,
+            rhs: substitute_another_in_expr(rhs),
+        }),
+        Condition::HasMaxSpeed => Some(TriggerCondition::HasMaxSpeed),
+        Condition::WasStartingPlayer { controller } => Some(TriggerCondition::WasStartingPlayer {
+            controller: controller.clone(),
+        }),
+        Condition::SpellCastWithVariantThisTurn { variant } => {
+            Some(TriggerCondition::SpellCastWithVariantThisTurn { variant: *variant })
+        }
+        Condition::CastVariantPaid { variant } => {
+            Some(TriggerCondition::CastVariantPaidPersistent { variant: *variant })
+        }
+        Condition::ClassLevelGE { level } => Some(TriggerCondition::ClassLevelGE { level: *level }),
+        Condition::SourceMatchesFilter { filter } => Some(TriggerCondition::SourceMatchesFilter {
+            filter: filter.clone(),
+        }),
+        Condition::IsMonarch => Some(TriggerCondition::IsMonarch),
+        Condition::NoMonarch => Some(TriggerCondition::NoMonarch),
+        Condition::HasCityBlessing => Some(TriggerCondition::HasCityBlessing),
+        Condition::SourceIsTapped => Some(TriggerCondition::SourceIsTapped),
+        Condition::SourceInZone { zone } => Some(TriggerCondition::SourceInZone { zone: *zone }),
+        Condition::HasCounters {
+            counters,
+            minimum,
+            maximum,
+        } => Some(TriggerCondition::HasCounters {
+            counters: counters.clone(),
+            minimum: *minimum,
+            maximum: *maximum,
+        }),
+        Condition::ChosenLabelIs { label } => Some(TriggerCondition::ChosenLabelIs {
+            label: label.clone(),
+        }),
+        Condition::ControlsCommander { ownership } => Some(TriggerCondition::ControlsCommander {
+            ownership: *ownership,
+        }),
+        Condition::SourceEnteredThisTurn => Some(TriggerCondition::SourceEnteredThisTurn),
+        Condition::SourceIsAttacking => Some(TriggerCondition::SourceIsAttacking),
+        _ => Some(TriggerCondition::Shared {
+            condition: condition.clone(),
+        }),
+    }
+}
+
 /// Bridge a `StaticCondition` (from the nom condition parser) to a `TriggerCondition`.
 ///
 /// Parallel to `static_condition_to_ability_condition` in `oracle_effect/mod.rs`.
@@ -2347,6 +2427,7 @@ fn substitute_another_in_expr(expr: &QuantityExpr) -> QuantityExpr {
 /// the caller falls through to the next strategy.
 fn static_condition_to_trigger_condition(sc: &StaticCondition) -> Option<TriggerCondition> {
     match sc {
+        StaticCondition::Shared { condition } => condition_to_trigger_condition(condition),
         StaticCondition::DuringYourTurn => Some(TriggerCondition::DuringPlayersTurn {
             player: PlayerFilter::Controller,
         }),

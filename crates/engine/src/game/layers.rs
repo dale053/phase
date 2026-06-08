@@ -4,15 +4,17 @@ use std::sync::Arc;
 use crate::database::synthesis::KeywordTriggerInstaller;
 use crate::game::arithmetic::saturating_pt_add;
 use crate::game::conditions::{
-    counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
-    eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn, eval_source_in_zone,
-    eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
+    condition_tree_uses_object_population, condition_tree_uses_recipient,
+    counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_condition,
+    eval_has_city_blessing, eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn,
+    eval_source_in_zone, eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
 };
 use crate::game::devotion::count_devotion;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::printed_cards::{apply_copiable_values, intrinsic_copiable_values};
 use crate::game::quantity::{filter_uses_recipient, quantity_expr_uses_recipient, QuantityContext};
 use crate::game::speed::{effective_speed, has_max_speed};
+use crate::types::ability::SourceIsTappedEval;
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, BasicLandType, CastingPermission,
     ChosenSubtypeKind, CommanderOwnership, ContinuousModification, CopiableValues, Duration,
@@ -517,6 +519,7 @@ fn condition_uses_recipient_context(condition: &StaticCondition) -> bool {
         StaticCondition::Not { condition } => condition_uses_recipient_context(condition),
         StaticCondition::RecipientHasCounters { .. } => true,
         StaticCondition::RecipientMatchesFilter { .. } => true,
+        StaticCondition::Shared { condition } => condition_tree_uses_recipient(condition),
         _ => false,
     }
 }
@@ -567,6 +570,7 @@ fn static_condition_uses_object_population(condition: &StaticCondition) -> bool 
             .iter()
             .any(static_condition_uses_object_population),
         StaticCondition::Not { condition } => static_condition_uses_object_population(condition),
+        StaticCondition::Shared { condition } => condition_tree_uses_object_population(condition),
         // Parse fallback — evaluated permissively (always true today), but its
         // text is unknown; conservatively escalate so an unrecognized
         // population-gated condition can never silently under-escalate.
@@ -683,6 +687,7 @@ fn entered_object_perturbs_static_condition(
         StaticCondition::Not { condition } => {
             entered_object_perturbs_static_condition(state, entered_id, ctx, condition)
         }
+        StaticCondition::Shared { condition } => condition_tree_uses_object_population(condition),
         // Unknown text — conservatively perturb so an unrecognized population gate
         // can never silently under-escalate.
         StaticCondition::Unrecognized { .. } => true,
@@ -772,6 +777,16 @@ fn evaluate_condition_with_context(
     source_id: ObjectId,
     recipient_id: Option<ObjectId>,
 ) -> bool {
+    if let Some(shared) = condition.to_condition() {
+        return eval_condition(
+            state,
+            &shared,
+            controller,
+            source_id,
+            recipient_id,
+            SourceIsTappedEval::OnBattlefield,
+        );
+    }
     match condition {
         StaticCondition::DevotionGE { colors, threshold } => {
             count_devotion(state, controller, colors) >= *threshold
@@ -1053,6 +1068,14 @@ fn evaluate_condition_with_context(
                 crate::game::commander::controls_any_commander(state, controller)
             }
         },
+        StaticCondition::Shared { condition } => eval_condition(
+            state,
+            condition,
+            controller,
+            source_id,
+            recipient_id,
+            SourceIsTappedEval::OnBattlefield,
+        ),
     }
 }
 

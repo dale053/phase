@@ -12,7 +12,7 @@ use nom::multi::many0;
 use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
-use super::error::{OracleError, OracleResult};
+use super::error::{oracle_err, OracleError, OracleResult};
 use super::primitives::{
     parse_article, parse_color, parse_keyword_name, parse_mana_cost, parse_number,
 };
@@ -24,9 +24,9 @@ use crate::parser::oracle_target::{
 use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
     AbilityCondition, AggregateFunction, CastManaObjectScope, CastManaSpentMetric,
-    CommanderOwnership, Comparator, ControllerRef, CountScope, DamageGroupKey, DamageKindFilter,
-    FilterProp, ObjectProperty, ObjectScope, PlayerScope, QuantityExpr, QuantityRef, SharedQuality,
-    StaticCondition, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
+    CommanderOwnership, Comparator, Condition, ControllerRef, CountScope, DamageGroupKey,
+    DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, PlayerScope, QuantityExpr,
+    QuantityRef, SharedQuality, StaticCondition, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::PlayerActionKind;
@@ -52,6 +52,20 @@ pub fn parse_condition(input: &str) -> OracleResult<'_, StaticCondition> {
 /// Useful when the prefix has already been consumed by the caller.
 pub fn parse_inner_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((parse_condition_disjunction, parse_single_inner_condition)).parse(input)
+}
+
+/// Single authority for context-free game-state predicates.
+///
+/// Lifts the static-parser result into [`Condition`] when every leaf is
+/// mappable to the shared type; static-only leaves (`DevotionGE`, `IsPresent`,
+/// `UnlessPay`, etc.) fail closed so callers can fall back to
+/// [`parse_inner_condition`].
+pub fn parse_condition_expr(input: &str) -> OracleResult<'_, Condition> {
+    let (rest, sc) = parse_inner_condition(input)?;
+    match sc.to_condition() {
+        Some(condition) => Ok((rest, condition)),
+        None => Err(oracle_err(rest)),
+    }
 }
 
 /// CR 608.2c: "<condition A> or <condition B>" — a natural-language disjunction

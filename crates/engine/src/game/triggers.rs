@@ -23,9 +23,9 @@ use crate::types::zones::Zone;
 
 use super::ability_utils::build_resolved_from_def;
 use super::conditions::{
-    counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
-    eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn, eval_source_in_zone,
-    eval_source_is_attacking, eval_source_is_tapped,
+    counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_condition,
+    eval_has_city_blessing, eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn,
+    eval_source_in_zone, eval_source_is_attacking, eval_source_is_tapped,
 };
 use super::filter::{matches_target_filter, spell_record_matches_filter, FilterContext};
 use super::game_object::GameObject;
@@ -4044,6 +4044,17 @@ pub(crate) fn check_trigger_condition(
     trigger_event: Option<&GameEvent>,
 ) -> bool {
     match condition {
+        TriggerCondition::Shared { condition } => {
+            let sid = source_id.unwrap_or(ObjectId(0));
+            eval_condition(
+                state,
+                condition,
+                controller,
+                sid,
+                None,
+                crate::types::ability::SourceIsTappedEval::RegardlessOfZone,
+            )
+        }
         TriggerCondition::GainedLife { minimum } => {
             player_field(state, controller, |p| p.life_gained_this_turn >= *minimum)
         }
