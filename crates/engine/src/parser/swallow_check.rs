@@ -517,6 +517,12 @@ fn static_carries_optional_modification(s: &StaticDefinition) -> bool {
         ContinuousModification::AssignDamageAsThoughUnblocked => true,
         ContinuousModification::GrantTrigger { trigger } => trigger_tree_has_optional(trigger),
         ContinuousModification::GrantAbility { definition } => def_tree_has_optional(definition),
+        // CR 113.3d + CR 613.1f: GrantStaticAbility conveys a static as if printed on the
+        // recipient (CR 113.3d: static abilities are simply true; CR 613.1f: layer 6).
+        // Recurse into the granted static definition to detect optional markers it may carry.
+        ContinuousModification::GrantStaticAbility { definition } => {
+            static_definition_has_optional(definition)
+        }
         _ => false,
     })
 }
@@ -554,6 +560,13 @@ fn static_mode_is_optional_permission(mode: &StaticMode) -> bool {
             // CR 601.2f: Defiler-style cost reductions encode the optional
             // life payment inside the static cost-modification primitive.
             | StaticMode::DefilerCostReduction { .. }
+            // CR 609.4b: "You may spend mana as though it were mana of any color" —
+            // opt-in mana-color substitution, inherently optional by the "you may" surface.
+            | StaticMode::SpendManaAsAnyColor
+            // CR 602.5a + CR 702.10c: "You may activate abilities of X as though those
+            // creatures had haste" — lifts the summoning-sickness gate on {T}/{Q}
+            // activated abilities; the permission is opt-in by the "you may" surface.
+            | StaticMode::CanActivateAbilitiesAsThoughHaste
     )
 }
 
@@ -594,6 +607,12 @@ fn static_definition_has_unimplemented(s: &StaticDefinition) -> bool {
         ContinuousModification::GrantTrigger { trigger } => trigger_tree_has_unimplemented(trigger),
         ContinuousModification::GrantAbility { definition } => {
             def_tree_has_unimplemented(definition)
+        }
+        // CR 113.3d + CR 613.1f: Parallel to static_carries_optional_modification —
+        // recurse into GrantStaticAbility so an Unimplemented-carrying granted static
+        // suppresses swallow detectors rather than double-reporting the parse gap.
+        ContinuousModification::GrantStaticAbility { definition } => {
+            static_definition_has_unimplemented(definition)
         }
         _ => false,
     })
@@ -2544,6 +2563,65 @@ mod tests {
             parsed.abilities
         );
         assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+    }
+
+    #[test]
+    fn optional_you_may_accepts_spend_mana_as_any_color_static() {
+        // CR 609.4b: "You may spend mana as though it were mana of any color."
+        // Must not produce an Optional_YouMay warning.
+        let parsed = parse(
+            "You may spend mana as though it were mana of any color.",
+            &["Artifact"],
+        );
+        assert!(
+            parsed
+                .statics
+                .iter()
+                .any(|s| matches!(s.mode, StaticMode::SpendManaAsAnyColor)),
+            "expected SpendManaAsAnyColor static to parse, got statics: {:#?}",
+            parsed.statics
+        );
+        assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+    }
+
+    #[test]
+    fn optional_you_may_accepts_activate_abilities_as_though_haste_static() {
+        // CR 602.5a + CR 702.10c: "You may activate abilities of creatures you
+        // control as though those creatures had haste."
+        let parsed = parse(
+            "You may activate abilities of creatures you control as though those creatures had haste.",
+            &["Creature"],
+        );
+        assert!(
+            parsed
+                .statics
+                .iter()
+                .any(|s| matches!(s.mode, StaticMode::CanActivateAbilitiesAsThoughHaste)),
+            "expected CanActivateAbilitiesAsThoughHaste static to parse, got statics: {:#?}",
+            parsed.statics
+        );
+        assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+    }
+
+    #[test]
+    fn static_carries_optional_modification_recurses_into_grant_static_ability() {
+        // CR 113.3d + CR 613.1f: GrantStaticAbility wrapping an optional modification
+        // must be detected by static_carries_optional_modification via recursion.
+        use crate::types::ability::{ContinuousModification, StaticDefinition};
+
+        let inner_def = Box::new(
+            StaticDefinition::continuous()
+                .modifications(vec![ContinuousModification::AssignDamageAsThoughUnblocked]),
+        );
+        let outer_static = StaticDefinition::continuous().modifications(vec![
+            ContinuousModification::GrantStaticAbility {
+                definition: inner_def,
+            },
+        ]);
+        assert!(
+            super::static_carries_optional_modification(&outer_static),
+            "static_carries_optional_modification must recurse into GrantStaticAbility"
+        );
     }
 
     #[test]
