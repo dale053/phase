@@ -11,8 +11,8 @@ use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 
-/// True when `obj` has at least `minimum` (and at most `maximum` if specified)
-/// counters matching `counters`. `CounterMatch::Any` sums all counter types (CR 122.1);
+/// CR 122.1: True when `obj` has at least `minimum` (and at most `maximum` if specified)
+/// counters matching `counters`. `CounterMatch::Any` sums all counter types;
 /// `CounterMatch::OfType(ct)` matches only that counter type.
 /// Used for HasCounters evaluation in StaticCondition and TriggerCondition.
 pub(crate) fn counter_condition_matches(
@@ -109,9 +109,9 @@ pub(crate) fn eval_source_entered_this_turn(state: &GameState, source_id: Object
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
-    use crate::types::CardId;
     use crate::types::game_state::GameState;
     use crate::types::player::PlayerId;
+    use crate::types::CardId;
 
     /// CR 110.5d: eval_source_is_tapped_on_battlefield must return false when the
     /// object is tapped but not on the battlefield (e.g. in the graveyard). The
