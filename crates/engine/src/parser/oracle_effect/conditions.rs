@@ -2124,13 +2124,13 @@ pub(super) fn difference_expr(cond: &AbilityCondition) -> Option<QuantityExpr> {
 /// are preserved via `AbilityCondition::Shared` for `eval_condition` at runtime.
 pub(crate) fn condition_to_ability_condition(
     condition: &Condition,
-    ctx: &mut ParseContext,
+    _ctx: &mut ParseContext,
 ) -> Option<AbilityCondition> {
     match condition {
         Condition::And { conditions } => {
             let mapped: Option<Vec<_>> = conditions
                 .iter()
-                .map(|c| condition_to_ability_condition(c, ctx))
+                .map(|c| condition_to_ability_condition(c, _ctx))
                 .collect();
             Some(AbilityCondition::And {
                 conditions: mapped?,
@@ -2139,14 +2139,14 @@ pub(crate) fn condition_to_ability_condition(
         Condition::Or { conditions } => {
             let mapped: Option<Vec<_>> = conditions
                 .iter()
-                .map(|c| condition_to_ability_condition(c, ctx))
+                .map(|c| condition_to_ability_condition(c, _ctx))
                 .collect();
             Some(AbilityCondition::Or {
                 conditions: mapped?,
             })
         }
         Condition::Not { condition } => {
-            condition_to_ability_condition(condition, ctx).map(|inner| AbilityCondition::Not {
+            condition_to_ability_condition(condition, _ctx).map(|inner| AbilityCondition::Not {
                 condition: Box::new(inner),
             })
         }

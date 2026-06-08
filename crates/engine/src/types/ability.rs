@@ -1524,6 +1524,12 @@ pub enum RestrictionPlayerScope {
 
 /// A permission granted to a `GameObject` allowing it to be cast under specific conditions.
 /// Stored in `GameObject::casting_permissions`.
+// clippy::large_enum_variant: `ExileWithAltCost` inlines optional
+// `ResolutionCastCleanup` and `Duration` (whose `ForAsLongAs` arm carries a
+// `StaticCondition`). The spread vs unit variants is inherent to the permission
+// model; boxing one field would not shrink the cleanup payload and would add
+// indirection at every cast-permission check site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum CastingPermission {
@@ -9350,6 +9356,11 @@ pub struct ModalChoice {
 }
 
 /// Selection constraints attached to a modal choice header.
+// clippy::large_enum_variant: `ConditionalMaxChoices` carries a full
+// `ModalSelectionCondition` (including nested `StaticCondition` trees) while
+// sibling variants are ZSTs. The constraint list is short and ephemeral at
+// cast time, so heap-indirecting the condition buys little.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ModalSelectionConstraint {
