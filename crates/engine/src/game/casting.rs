@@ -1,9 +1,10 @@
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AdditionalCost, CardPlayMode,
-    CastTimingPermission, CastingPermission, ChoiceType, ContinuousModification, CostObjectCount,
-    CostPaidObjectSnapshot, Duration, Effect, GameRestriction, ModalSelectionCondition,
-    ObjectScope, PlayerScope, ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility,
-    RestrictionPlayerScope, StaticDefinition, TargetFilter, TargetRef,
+    is_variable_remove_counter_cost_count, AbilityCondition, AbilityCost, AbilityDefinition,
+    AbilityKind, AdditionalCost, CardPlayMode, CastTimingPermission, CastingPermission, ChoiceType,
+    ContinuousModification, CostObjectCount, CostPaidObjectSnapshot, CounterCostSelection,
+    Duration, Effect, GameRestriction, ModalSelectionCondition, ObjectScope, PlayerScope,
+    ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility, RestrictionPlayerScope,
+    StaticDefinition, TargetFilter, TargetRef, REMOVE_COUNTER_COST_ALL,
 };
 use crate::types::actions::AlternativeCastDecision;
 use crate::types::card::LayoutKind;
@@ -48,6 +49,62 @@ use super::stack;
 use super::targeting;
 
 const FORETELL_SPECIAL_ACTION_COST: u32 = 2;
+
+fn runtime_granted_cycling_abilities(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Vec<AbilityDefinition> {
+    let Some(obj) = state.objects.get(&source_id) else {
+        return Vec::new();
+    };
+    if obj.zone != Zone::Hand {
+        return Vec::new();
+    }
+
+    crate::game::off_zone_characteristics::effective_off_zone_keywords(state, source_id)
+        .into_iter()
+        .filter(|keyword| {
+            matches!(keyword, Keyword::Cycling(_) | Keyword::Typecycling { .. })
+                && !obj.base_keywords.iter().any(|printed| printed == keyword)
+        })
+        .filter_map(|keyword| crate::database::synthesis::cycling_ability_for_keyword(&keyword))
+        .collect()
+}
+
+pub fn activated_ability_definitions(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Vec<(usize, AbilityDefinition)> {
+    let Some(obj) = state.objects.get(&source_id) else {
+        return Vec::new();
+    };
+    let printed_len = obj.abilities.len();
+    let mut abilities: Vec<(usize, AbilityDefinition)> =
+        obj.abilities.iter().cloned().enumerate().collect();
+    abilities.extend(
+        runtime_granted_cycling_abilities(state, source_id)
+            .into_iter()
+            .enumerate()
+            .map(|(offset, ability)| (printed_len + offset, ability)),
+    );
+    abilities
+}
+
+fn activation_ability_definition(
+    state: &GameState,
+    source_id: ObjectId,
+    ability_index: usize,
+) -> Option<AbilityDefinition> {
+    let obj = state.objects.get(&source_id)?;
+    if let Some(ability) = obj.abilities.get(ability_index) {
+        return Some(ability.clone());
+    }
+
+    let offset = ability_index.checked_sub(obj.abilities.len())?;
+    runtime_granted_cycling_abilities(state, source_id)
+        .into_iter()
+        .nth(offset)
+}
 
 pub(crate) fn variable_speed_payment_range(cost: &AbilityCost, max_speed: u8) -> Option<(u8, u8)> {
     match cost {
@@ -1415,6 +1472,19 @@ fn has_graveyard_timed_alt_cost_permission(
         })
 }
 
+/// CR 601.2a: Object-level alt-cost grants that allow casting a chosen card
+/// from hand without moving it first (Electrodominance).
+fn has_hand_alt_cost_permission(
+    state: &GameState,
+    obj: &crate::game::game_object::GameObject,
+    player: PlayerId,
+) -> bool {
+    obj.zone == Zone::Hand
+        && obj.casting_permissions.iter().any(|permission| {
+            exile_alt_cost_permission_supports_cast(state, obj, player, permission, None)
+        })
+}
+
 /// CR 608.2g: An object carries a *cast-during-resolution* alt-cost permission —
 /// the runtime `ExileWithAltCost` stamped by `initiate_cast_during_resolution`,
 /// identified by `resolution_cleanup.is_some()`. Unlike Cascade/Discover/Suspend
@@ -2760,6 +2830,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     };
     let has_graveyard_permission = graveyard_permission_src.is_some();
     let has_graveyard_alt_cost = has_graveyard_timed_alt_cost_permission(state, obj, player);
+    let has_hand_alt_cost = has_hand_alt_cost_permission(state, obj, player);
     // CR 608.2g: A free-cast window (Invoke Calamity) may drive a
     // cast-during-resolution on a card still in the controller's HAND. The
     // runtime `ExileWithAltCost { resolution_cleanup: Some(_) }` is the
@@ -2876,12 +2947,13 @@ fn prepare_spell_cast_with_variant_override_inner(
 
     let flash_cost = restrictions::flash_timing_cost(state, player, obj);
     // ExileWithAltCost / ExileWithAltAbilityCost: override mana cost when
-    // casting from exile via an alt-cost permission. The non-mana branch
+    // casting via an object-level alt-cost permission. The non-mana branch
     // (ExileWithAltAbilityCost) zeroes the mana cost — its `AbilityCost` is
     // routed through `pay_additional_cost` in `check_additional_cost_or_pay`
     // (CR 118.9 + CR 119.4).
     let alt_cost_from_exile = if obj.zone == Zone::Exile
         || has_graveyard_alt_cost
+        || has_hand_alt_cost
         || has_during_resolution_alt_cost
     {
         // CR 611.2a: When a permission carries `granted_to: Some(p)`, only
@@ -4116,17 +4188,20 @@ fn cost_filter_has_target_ref(filter: &TargetFilter) -> bool {
 
 fn target_ref_matches_cost_filter(
     state: &GameState,
-    source_id: ObjectId,
     source_controller: PlayerId,
+    ability: &ResolvedAbility,
     target: &TargetRef,
     filter: &TargetFilter,
 ) -> bool {
     match target {
         TargetRef::Object(object_id) => {
-            let ctx = super::filter::FilterContext::from_source_with_controller(
-                source_id,
+            let ctx = super::filter::FilterContext::from_ability_with_controller(
+                ability,
                 source_controller,
             );
+            if super::filter::matches_stack_target_filter(state, *object_id, filter, &ctx) {
+                return true;
+            }
             super::filter::matches_target_filter(state, *object_id, filter, &ctx)
         }
         TargetRef::Player(player_id) => super::filter::player_matches_target_filter_in_state(
@@ -4140,7 +4215,6 @@ fn target_ref_matches_cost_filter(
 
 fn selected_targets_match_filter(
     state: &GameState,
-    source_id: ObjectId,
     source_controller: PlayerId,
     ability: &ResolvedAbility,
     filter: &TargetFilter,
@@ -4153,11 +4227,11 @@ fn selected_targets_match_filter(
 
     if require_all {
         targets.iter().all(|target| {
-            target_ref_matches_cost_filter(state, source_id, source_controller, target, filter)
+            target_ref_matches_cost_filter(state, source_controller, ability, target, filter)
         })
     } else {
         targets.iter().any(|target| {
-            target_ref_matches_cost_filter(state, source_id, source_controller, target, filter)
+            target_ref_matches_cost_filter(state, source_controller, ability, target, filter)
         })
     }
 }
@@ -4199,24 +4273,10 @@ fn spell_matches_cost_filter_with_selected_targets(
 
             tf.properties.iter().all(|prop| match prop {
                 crate::types::ability::FilterProp::Targets { filter } => {
-                    selected_targets_match_filter(
-                        state,
-                        source_id,
-                        source_controller,
-                        ability,
-                        filter,
-                        false,
-                    )
+                    selected_targets_match_filter(state, source_controller, ability, filter, false)
                 }
                 crate::types::ability::FilterProp::TargetsOnly { filter } => {
-                    selected_targets_match_filter(
-                        state,
-                        source_id,
-                        source_controller,
-                        ability,
-                        filter,
-                        true,
-                    )
+                    selected_targets_match_filter(state, source_controller, ability, filter, true)
                 }
                 _ => true,
             })
@@ -10302,7 +10362,32 @@ fn pay_ability_cost_inner(
             count,
             counter_type,
             target: None,
+            ..
         } => {
+            if *count == REMOVE_COUNTER_COST_ALL
+                && matches!(counter_type, crate::types::counter::CounterMatch::Any)
+            {
+                let counters: Vec<_> = state
+                    .objects
+                    .get(&source_id)
+                    .map(|obj| {
+                        obj.counters
+                            .iter()
+                            .map(|(ty, count)| (ty.clone(), *count))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (counter_type, count) in counters {
+                    super::effects::counters::remove_counter_with_replacement(
+                        state,
+                        source_id,
+                        counter_type,
+                        count,
+                        events,
+                    );
+                }
+                return Ok(AbilityCostPaymentOutcome::Complete);
+            }
             // CR 601.2h: Resolve `CounterMatch::Any` to the concrete counter
             // type currently present on the source before the replacement
             // pipeline sees it — `remove_counter_with_replacement` operates on
@@ -10312,8 +10397,18 @@ fn pay_ability_cost_inner(
                 source_id,
                 counter_type,
             ) {
+                let count = if *count == REMOVE_COUNTER_COST_ALL {
+                    state
+                        .objects
+                        .get(&source_id)
+                        .and_then(|obj| obj.counters.get(&resolved))
+                        .copied()
+                        .unwrap_or(0)
+                } else {
+                    *count
+                };
                 super::effects::counters::remove_counter_with_replacement(
-                    state, source_id, resolved, *count, events,
+                    state, source_id, resolved, count, events,
                 );
             }
         }
@@ -10546,13 +10641,19 @@ fn find_tap_creatures_cost(cost: &AbilityCost) -> Option<(u32, &TargetFilter)> {
 
 fn find_targeted_remove_counter_cost(
     cost: &AbilityCost,
-) -> Option<(u32, &crate::types::counter::CounterMatch, &TargetFilter)> {
+) -> Option<(
+    u32,
+    &crate::types::counter::CounterMatch,
+    &TargetFilter,
+    CounterCostSelection,
+)> {
     match cost {
         AbilityCost::RemoveCounter {
             count,
             counter_type,
             target: Some(target),
-        } => Some((*count, counter_type, target)),
+            selection,
+        } => Some((*count, counter_type, target, *selection)),
         AbilityCost::Composite { costs } => {
             costs.iter().find_map(find_targeted_remove_counter_cost)
         }
@@ -10691,7 +10792,7 @@ pub(crate) fn find_eligible_return_to_hand_targets(
         .collect()
 }
 
-fn removable_counter_count(
+pub(crate) fn removable_counter_count(
     obj: &crate::game::game_object::GameObject,
     counter_type: &crate::types::counter::CounterMatch,
 ) -> u32 {
@@ -10699,7 +10800,26 @@ fn removable_counter_count(
         crate::types::counter::CounterMatch::OfType(ty) => {
             obj.counters.get(ty).copied().unwrap_or(0)
         }
-        crate::types::counter::CounterMatch::Any => obj.counters.values().copied().sum(),
+        // CR 118.3 + CR 122.1: A remove-counter cost removes one concrete
+        // counter type from one object. Match the concrete-type choice used by
+        // `resolve_counter_match_for_removal` by capping against the largest
+        // removable stack, not the sum across unrelated counter types.
+        crate::types::counter::CounterMatch::Any => {
+            obj.counters.values().copied().max().unwrap_or(0)
+        }
+    }
+}
+
+pub(crate) fn removable_counter_count_for_cost_selection(
+    obj: &crate::game::game_object::GameObject,
+    counter_type: &crate::types::counter::CounterMatch,
+    selection: CounterCostSelection,
+) -> u32 {
+    match (counter_type, selection) {
+        (crate::types::counter::CounterMatch::Any, CounterCostSelection::AmongObjects) => {
+            obj.counters.values().copied().sum()
+        }
+        _ => removable_counter_count(obj, counter_type),
     }
 }
 
@@ -10720,8 +10840,9 @@ pub(crate) fn find_eligible_remove_counter_for_cost_targets(
             state.objects.get(&id).is_some_and(|obj| {
                 obj.controller == player
                     && super::filter::matches_target_filter(state, id, target, &ctx)
-                    // CR 107.2: u32::MAX encodes "any number of" — always eligible.
-                    && (count == u32::MAX
+                    // CR 107.2 / CR 107.3a: variable remove-counter costs
+                    // are eligible before the final count is announced.
+                    && (is_variable_remove_counter_cost_count(count)
                         || removable_counter_count(obj, counter_type) >= count)
             })
         })
@@ -10952,19 +11073,22 @@ pub fn can_activate_ability_now(
     let Some(obj) = state.objects.get(&source_id) else {
         return false;
     };
-    if obj.controller != player || ability_index >= obj.abilities.len() {
+    if obj.controller != player {
         return false;
     }
+    let Some(mut ability_def) = activation_ability_definition(state, source_id, ability_index)
+    else {
+        return false;
+    };
 
     // CR 702.61a + CR 702.61b: While a spell with split second is on the stack,
     // players can't activate abilities that aren't mana abilities.
     if super::keywords::stack_has_split_second(state)
-        && !super::mana_abilities::is_mana_ability(&obj.abilities[ability_index])
+        && !super::mana_abilities::is_mana_ability(&ability_def)
     {
         return false;
     }
 
-    let mut ability_def = obj.abilities[ability_index].clone();
     // CR 602.1: Check activation zone — default to battlefield.
     let required_zone = ability_def.activation_zone.unwrap_or(Zone::Battlefield);
     if obj.zone != required_zone {
@@ -11066,6 +11190,7 @@ pub fn can_activate_ability_now(
                     casting_costs::extract_x_mana_cost(cost).is_some()
                         || find_non_self_sacrifice_cost(cost)
                             .is_some_and(|(count, _)| count == u32::MAX)
+                        || casting_costs::activation_cost_needs_x_choice(&resolved, cost)
                 })
         }
     }
@@ -11184,13 +11309,12 @@ pub fn handle_activate_ability(
     if obj.controller != player {
         return Err(EngineError::NotYourPriority);
     }
-    if ability_index >= obj.abilities.len() {
+    let Some(mut ability_def) = activation_ability_definition(state, source_id, ability_index)
+    else {
         return Err(EngineError::InvalidAction(
             "Invalid ability index".to_string(),
         ));
-    }
-
-    let mut ability_def = obj.abilities[ability_index].clone();
+    };
     // CR 602.1: Check activation zone — default to battlefield.
     let required_zone = ability_def.activation_zone.unwrap_or(Zone::Battlefield);
     if obj.zone != required_zone {
@@ -11280,12 +11404,12 @@ pub fn handle_activate_ability(
         }
         let mut unavailable_modes = compute_unavailable_modes(state, source_id, &modal);
         let x_dependent_modal_targets = ability_def.cost.as_ref().is_some_and(|cost| {
-            casting_costs::extract_x_mana_cost(cost).is_some()
-                && ability_def.mode_abilities.iter().any(|mode| {
-                    ability_target_legality_needs_chosen_x(&build_resolved_from_def(
-                        mode, source_id, player,
-                    ))
-                })
+            ability_def.mode_abilities.iter().any(|mode| {
+                let resolved = build_resolved_from_def(mode, source_id, player);
+                (casting_costs::extract_x_mana_cost(cost).is_some()
+                    || casting_costs::activation_cost_needs_x_choice(&resolved, cost))
+                    && ability_target_legality_needs_chosen_x(&resolved)
+            })
         });
         // CR 602.2b + CR 601.2b/c: When modal activated ability target legality
         // depends on an {X} activation cost, legality is not knowable until the
@@ -11346,6 +11470,24 @@ pub fn handle_activate_ability(
     // CR 118.3: Pre-check for non-self sacrifice costs — must detour to WaitingFor
     // before any cost payment, regardless of whether targets were auto-selected.
     if let Some(ref cost) = ability_def.cost {
+        if casting_costs::activation_cost_needs_x_choice(&resolved, cost) {
+            // CR 602.2b + CR 601.2f: A non-mana activation cost that removes
+            // X counters still needs the same X announcement step before any
+            // mana or counter payment happens. Split fixed mana out so it
+            // flows through ManaPayment, then pay the concretized residual cost.
+            let (mana_cost, remaining) = split_alt_cost_components(cost);
+            let mut pending_x = PendingCast::new(
+                source_id,
+                CardId(0),
+                resolved,
+                mana_cost.unwrap_or(ManaCost::NoCost),
+            );
+            pending_x.activation_cost = remaining;
+            pending_x.activation_ability_index = Some(ability_index);
+            state.pending_cast = Some(Box::new(pending_x));
+            return casting_costs::enter_payment_step(state, player, None, events);
+        }
+
         if let Some((count, sac_filter)) = find_non_self_sacrifice_cost(cost) {
             let eligible = find_eligible_sacrifice_targets(state, player, source_id, sac_filter);
             let (min_count, max_count) = sacrifice_cost_bounds(count, eligible.len());
@@ -11509,32 +11651,61 @@ pub fn handle_activate_ability(
         // remove-counter activation costs. The player chooses which matching
         // permanent supplies the counter before automatic cost components are
         // paid and the ability is put on the stack.
-        if let Some((count, counter_type, target)) = find_targeted_remove_counter_cost(cost) {
+        if let Some((count, counter_type, target, selection)) =
+            find_targeted_remove_counter_cost(cost)
+        {
+            let required_count = match selection {
+                CounterCostSelection::SingleObject => count,
+                CounterCostSelection::AmongObjects => 1,
+            };
             let eligible = find_eligible_remove_counter_for_cost_targets(
                 state,
                 player,
                 source_id,
                 target,
                 counter_type,
-                count,
+                required_count,
             );
             if eligible.is_empty() {
                 return Err(EngineError::ActionNotAllowed(
                     "No eligible permanents with counters".into(),
                 ));
             }
+            if selection == CounterCostSelection::AmongObjects {
+                let removable_count = eligible
+                    .iter()
+                    .filter_map(|object_id| state.objects.get(object_id))
+                    .map(|obj| {
+                        removable_counter_count_for_cost_selection(obj, counter_type, selection)
+                    })
+                    .fold(0, u32::saturating_add);
+                if removable_count < count {
+                    return Err(EngineError::ActionNotAllowed(
+                        "Not enough eligible counters to remove".into(),
+                    ));
+                }
+            }
             let mut pending_counter =
                 PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
             pending_counter.activation_cost = Some(cost.clone());
             pending_counter.activation_ability_index = Some(ability_index);
+            let max_count = match selection {
+                CounterCostSelection::SingleObject => 1,
+                CounterCostSelection::AmongObjects => eligible.len(),
+            };
             return Ok(WaitingFor::PayCost {
                 player,
                 kind: PayCostKind::RemoveCounter {
                     counter_type: counter_type.clone(),
+                    count,
+                    selection,
                 },
                 choices: eligible,
-                count: count as usize,
-                min_count: 0,
+                count: max_count,
+                min_count: match selection {
+                    CounterCostSelection::SingleObject => 0,
+                    CounterCostSelection::AmongObjects => 1,
+                },
                 resume: CostResume::Spell {
                     spell: Box::new(pending_counter),
                 },
@@ -12425,10 +12596,10 @@ mod tests {
         ChosenAttribute, ChosenSubtypeKind, Comparator, ContinuousModification, ControllerRef,
         CostCategory, FilterProp, GameRestriction, KickerVariant, ManaContribution, ManaProduction,
         ManaSpendPermission, ManaSpendRestriction, ModalChoice, ModalSelectionCondition,
-        ModalSelectionConstraint, MultiTargetSpec, ObjectProperty, ProhibitedActivity, PtValue,
-        QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
-        RestrictionPlayerScope, SearchSelectionConstraint, StaticCondition, StaticDefinition,
-        TargetFilter, TargetRef, TypeFilter, TypedFilter,
+        ModalSelectionConstraint, MultiTargetSpec, ObjectProperty, ProhibitedActivity, PtStat,
+        PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode,
+        RestrictionExpiry, RestrictionPlayerScope, SearchSelectionConstraint, StaticCondition,
+        StaticDefinition, TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::{CoreType, Supertype};
@@ -18865,6 +19036,213 @@ mod tests {
         assert_eq!(blue_cost, ManaCost::generic(3));
     }
 
+    #[test]
+    fn nested_stack_target_self_cost_reduction_matches_stack_entry_targets() {
+        let mut state = setup_game_at_main_phase();
+        let spell_id = create_object(
+            &mut state,
+            CardId(994),
+            PlayerId(0),
+            "Not of This World".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&spell_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            obj.mana_cost = ManaCost::generic(7);
+            let large_creature_filter = TargetFilter::Typed(
+                TypedFilter::creature()
+                    .controller(ControllerRef::You)
+                    .properties(vec![FilterProp::PtComparison {
+                        stat: PtStat::Power,
+                        scope: PtValueScope::Current,
+                        comparator: Comparator::GE,
+                        value: QuantityExpr::Fixed { value: 7 },
+                    }]),
+            );
+            let stack_target_filter = TargetFilter::And {
+                filters: vec![
+                    TargetFilter::Or {
+                        filters: vec![
+                            TargetFilter::StackSpell,
+                            TargetFilter::StackAbility { controller: None },
+                        ],
+                    },
+                    TargetFilter::Typed(TypedFilter::default().properties(vec![
+                        FilterProp::Targets {
+                            filter: Box::new(large_creature_filter),
+                        },
+                    ])),
+                ],
+            };
+            let mut def = StaticDefinition::new(StaticMode::ModifyCost {
+                mode: CostModifyMode::Reduce,
+                amount: ManaCost::generic(7),
+                spell_filter: Some(TargetFilter::Typed(TypedFilter::card().properties(vec![
+                    FilterProp::Targets {
+                        filter: Box::new(stack_target_filter),
+                    },
+                ]))),
+                dynamic_count: None,
+            })
+            .affected(TargetFilter::SelfRef);
+            def.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
+            obj.static_definitions.push(def);
+        }
+
+        let large_creature = create_object(
+            &mut state,
+            CardId(995),
+            PlayerId(0),
+            "Large Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&large_creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(7);
+            obj.toughness = Some(7);
+            obj.base_power = Some(7);
+            obj.base_toughness = Some(7);
+        }
+        let smaller_creature = create_object(
+            &mut state,
+            CardId(996),
+            PlayerId(0),
+            "Smaller Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&smaller_creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(6);
+            obj.toughness = Some(6);
+            obj.base_power = Some(6);
+            obj.base_toughness = Some(6);
+        }
+        let opposing_bolt = create_object(
+            &mut state,
+            CardId(997),
+            PlayerId(1),
+            "Targeted Spell".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&opposing_bolt).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+        }
+        state.stack.push_back(StackEntry {
+            id: opposing_bolt,
+            source_id: opposing_bolt,
+            controller: PlayerId(1),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(997),
+                ability: Some(ResolvedAbility::new(
+                    Effect::Destroy {
+                        target: TargetFilter::Typed(TypedFilter::creature()),
+                        cant_regenerate: false,
+                    },
+                    vec![TargetRef::Object(large_creature)],
+                    opposing_bolt,
+                    PlayerId(1),
+                )),
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 1,
+            },
+        });
+
+        let mut early_cost = state.objects.get(&spell_id).unwrap().mana_cost.clone();
+        super::super::casting::apply_self_spell_cost_modifiers(
+            &state,
+            PlayerId(0),
+            spell_id,
+            &mut early_cost,
+        );
+        assert_eq!(early_cost, ManaCost::generic(7));
+
+        let not_of_this_world_targeting_bolt = ResolvedAbility::new(
+            Effect::Counter {
+                target: TargetFilter::StackSpell,
+                source_rider: None,
+            },
+            vec![TargetRef::Object(opposing_bolt)],
+            spell_id,
+            PlayerId(0),
+        );
+        let mut reduced_cost = state.objects.get(&spell_id).unwrap().mana_cost.clone();
+        super::super::casting::apply_self_spell_cost_modifiers_with_selected_targets(
+            &state,
+            PlayerId(0),
+            spell_id,
+            &not_of_this_world_targeting_bolt,
+            &mut reduced_cost,
+        );
+        assert_eq!(reduced_cost, ManaCost::generic(0));
+
+        let ability_source = create_object(
+            &mut state,
+            CardId(998),
+            PlayerId(1),
+            "Targeted Ability Source".to_string(),
+            Zone::Battlefield,
+        );
+        let stack_ability_id = ObjectId(state.next_object_id);
+        state.next_object_id += 1;
+        state.stack.push_back(StackEntry {
+            id: stack_ability_id,
+            source_id: ability_source,
+            controller: PlayerId(1),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: ability_source,
+                ability: ResolvedAbility::new(
+                    Effect::Destroy {
+                        target: TargetFilter::Typed(TypedFilter::creature()),
+                        cant_regenerate: false,
+                    },
+                    vec![TargetRef::Object(large_creature)],
+                    ability_source,
+                    PlayerId(1),
+                ),
+            },
+        });
+        let not_of_this_world_targeting_ability = ResolvedAbility::new(
+            Effect::Counter {
+                target: TargetFilter::StackAbility { controller: None },
+                source_rider: None,
+            },
+            vec![TargetRef::Object(stack_ability_id)],
+            spell_id,
+            PlayerId(0),
+        );
+        let mut reduced_ability_cost = state.objects.get(&spell_id).unwrap().mana_cost.clone();
+        super::super::casting::apply_self_spell_cost_modifiers_with_selected_targets(
+            &state,
+            PlayerId(0),
+            spell_id,
+            &not_of_this_world_targeting_ability,
+            &mut reduced_ability_cost,
+        );
+        assert_eq!(reduced_ability_cost, ManaCost::generic(0));
+
+        state
+            .stack
+            .iter_mut()
+            .find(|entry| entry.id == opposing_bolt)
+            .expect("expected stack spell entry")
+            .ability_mut()
+            .unwrap()
+            .targets = vec![TargetRef::Object(smaller_creature)];
+        let mut unreduced_cost = state.objects.get(&spell_id).unwrap().mana_cost.clone();
+        super::super::casting::apply_self_spell_cost_modifiers_with_selected_targets(
+            &state,
+            PlayerId(0),
+            spell_id,
+            &not_of_this_world_targeting_bolt,
+            &mut unreduced_cost,
+        );
+        assert_eq!(unreduced_cost, ManaCost::generic(7));
+    }
+
     /// CR 601.2f: Cost reductions are applied during cost determination (before
     /// `enter_payment_step` runs), so `max_x_value` sees the reduced cost and
     /// bounds X accordingly. A pending "next spell costs {1} less" reduction on
@@ -23141,6 +23519,44 @@ mod tests {
         assert!(spell_objects_available_to_cast(&state, PlayerId(0)).contains(&bauble));
         prepare_spell_cast(&state, PlayerId(0), bauble)
             .expect("bauble must be castable from graveyard");
+    }
+
+    #[test]
+    fn hand_alt_cost_permission_overrides_printed_mana_cost() {
+        let mut state = setup_game_at_main_phase();
+        let spell = create_object(
+            &mut state,
+            CardId(1313),
+            PlayerId(0),
+            "Hand Spell".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Sorcery);
+            Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            ));
+            obj.mana_cost = ManaCost::generic(5);
+            obj.casting_permissions
+                .push(CastingPermission::ExileWithAltCost {
+                    cost: ManaCost::zero(),
+                    cast_transformed: false,
+                    constraint: None,
+                    granted_to: Some(PlayerId(0)),
+                    resolution_cleanup: None,
+                    duration: None,
+                });
+        }
+
+        let prepared = prepare_spell_cast(&state, PlayerId(0), spell)
+            .expect("hand CastFromZone permission must allow the spell to be prepared");
+
+        assert!(prepared.mana_cost.is_without_paying_mana());
     }
 
     fn add_borrowed_exile_sorcery_with_mana_value(
@@ -34008,7 +34424,12 @@ mod tests {
     // any activated ability whose cost is "Remove N {type} counters from ~".
     mod remove_counter_cost {
         use super::*;
+        use crate::types::ability::{
+            CounterCostSelection, TypeFilter, TypedFilter, REMOVE_COUNTER_COST_ANY_NUMBER,
+            REMOVE_COUNTER_COST_X,
+        };
         use crate::types::counter::{CounterMatch, CounterType};
+        use crate::types::game_state::CounterCostChoice;
 
         fn source_with_counters(
             state: &mut GameState,
@@ -34041,6 +34462,7 @@ mod tests {
                 count: 2,
                 counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
                 target: None,
+                selection: CounterCostSelection::SingleObject,
             };
             let mut events = Vec::new();
             pay_ability_cost(&mut state, PlayerId(0), source, &cost, &mut events)
@@ -34078,6 +34500,7 @@ mod tests {
                 count: 1,
                 counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
                 target: None,
+                selection: CounterCostSelection::SingleObject,
             };
             assert!(
                 !cost.is_payable(&state, PlayerId(0), source),
@@ -34097,6 +34520,7 @@ mod tests {
                 count: 2,
                 counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
                 target: None,
+                selection: CounterCostSelection::SingleObject,
             };
             assert!(
                 !cost.is_payable(&state, PlayerId(0), source),
@@ -34117,6 +34541,7 @@ mod tests {
                 count: 1,
                 counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
                 target: None,
+                selection: CounterCostSelection::SingleObject,
             };
             let mut events = Vec::new();
             pay_ability_cost(&mut state, PlayerId(0), source, &cost, &mut events).unwrap();
@@ -34179,6 +34604,7 @@ mod tests {
                                     TypedFilter::new(TypeFilter::Permanent)
                                         .controller(ControllerRef::You),
                                 )),
+                                selection: CounterCostSelection::SingleObject,
                             },
                         ],
                     }),
@@ -34218,13 +34644,19 @@ mod tests {
             match &waiting {
                 WaitingFor::PayCost {
                     player,
-                    kind: PayCostKind::RemoveCounter { counter_type },
+                    kind:
+                        PayCostKind::RemoveCounter {
+                            counter_type,
+                            count: counter_count,
+                            ..
+                        },
                     count,
                     choices: permanents,
                     ..
                 } => {
                     assert_eq!(*player, PlayerId(0));
                     assert_eq!(*count, 1);
+                    assert_eq!(*counter_count, 1);
                     assert_eq!(*counter_type, CounterMatch::Any);
                     assert_eq!(permanents, &vec![saga]);
                 }
@@ -34247,6 +34679,1293 @@ mod tests {
                 state.stack.iter().any(|entry| entry.source_id == source),
                 "activated ability should reach the stack after targeted counter cost payment"
             );
+        }
+
+        #[test]
+        fn x_counter_activation_cost_caps_and_pays_chosen_counter_count() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 3);
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Mana {
+                            cost: ManaCost::Cost {
+                                shards: vec![ManaCostShard::X],
+                                generic: 0,
+                            },
+                        },
+                        AbilityCost::RemoveCounter {
+                            count: REMOVE_COUNTER_COST_X,
+                            counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
+                            target: None,
+                            selection: CounterCostSelection::SingleObject,
+                        },
+                    ],
+                }),
+            );
+            add_mana(&mut state, PlayerId(0), ManaType::Colorless, 5);
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            match &waiting {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 3,
+                    "X must be capped by counters available on the source, not just mana"
+                ),
+                other => panic!("expected ChooseXValue, got {other:?}"),
+            }
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+
+            assert_eq!(
+                state.objects[&source]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "choosing X=2 must remove exactly two counters, not all counters"
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "activated ability should reach the stack after paying the chosen X cost"
+            );
+        }
+
+        #[test]
+        fn x_counter_activation_cost_without_x_mana_prompts_and_pays_chosen_count() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, charge_counter.clone(), 3);
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Scry {
+                        count: QuantityExpr::Ref {
+                            qty: QuantityRef::Variable {
+                                name: "X".to_string(),
+                            },
+                        },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Mana {
+                            cost: ManaCost::Cost {
+                                shards: Vec::new(),
+                                generic: 1,
+                            },
+                        },
+                        AbilityCost::RemoveCounter {
+                            count: REMOVE_COUNTER_COST_X,
+                            counter_type: CounterMatch::OfType(charge_counter.clone()),
+                            target: None,
+                            selection: CounterCostSelection::SingleObject,
+                        },
+                    ],
+                }),
+            );
+            add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            match &waiting {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 3,
+                    "fixed-mana X counter costs must still ask for X and cap by counters"
+                ),
+                other => panic!("expected ChooseXValue, got {other:?}"),
+            }
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+
+            assert_eq!(
+                state.objects[&source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "choosing X=2 must remove exactly two counters after fixed mana is paid"
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "activated ability should reach the stack after paying the fixed mana and chosen X cost"
+            );
+        }
+
+        #[test]
+        fn x_counter_activation_cost_with_negative_x_pump_prompts_and_pays_chosen_count() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, charge_counter.clone(), 3);
+            let target = create_object(
+                &mut state,
+                CardId(903),
+                PlayerId(1),
+                "Pump Target".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&target).unwrap();
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.power = Some(3);
+                obj.toughness = Some(3);
+            }
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Pump {
+                        power: PtValue::Variable("-X".to_string()),
+                        toughness: PtValue::Variable("-X".to_string()),
+                        target: TargetFilter::Typed(TypedFilter::creature()),
+                    },
+                )
+                .cost(AbilityCost::RemoveCounter {
+                    count: REMOVE_COUNTER_COST_X,
+                    counter_type: CounterMatch::OfType(charge_counter.clone()),
+                    target: None,
+                    selection: CounterCostSelection::SingleObject,
+                }),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            match &waiting {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 3,
+                    "-X/-X effects must still prompt for X before removing counters"
+                ),
+                other => panic!("expected ChooseXValue, got {other:?}"),
+            }
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+
+            assert_eq!(
+                state.objects[&source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "choosing X=2 for -X/-X must remove exactly two counters"
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "negative-X pump activation should reach the stack after chosen X payment"
+            );
+        }
+
+        #[test]
+        fn any_number_counter_activation_cost_prompts_and_pays_chosen_count() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 3);
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::RemoveCounter {
+                    count: REMOVE_COUNTER_COST_ANY_NUMBER,
+                    counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
+                    target: None,
+                    selection: CounterCostSelection::SingleObject,
+                }),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            match &waiting {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 3,
+                    "any-number counter costs must cap by available counters"
+                ),
+                other => panic!("expected ChooseXValue, got {other:?}"),
+            }
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 1 }).unwrap();
+
+            assert_eq!(
+                state.objects[&source]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0),
+                2,
+                "any-number costs must remove only the chosen count"
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "activated ability should reach the stack after chosen any-number payment"
+            );
+        }
+
+        #[test]
+        fn x_counter_activation_cost_target_legality_defers_until_x_choice() {
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, charge_counter.clone(), 3);
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Destroy {
+                        target: TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                            FilterProp::Cmc {
+                                comparator: Comparator::LE,
+                                value: QuantityExpr::Ref {
+                                    qty: QuantityRef::Variable {
+                                        name: "X".to_string(),
+                                    },
+                                },
+                            },
+                        ])),
+                        cant_regenerate: false,
+                    },
+                )
+                .cost(AbilityCost::RemoveCounter {
+                    count: REMOVE_COUNTER_COST_X,
+                    counter_type: CounterMatch::OfType(charge_counter),
+                    target: None,
+                    selection: CounterCostSelection::SingleObject,
+                }),
+            );
+
+            assert!(
+                can_activate_ability_now(&state, PlayerId(0), source, 0),
+                "target legality depending on X must not hide Remove-X-counter activations before X is chosen"
+            );
+        }
+
+        #[test]
+        fn targeted_x_counter_activation_cost_allows_zero_without_cost_target() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 0);
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Scry {
+                        count: QuantityExpr::Ref {
+                            qty: QuantityRef::Variable {
+                                name: "X".to_string(),
+                            },
+                        },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::RemoveCounter {
+                    count: REMOVE_COUNTER_COST_X,
+                    counter_type: CounterMatch::OfType(charge_counter),
+                    target: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact))),
+                    selection: CounterCostSelection::SingleObject,
+                }),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            match &waiting {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 0,
+                    "no eligible targeted counter source should still allow X=0"
+                ),
+                other => panic!("expected ChooseXValue, got {other:?}"),
+            }
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 0 }).unwrap();
+
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "choosing X=0 must not require selecting a targeted counter-cost object"
+            );
+        }
+
+        #[test]
+        fn targeted_x_counter_activation_cost_pays_residual_costs_once() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 0);
+            let counter_source = create_object(
+                &mut state,
+                CardId(909),
+                PlayerId(0),
+                "Life Counter Battery".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&counter_source).unwrap();
+                obj.card_types.core_types.push(CoreType::Artifact);
+                obj.counters.insert(charge_counter.clone(), 3);
+            }
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Scry {
+                        count: QuantityExpr::Ref {
+                            qty: QuantityRef::Variable {
+                                name: "X".to_string(),
+                            },
+                        },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::PayLife {
+                            amount: QuantityExpr::Fixed { value: 2 },
+                        },
+                        AbilityCost::RemoveCounter {
+                            count: REMOVE_COUNTER_COST_X,
+                            counter_type: CounterMatch::OfType(charge_counter.clone()),
+                            target: Some(TargetFilter::Typed(TypedFilter::new(
+                                TypeFilter::Artifact,
+                            ))),
+                            selection: CounterCostSelection::SingleObject,
+                        },
+                    ],
+                }),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+            assert_eq!(
+                state.players[0].life, 20,
+                "residual PayLife cost must not be paid before the cancellable targeted counter choice"
+            );
+
+            apply_as_current(
+                &mut state,
+                GameAction::SelectCards {
+                    cards: vec![counter_source],
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                state.players[0].life, 18,
+                "targeted counter choice resume must pay residual PayLife exactly once"
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "activation should reach the stack after paying each residual cost once"
+            );
+        }
+
+        #[test]
+        fn targeted_x_counter_activation_cost_prompts_x_before_targeted_cost_payment() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 0);
+            let counter_source = create_object(
+                &mut state,
+                CardId(904),
+                PlayerId(0),
+                "Counter Battery".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&counter_source).unwrap();
+                obj.card_types.core_types.push(CoreType::Artifact);
+                obj.counters.insert(charge_counter.clone(), 3);
+            }
+            let other_counter_source = create_object(
+                &mut state,
+                CardId(905),
+                PlayerId(0),
+                "Smaller Counter Battery".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&other_counter_source).unwrap();
+                obj.card_types.core_types.push(CoreType::Artifact);
+                obj.counters.insert(charge_counter.clone(), 2);
+            }
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Scry {
+                        count: QuantityExpr::Ref {
+                            qty: QuantityRef::Variable {
+                                name: "X".to_string(),
+                            },
+                        },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Mana {
+                            cost: ManaCost::generic(1),
+                        },
+                        AbilityCost::RemoveCounter {
+                            count: REMOVE_COUNTER_COST_X,
+                            counter_type: CounterMatch::OfType(charge_counter.clone()),
+                            target: Some(TargetFilter::Typed(TypedFilter::new(
+                                TypeFilter::Artifact,
+                            ))),
+                            selection: CounterCostSelection::SingleObject,
+                        },
+                    ],
+                }),
+            );
+            add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            match &waiting {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 3,
+                    "targeted X counter costs must cap by the largest single eligible source, not the sum"
+                ),
+                other => panic!("expected ChooseXValue, got {other:?}"),
+            }
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+            match &state.waiting_for {
+                WaitingFor::PayCost {
+                    kind:
+                        PayCostKind::RemoveCounter {
+                            counter_type,
+                            count: counter_count,
+                            ..
+                        },
+                    choices,
+                    count,
+                    ..
+                } => {
+                    assert_eq!(*counter_type, CounterMatch::OfType(charge_counter.clone()));
+                    assert_eq!(*counter_count, 2);
+                    assert!(choices.contains(&counter_source));
+                    assert!(choices.contains(&other_counter_source));
+                    assert_eq!(*count, 1);
+                }
+                other => panic!("expected targeted RemoveCounter payment, got {other:?}"),
+            }
+
+            apply_as_current(
+                &mut state,
+                GameAction::SelectCards {
+                    cards: vec![counter_source],
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                state.objects[&counter_source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "targeted payment must remove exactly the chosen X counters"
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "activated ability should reach the stack after targeted X counter cost payment"
+            );
+            assert_eq!(
+                state.players[0].mana_pool.total(),
+                0,
+                "targeted X counter cost selection must resume and pay split-out fixed mana"
+            );
+        }
+
+        #[test]
+        fn targeted_x_counter_activation_cost_pays_tap_component() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 0);
+            let counter_source = create_object(
+                &mut state,
+                CardId(913),
+                PlayerId(0),
+                "Tapped Counter Battery".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&counter_source).unwrap();
+                obj.card_types.core_types.push(CoreType::Artifact);
+                obj.counters.insert(charge_counter.clone(), 3);
+            }
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Scry {
+                        count: QuantityExpr::Ref {
+                            qty: QuantityRef::Variable {
+                                name: "X".to_string(),
+                            },
+                        },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Tap,
+                        AbilityCost::RemoveCounter {
+                            count: REMOVE_COUNTER_COST_X,
+                            counter_type: CounterMatch::OfType(charge_counter.clone()),
+                            target: Some(TargetFilter::Typed(TypedFilter::new(
+                                TypeFilter::Artifact,
+                            ))),
+                            selection: CounterCostSelection::SingleObject,
+                        },
+                    ],
+                }),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+            assert!(
+                !state.objects[&source].tapped,
+                "targeted X counter-cost detour must not pay the tap component before the counter-source choice"
+            );
+
+            apply_as_current(
+                &mut state,
+                GameAction::SelectCards {
+                    cards: vec![counter_source],
+                },
+            )
+            .unwrap();
+
+            assert!(
+                state.objects[&source].tapped,
+                "targeted counter selection must pay the activation's tap component"
+            );
+            assert_eq!(
+                state.objects[&counter_source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "targeted counter selection must still remove the chosen X counters"
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "activated ability should reach the stack after tap and targeted counter cost payment"
+            );
+        }
+
+        #[test]
+        fn cancel_after_targeted_x_counter_choice_does_not_pay_automatic_costs() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 0);
+            let counter_source = create_object(
+                &mut state,
+                CardId(918),
+                PlayerId(0),
+                "Cancellable Counter Battery".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&counter_source).unwrap();
+                obj.card_types.core_types.push(CoreType::Artifact);
+                obj.counters.insert(charge_counter.clone(), 2);
+            }
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Scry {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Tap,
+                        AbilityCost::RemoveCounter {
+                            count: REMOVE_COUNTER_COST_X,
+                            counter_type: CounterMatch::OfType(charge_counter.clone()),
+                            target: Some(TargetFilter::Typed(TypedFilter::new(
+                                TypeFilter::Artifact,
+                            ))),
+                            selection: CounterCostSelection::SingleObject,
+                        },
+                    ],
+                }),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 1 }).unwrap();
+            assert!(
+                matches!(state.waiting_for, WaitingFor::PayCost { .. }),
+                "counter-source choice should remain cancellable after X is chosen"
+            );
+
+            apply_as_current(&mut state, GameAction::CancelCast).unwrap();
+
+            assert!(
+                !state.objects[&source].tapped,
+                "canceling the counter-source prompt must not leave the source tapped"
+            );
+            assert_eq!(
+                state.objects[&counter_source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                2,
+                "canceling the counter-source prompt must not remove counters"
+            );
+        }
+
+        #[test]
+        fn targeted_x_any_counter_cost_caps_by_largest_concrete_counter_stack() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let quest_counter = CounterType::Generic("quest".to_string());
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 0);
+            let counter_source = create_object(
+                &mut state,
+                CardId(912),
+                PlayerId(0),
+                "Mixed Counter Battery".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&counter_source).unwrap();
+                obj.card_types.core_types.push(CoreType::Artifact);
+                obj.counters.insert(charge_counter.clone(), 2);
+                obj.counters.insert(quest_counter.clone(), 1);
+            }
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Scry {
+                        count: QuantityExpr::Ref {
+                            qty: QuantityRef::Variable {
+                                name: "X".to_string(),
+                            },
+                        },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::RemoveCounter {
+                    count: REMOVE_COUNTER_COST_X,
+                    counter_type: CounterMatch::Any,
+                    target: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact))),
+                    selection: CounterCostSelection::SingleObject,
+                }),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            match &waiting {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 2,
+                    "untyped Remove-X-counter costs must cap by the largest concrete counter stack, not the sum across types"
+                ),
+                other => panic!("expected ChooseXValue, got {other:?}"),
+            }
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+            match &state.waiting_for {
+                WaitingFor::PayCost {
+                    kind:
+                        PayCostKind::RemoveCounter {
+                            counter_type,
+                            count: counter_count,
+                            ..
+                        },
+                    count,
+                    ..
+                } => {
+                    assert_eq!(*counter_type, CounterMatch::Any);
+                    assert_eq!(*counter_count, 2);
+                    assert_eq!(*count, 1);
+                }
+                other => panic!("expected targeted RemoveCounter payment, got {other:?}"),
+            }
+
+            apply_as_current(
+                &mut state,
+                GameAction::SelectCards {
+                    cards: vec![counter_source],
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                state.objects[&counter_source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                0,
+                "payment should remove the chosen X counters from one concrete counter type"
+            );
+            assert_eq!(
+                state.objects[&counter_source]
+                    .counters
+                    .get(&quest_counter)
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "payment must not combine unrelated counter types to satisfy one untyped cost"
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "activated ability should reach the stack after concrete Any-counter payment"
+            );
+        }
+
+        #[test]
+        fn from_among_x_counter_activation_cost_caps_and_pays_exact_distribution() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 0);
+            let first_counter_source = create_object(
+                &mut state,
+                CardId(914),
+                PlayerId(0),
+                "First Counter Creature".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&first_counter_source).unwrap();
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.counters.insert(charge_counter.clone(), 1);
+            }
+            let second_counter_source = create_object(
+                &mut state,
+                CardId(915),
+                PlayerId(0),
+                "Second Counter Creature".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&second_counter_source).unwrap();
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.counters.insert(charge_counter.clone(), 2);
+            }
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Scry {
+                        count: QuantityExpr::Ref {
+                            qty: QuantityRef::Variable {
+                                name: "X".to_string(),
+                            },
+                        },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::RemoveCounter {
+                    count: REMOVE_COUNTER_COST_X,
+                    counter_type: CounterMatch::OfType(charge_counter.clone()),
+                    target: Some(TargetFilter::Typed(TypedFilter::creature())),
+                    selection: CounterCostSelection::AmongObjects,
+                }),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            match &waiting {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 3,
+                    "from-among X counter costs must cap by the aggregate removable counters"
+                ),
+                other => panic!("expected ChooseXValue, got {other:?}"),
+            }
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+            match &state.waiting_for {
+                WaitingFor::PayCost {
+                    kind:
+                        PayCostKind::RemoveCounter {
+                            selection,
+                            count: counter_count,
+                            ..
+                        },
+                    choices,
+                    count,
+                    min_count,
+                    ..
+                } => {
+                    assert_eq!(*selection, CounterCostSelection::AmongObjects);
+                    assert_eq!(*counter_count, 2);
+                    assert_eq!(*min_count, 1);
+                    assert_eq!(*count, 2);
+                    assert!(choices.contains(&first_counter_source));
+                    assert!(choices.contains(&second_counter_source));
+                }
+                other => panic!("expected from-among RemoveCounter payment, got {other:?}"),
+            }
+
+            apply_as_current(
+                &mut state,
+                GameAction::ChooseRemoveCounterCostDistribution {
+                    distribution: vec![
+                        CounterCostChoice {
+                            object_id: first_counter_source,
+                            counter_type: charge_counter.clone(),
+                            count: 1,
+                        },
+                        CounterCostChoice {
+                            object_id: second_counter_source,
+                            counter_type: charge_counter.clone(),
+                            count: 1,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                state.objects[&first_counter_source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                0
+            );
+            assert_eq!(
+                state.objects[&second_counter_source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                1
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "activated ability should reach the stack after from-among counter cost payment"
+            );
+        }
+
+        #[test]
+        fn from_among_any_counter_cost_can_distribute_across_counter_types() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let quest_counter = CounterType::Generic("quest".to_string());
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 0);
+            let counter_source = create_object(
+                &mut state,
+                CardId(919),
+                PlayerId(0),
+                "Mixed Counter Creature".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&counter_source).unwrap();
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.counters.insert(charge_counter.clone(), 1);
+                obj.counters.insert(quest_counter.clone(), 1);
+            }
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Scry {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::RemoveCounter {
+                    count: REMOVE_COUNTER_COST_X,
+                    counter_type: CounterMatch::Any,
+                    target: Some(TargetFilter::Typed(TypedFilter::creature())),
+                    selection: CounterCostSelection::AmongObjects,
+                }),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            match &waiting {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 2,
+                    "from-among Any counter costs must count all removable counter types"
+                ),
+                other => panic!("expected ChooseXValue, got {other:?}"),
+            }
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+            apply_as_current(
+                &mut state,
+                GameAction::ChooseRemoveCounterCostDistribution {
+                    distribution: vec![
+                        CounterCostChoice {
+                            object_id: counter_source,
+                            counter_type: charge_counter.clone(),
+                            count: 1,
+                        },
+                        CounterCostChoice {
+                            object_id: counter_source,
+                            counter_type: quest_counter.clone(),
+                            count: 1,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                state.objects[&counter_source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                0
+            );
+            assert_eq!(
+                state.objects[&counter_source]
+                    .counters
+                    .get(&quest_counter)
+                    .copied()
+                    .unwrap_or(0),
+                0
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "activated ability should reach the stack after mixed counter distribution"
+            );
+        }
+
+        #[test]
+        fn modal_x_counter_activation_cost_prompts_after_mode_choice() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, charge_counter.clone(), 3);
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Unimplemented {
+                        name: "modal placeholder".to_string(),
+                        description: None,
+                    },
+                )
+                .cost(AbilityCost::RemoveCounter {
+                    count: REMOVE_COUNTER_COST_X,
+                    counter_type: CounterMatch::OfType(charge_counter.clone()),
+                    target: None,
+                    selection: CounterCostSelection::SingleObject,
+                })
+                .with_modal(
+                    ModalChoice {
+                        min_choices: 1,
+                        max_choices: 1,
+                        mode_count: 2,
+                        mode_descriptions: vec!["Scry X.".to_string(), "Draw a card.".to_string()],
+                        ..ModalChoice::default()
+                    },
+                    vec![
+                        AbilityDefinition::new(
+                            AbilityKind::Activated,
+                            Effect::Scry {
+                                count: QuantityExpr::Ref {
+                                    qty: QuantityRef::Variable {
+                                        name: "X".to_string(),
+                                    },
+                                },
+                                target: TargetFilter::Controller,
+                            },
+                        ),
+                        AbilityDefinition::new(
+                            AbilityKind::Activated,
+                            Effect::Draw {
+                                count: QuantityExpr::Fixed { value: 1 },
+                                target: TargetFilter::Controller,
+                            },
+                        ),
+                    ],
+                ),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            assert!(
+                matches!(waiting, WaitingFor::AbilityModeChoice { .. }),
+                "modal activated ability must ask for mode before X"
+            );
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::SelectModes { indices: vec![0] }).unwrap();
+            match &state.waiting_for {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 3,
+                    "modal X counter costs must prompt after mode choice and cap by counters"
+                ),
+                other => panic!("expected ChooseXValue after mode choice, got {other:?}"),
+            }
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+
+            assert_eq!(
+                state.objects[&source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "modal ability must remove exactly the chosen X counters"
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "modal activated ability should reach the stack after chosen X cost payment"
+            );
+        }
+
+        #[test]
+        fn modal_x_counter_activation_cost_prompts_for_non_x_selected_mode() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, charge_counter.clone(), 3);
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Unimplemented {
+                        name: "modal placeholder".to_string(),
+                        description: None,
+                    },
+                )
+                .cost(AbilityCost::RemoveCounter {
+                    count: REMOVE_COUNTER_COST_X,
+                    counter_type: CounterMatch::OfType(charge_counter.clone()),
+                    target: None,
+                    selection: CounterCostSelection::SingleObject,
+                })
+                .with_modal(
+                    ModalChoice {
+                        min_choices: 1,
+                        max_choices: 1,
+                        mode_count: 2,
+                        mode_descriptions: vec!["Scry X.".to_string(), "Draw a card.".to_string()],
+                        ..ModalChoice::default()
+                    },
+                    vec![
+                        AbilityDefinition::new(
+                            AbilityKind::Activated,
+                            Effect::Scry {
+                                count: QuantityExpr::Ref {
+                                    qty: QuantityRef::Variable {
+                                        name: "X".to_string(),
+                                    },
+                                },
+                                target: TargetFilter::Controller,
+                            },
+                        ),
+                        AbilityDefinition::new(
+                            AbilityKind::Activated,
+                            Effect::Draw {
+                                count: QuantityExpr::Fixed { value: 1 },
+                                target: TargetFilter::Controller,
+                            },
+                        ),
+                    ],
+                ),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::SelectModes { indices: vec![1] }).unwrap();
+            match &state.waiting_for {
+                WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+                    *max, 3,
+                    "literal Remove-X-counter costs must prompt for X even when the selected mode does not use X"
+                ),
+                other => panic!("expected ChooseXValue after non-X mode choice, got {other:?}"),
+            }
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+
+            assert_eq!(
+                state.objects[&source]
+                    .counters
+                    .get(&charge_counter)
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "non-X selected mode must still pay the chosen literal-X counter cost"
+            );
+            assert!(
+                state.stack.iter().any(|entry| entry.source_id == source),
+                "modal activated ability should reach the stack after paying literal-X cost"
+            );
+        }
+
+        #[test]
+        fn modal_targeted_x_counter_activation_cost_preserves_deferred_mode_targeting() {
+            use crate::game::engine::apply_as_current;
+
+            let mut state = setup_game_at_main_phase();
+            let charge_counter = CounterType::Generic("charge".to_string());
+            let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 0);
+            let counter_source = create_object(
+                &mut state,
+                CardId(906),
+                PlayerId(0),
+                "Modal Counter Battery".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&counter_source).unwrap();
+                obj.card_types.core_types.push(CoreType::Artifact);
+                obj.counters.insert(charge_counter.clone(), 3);
+            }
+            for card_id in [907, 908] {
+                let target = create_object(
+                    &mut state,
+                    CardId(card_id),
+                    PlayerId(1),
+                    format!("Target Creature {card_id}"),
+                    Zone::Battlefield,
+                );
+                let obj = state.objects.get_mut(&target).unwrap();
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.power = Some(2);
+                obj.toughness = Some(2);
+            }
+            Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Unimplemented {
+                        name: "modal placeholder".to_string(),
+                        description: None,
+                    },
+                )
+                .cost(AbilityCost::RemoveCounter {
+                    count: REMOVE_COUNTER_COST_X,
+                    counter_type: CounterMatch::OfType(charge_counter.clone()),
+                    target: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact))),
+                    selection: CounterCostSelection::SingleObject,
+                })
+                .with_modal(
+                    ModalChoice {
+                        min_choices: 1,
+                        max_choices: 1,
+                        mode_count: 1,
+                        mode_descriptions: vec!["Deal X damage to target creature.".to_string()],
+                        ..ModalChoice::default()
+                    },
+                    vec![AbilityDefinition::new(
+                        AbilityKind::Activated,
+                        Effect::DealDamage {
+                            amount: QuantityExpr::Ref {
+                                qty: QuantityRef::Variable {
+                                    name: "X".to_string(),
+                                },
+                            },
+                            target: TargetFilter::Typed(TypedFilter::creature()),
+                            damage_source: None,
+                        },
+                    )],
+                ),
+            );
+
+            let waiting =
+                handle_activate_ability(&mut state, PlayerId(0), source, 0, &mut Vec::new())
+                    .unwrap();
+            state.waiting_for = waiting;
+
+            apply_as_current(&mut state, GameAction::SelectModes { indices: vec![0] }).unwrap();
+            assert!(matches!(state.waiting_for, WaitingFor::ChooseXValue { .. }));
+
+            apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).unwrap();
+            assert!(matches!(
+                state.waiting_for,
+                WaitingFor::PayCost {
+                    kind: PayCostKind::RemoveCounter { .. },
+                    ..
+                }
+            ));
+
+            apply_as_current(
+                &mut state,
+                GameAction::SelectCards {
+                    cards: vec![counter_source],
+                },
+            )
+            .unwrap();
+            match &state.waiting_for {
+                WaitingFor::TargetSelection {
+                    target_slots,
+                    mode_labels,
+                    ..
+                } => {
+                    assert_eq!(target_slots.len(), 1);
+                    assert_eq!(mode_labels.len(), 1);
+                    assert_eq!(
+                        mode_labels[0].as_deref(),
+                        Some("Deal X damage to target creature."),
+                        "targeted counter-cost resume must preserve chosen modal labels"
+                    );
+                }
+                other => panic!("expected deferred modal target selection, got {other:?}"),
+            }
         }
     }
 

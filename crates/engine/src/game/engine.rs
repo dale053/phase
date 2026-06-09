@@ -2137,6 +2137,48 @@ fn apply_action(
         (
             WaitingFor::PayCost {
                 player,
+                kind:
+                    PayCostKind::RemoveCounter {
+                        counter_type,
+                        count: counter_count,
+                        selection,
+                    },
+                choices,
+                resume,
+                ..
+            },
+            GameAction::ChooseRemoveCounterCostDistribution { distribution },
+        ) => match resume {
+            CostResume::Spell {
+                spell: pending_cast,
+            }
+            | CostResume::SpellCost {
+                spell: pending_cast,
+                ..
+            } => {
+                casting_costs::handle_remove_counter_distribution_for_cost(
+                    state,
+                    *player,
+                    *pending_cast.clone(),
+                    *counter_count,
+                    counter_type.clone(),
+                    *selection,
+                    choices,
+                    &distribution,
+                    &mut events,
+                )?
+            }
+            CostResume::ManaAbility {
+                ..
+            } => {
+                return Err(EngineError::InvalidAction(
+                    "Counter-cost distribution is not valid for mana abilities".to_string(),
+                ));
+            }
+        },
+        (
+            WaitingFor::PayCost {
+                player,
                 kind,
                 choices,
                 count,
@@ -2217,13 +2259,18 @@ fn apply_action(
                         &mut events,
                     )?
                 }
-                PayCostKind::RemoveCounter { counter_type } => {
+                PayCostKind::RemoveCounter {
+                    counter_type,
+                    count: counter_count,
+                    selection,
+                } => {
                     casting_costs::handle_remove_counter_for_cost(
                         state,
                         *player,
                         *pending_cast.clone(),
-                        *count as u32,
+                        *counter_count,
                         counter_type.clone(),
+                        *selection,
                         choices,
                         &chosen,
                         &mut events,
@@ -14973,9 +15020,9 @@ mod phase_trigger_regression_tests {
     use crate::parser::oracle::parse_oracle_text;
     use crate::types::ability::{
         AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect,
-        FilterProp, ObjectScope, PlayerFilter, QuantityExpr, QuantityRef, ResolvedAbility,
-        TargetFilter, TargetRef, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
-        UnlessPayModifier,
+        FilterProp, ObjectScope, PlayerFilter, QuantityExpr, QuantityRef, ReplacementDefinition,
+        ReplacementMode, ResolvedAbility, TargetFilter, TargetRef, TriggerConstraint,
+        TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier,
     };
     use crate::types::card::CardFace;
     use crate::types::card_type::CoreType;
@@ -14984,6 +15031,7 @@ mod phase_trigger_regression_tests {
     use crate::types::keywords::Keyword;
     use crate::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
     use crate::types::player::PlayerId;
+    use crate::types::replacements::ReplacementEvent;
     use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
 
@@ -18960,6 +19008,181 @@ Echo—Discard a card. (At the beginning of your upkeep, if this came under your
     // sourced (synthesized by Keyword::CumulativeUpkeep, not parsed) and in
     // the `PerCounter` expansion that lives in the sub-ability's unless-cost.
 
+    fn cumulative_upkeep_exile_top_trigger() -> TriggerDefinition {
+        crate::database::synthesis::build_cumulative_upkeep_trigger(AbilityCost::Exile {
+            count: 1,
+            zone: Some(Zone::Library),
+            filter: None,
+        })
+    }
+
+    fn setup_top_library_exile_upkeep_state(
+        preloaded_age_counters: u32,
+        library_count: u32,
+    ) -> (GameState, ObjectId, Vec<ObjectId>) {
+        let mut state = new_game(42);
+        state.turn_number = 2;
+        state.phase = Phase::Untap;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+
+        let mut library_cards = Vec::new();
+        for index in 0..library_count {
+            library_cards.push(create_object(
+                &mut state,
+                CardId(8000 + u64::from(index)),
+                PlayerId(0),
+                format!("Library Card {}", index + 1),
+                Zone::Library,
+            ));
+        }
+
+        let source = create_object(
+            &mut state,
+            CardId(70240),
+            PlayerId(0),
+            "Top-Library Exile Upkeep".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.trigger_definitions
+                .push(cumulative_upkeep_exile_top_trigger());
+            if preloaded_age_counters > 0 {
+                obj.counters.insert(
+                    crate::types::counter::CounterType::Age,
+                    preloaded_age_counters,
+                );
+            }
+        }
+
+        (state, source, library_cards)
+    }
+
+    fn install_optional_exile_move_replacement(state: &mut GameState, card_id: ObjectId) {
+        let replacement_source = create_object(
+            state,
+            CardId(70241),
+            PlayerId(0),
+            "Optional Exile Move Replacement".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&replacement_source).unwrap();
+        obj.card_types.core_types.push(CoreType::Enchantment);
+        obj.replacement_definitions.push(
+            ReplacementDefinition::new(ReplacementEvent::Moved)
+                .mode(ReplacementMode::Optional { decline: None })
+                .valid_card(TargetFilter::SpecificObject { id: card_id })
+                .destination_zone(Zone::Exile),
+        );
+    }
+
+    #[test]
+    fn top_library_exile_cumulative_upkeep_exiles_top_cards_and_keeps_permanent() {
+        let (mut state, source, library_cards) = setup_top_library_exile_upkeep_state(1, 3);
+
+        advance_to_unless_payment_prompt(&mut state);
+
+        match &state.waiting_for {
+            WaitingFor::UnlessPayment { player, cost, .. } => {
+                assert_eq!(*player, PlayerId(0));
+                assert_eq!(
+                    cost,
+                    &AbilityCost::Exile {
+                        count: 2,
+                        zone: Some(Zone::Library),
+                        filter: None,
+                    },
+                    "one preloaded age counter plus the upkeep tick should require exiling two top cards"
+                );
+            }
+            other => panic!("expected UnlessPayment for top-library exile, got {other:?}"),
+        }
+
+        apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true })
+            .expect("top-library exile cumulative-upkeep cost should be payable");
+
+        assert_eq!(state.objects[&source].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&library_cards[0]].zone, Zone::Exile);
+        assert_eq!(state.objects[&library_cards[1]].zone, Zone::Exile);
+        assert_eq!(state.objects[&library_cards[2]].zone, Zone::Library);
+        assert_eq!(
+            state.players[0].library.front().copied(),
+            Some(library_cards[2]),
+            "the third card should become the new library top after paying"
+        );
+    }
+
+    #[test]
+    fn top_library_exile_cumulative_upkeep_sacrifices_when_library_payment_unpayable() {
+        let (mut state, source, library_cards) = setup_top_library_exile_upkeep_state(1, 1);
+
+        advance_to_unless_payment_prompt(&mut state);
+
+        match &state.waiting_for {
+            WaitingFor::UnlessPayment { cost, .. } => assert_eq!(
+                cost,
+                &AbilityCost::Exile {
+                    count: 2,
+                    zone: Some(Zone::Library),
+                    filter: None,
+                }
+            ),
+            other => panic!("expected UnlessPayment for top-library exile, got {other:?}"),
+        }
+
+        apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true })
+            .expect("unpayable top-library exile cost should fall through to sacrifice");
+
+        assert_eq!(
+            state.objects[&source].zone,
+            Zone::Graveyard,
+            "partial cumulative-upkeep payments are not allowed; too few library cards sacrifices the permanent"
+        );
+        assert_eq!(
+            state.objects[&library_cards[0]].zone,
+            Zone::Library,
+            "failed payment must not partially exile the available top card"
+        );
+    }
+
+    #[test]
+    fn top_library_exile_cumulative_upkeep_replacement_choice_is_atomic() {
+        let (mut state, source, library_cards) = setup_top_library_exile_upkeep_state(1, 3);
+        install_optional_exile_move_replacement(&mut state, library_cards[1]);
+
+        advance_to_unless_payment_prompt(&mut state);
+
+        apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true })
+            .expect("choice-based top-library exile cost should fall through to sacrifice");
+
+        assert_eq!(
+            state.objects[&source].zone,
+            Zone::Graveyard,
+            "a choice-based replacement makes the deterministic cumulative-upkeep payment fail"
+        );
+        assert_eq!(
+            state.objects[&library_cards[0]].zone,
+            Zone::Library,
+            "failed payment must not partially exile the first top card"
+        );
+        assert_eq!(
+            state.objects[&library_cards[1]].zone,
+            Zone::Library,
+            "failed payment must not partially exile later top cards"
+        );
+        assert_eq!(
+            state.players[0].library.front().copied(),
+            Some(library_cards[0]),
+            "choice-based payment failure leaves library order untouched"
+        );
+        assert!(
+            state.pending_replacement.is_none(),
+            "abandoned deterministic payment must not leave a replacement choice pending"
+        );
+    }
+
     /// Build the synthesized cumulative-upkeep trigger for "Cumulative upkeep
     /// {N}" (mana base cost) by delegating to the production synthesizer.
     /// Binding the end-to-end tests to the real builder ensures any regression
@@ -20628,6 +20851,81 @@ mod crew_tests {
                 // Vehicle should NOT be in eligible creatures even though it's a creature
                 assert!(!eligible_creatures.contains(&vehicle_id));
             }
+            other => panic!("Expected CrewVehicle, got {:?}", other),
+        }
+    }
+
+    // CR 702.122a + CR 702.122b: A Vehicle that has become an artifact creature
+    // via Crew may contribute to crewing another Vehicle.
+    #[test]
+    fn test_crewed_vehicle_may_crew_another_vehicle() {
+        let (mut state, vehicle_a, creature_a, _creature_b) = setup_crew_scenario();
+
+        let vehicle_b = create_object(
+            &mut state,
+            CardId(204),
+            PlayerId(0),
+            "Second Vehicle".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&vehicle_b).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.card_types.subtypes.push("Vehicle".to_string());
+            obj.keywords.push(crate::types::keywords::Keyword::Crew {
+                power: 3,
+                once_per_turn: crate::types::keywords::ActivationCadence::Unlimited,
+            });
+            obj.power = Some(6);
+            obj.toughness = Some(5);
+        }
+
+        apply_as_current(
+            &mut state,
+            GameAction::CrewVehicle {
+                vehicle_id: vehicle_a,
+                creature_ids: vec![],
+            },
+        )
+        .unwrap();
+        apply_as_current(
+            &mut state,
+            GameAction::CrewVehicle {
+                vehicle_id: vehicle_a,
+                creature_ids: vec![creature_a],
+            },
+        )
+        .unwrap();
+        apply(&mut state, PlayerId(0), GameAction::PassPriority).unwrap();
+        apply(&mut state, PlayerId(1), GameAction::PassPriority).unwrap();
+
+        assert!(
+            state
+                .objects
+                .get(&vehicle_a)
+                .unwrap()
+                .card_types
+                .core_types
+                .contains(&CoreType::Creature),
+            "Vehicle A should be an artifact creature after crew resolves"
+        );
+
+        apply_as_current(
+            &mut state,
+            GameAction::CrewVehicle {
+                vehicle_id: vehicle_b,
+                creature_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::CrewVehicle {
+                eligible_creatures, ..
+            } => assert!(
+                eligible_creatures.contains(&vehicle_a),
+                "crewed Vehicle A should be eligible to crew Vehicle B"
+            ),
             other => panic!("Expected CrewVehicle, got {:?}", other),
         }
     }
