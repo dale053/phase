@@ -513,7 +513,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             },
         ));
         let deck = vec![entry(face, 4)];
@@ -539,7 +539,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             },
         ));
         let deck = vec![entry(face, 4)];
