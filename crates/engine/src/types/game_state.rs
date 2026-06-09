@@ -2210,7 +2210,12 @@ pub enum ZoneManipulationKind {
         cards: Vec<ObjectId>,
         primary_destination: Zone,
         primary_count: u32,
-        primary_enter_tapped: bool,
+        #[serde(
+            default,
+            with = "super::zones::etb_tap_bool_compat",
+            skip_serializing_if = "EtbTapState::is_unspecified"
+        )]
+        primary_enter_tapped: EtbTapState,
         rest_destination: Zone,
         source_id: ObjectId,
     },
@@ -2248,8 +2253,12 @@ pub enum ZoneManipulationKind {
         zone: Zone,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<Zone>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        enter_tapped: bool,
+        #[serde(
+            default,
+            with = "super::zones::etb_tap_bool_compat",
+            skip_serializing_if = "EtbTapState::is_unspecified"
+        )]
+        enter_tapped: EtbTapState,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         enter_transformed: bool,
         #[serde(
@@ -2276,7 +2285,12 @@ pub enum ZoneManipulationKind {
         source_id: ObjectId,
         accept_zone: Zone,
         decline_zone: Zone,
-        enter_tapped: bool,
+        #[serde(
+            default,
+            with = "super::zones::etb_tap_bool_compat",
+            skip_serializing_if = "EtbTapState::is_unspecified"
+        )]
+        enter_tapped: EtbTapState,
         #[serde(default)]
         enters_attacking: bool,
         revealed_misses: Vec<ObjectId>,
