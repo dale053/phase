@@ -3608,7 +3608,7 @@ pub(super) fn parse_followup_continuation_ast(
                 rest_destination: None,
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
         // "You may put one of those cards back on top of your library" after
@@ -3622,7 +3622,7 @@ pub(super) fn parse_followup_continuation_ast(
                 rest_destination: None,
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
         // "put them back in any order" after Dig means all looked-at cards
@@ -5089,7 +5089,7 @@ mod tests {
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
-            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enter_tapped: false,
         }
     }
 
@@ -5232,7 +5232,7 @@ mod tests {
                 rest_destination: Some(Zone::Library),
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         );
     }
@@ -5255,7 +5255,7 @@ mod tests {
                 rest_destination: Some(Zone::Library),
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         );
     }
@@ -5283,7 +5283,7 @@ mod tests {
                 rest_destination: Some(Zone::Library),
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         );
     }
@@ -5305,7 +5305,7 @@ mod tests {
                 rest_destination: Some(Zone::Graveyard),
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         );
     }
@@ -5327,7 +5327,7 @@ mod tests {
                 rest_destination: Some(Zone::Library),
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         );
     }
@@ -5516,7 +5516,7 @@ mod tests {
                 rest_destination: Some(Zone::Library),
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             },
             AbilityKind::Spell,
         );
@@ -5552,7 +5552,7 @@ mod tests {
                 rest_destination: None,
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             },
             AbilityKind::Spell,
         );
@@ -5592,7 +5592,7 @@ mod tests {
                 rest_destination: None,
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             },
             AbilityKind::Spell,
         );
@@ -5650,7 +5650,7 @@ mod tests {
                 rest_destination: None,
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             },
             AbilityKind::Spell,
         );
@@ -6192,7 +6192,7 @@ mod tests {
                 rest_destination: None,
                 enters_under: None,
                 face_down_profile: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         );
     }

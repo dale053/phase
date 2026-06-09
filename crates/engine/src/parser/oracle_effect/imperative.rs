@@ -1373,7 +1373,7 @@ pub(super) fn parse_targeted_action_ast(
                         origin,
                         destination: Zone::Hand,
                         enters_under: None,
-                        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                        enter_tapped: false,
                     })
                 } else {
                     Some(TargetedImperativeAst::Return { target, selection })
@@ -1386,7 +1386,7 @@ pub(super) fn parse_targeted_action_ast(
                         origin,
                         destination: d.zone,
                         enters_under: None,
-                        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                        enter_tapped: false,
                     })
                 } else {
                     Some(TargetedImperativeAst::ReturnToZone {
@@ -2097,7 +2097,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal,
-            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enter_tapped: false,
         },
         SearchCreationImperativeAst::CopyTokenOf {
             target,
@@ -2190,7 +2190,7 @@ pub(super) fn parse_hand_reveal_ast(
             return Some(HandRevealImperativeAst::LookAt {
                 target: TargetFilter::ExiledBySource,
                 count: None,
-                selection: crate::types::ability::CardSelectionMode::Chosen,
+                random: false,
             });
         }
     }
@@ -2229,7 +2229,7 @@ pub(super) fn parse_hand_reveal_ast(
         return Some(HandRevealImperativeAst::LookAt {
             target,
             count: None,
-            selection: crate::types::ability::CardSelectionMode::Chosen,
+            random: false,
         });
     }
 

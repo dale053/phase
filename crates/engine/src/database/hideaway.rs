@@ -85,7 +85,7 @@ fn hideaway_trigger(n: u32) -> TriggerDefinition {
             rest_destination: Some(Zone::Library),
             // CR 701.20e: the cards are looked at privately, not revealed.
             reveal: false,
-            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enter_tapped: false,
         },
     )
     // CR 608.2c: continuation — conceal the just-exiled card (ParentTarget).

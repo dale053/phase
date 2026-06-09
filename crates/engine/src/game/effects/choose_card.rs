@@ -86,7 +86,7 @@ pub fn resolve(
         kept_destination: None,
         rest_destination: None,
         source_id: Some(ability.source_id),
-        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+        enter_tapped: false,
     };
 
     events.push(GameEvent::EffectResolved {

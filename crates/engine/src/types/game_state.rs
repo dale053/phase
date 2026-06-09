@@ -7065,7 +7065,7 @@ mod tests {
             kept_destination: None,
             rest_destination: None,
             source_id: None,
-            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enter_tapped: false,
         }
         .accepts_freeform_card_selection());
 
@@ -7329,7 +7329,7 @@ mod tests {
             kept_destination: None,
             rest_destination: None,
             source_id: None,
-            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enter_tapped: false,
         }));
         variants.push(Box::new(WaitingFor::SurveilChoice {
             player: PlayerId(0),
