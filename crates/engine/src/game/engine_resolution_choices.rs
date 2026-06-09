@@ -18,7 +18,7 @@ use super::effects;
 use super::engine::EngineError;
 use super::turns;
 use super::zones;
-use super::{casting, casting_costs};
+use super::{casting, casting_costs, mana_abilities};
 
 pub(super) enum ResolutionChoiceOutcome {
     WaitingFor(WaitingFor),
@@ -479,7 +479,7 @@ pub(super) fn handle_resolution_choice(
             if accept {
                 zones::move_to_zone(state, hit_card, accept_zone, events);
                 // CR 110.5b: the kept card enters tapped when requested.
-                if enter_tapped {
+                if enter_tapped.resolve(false) {
                     if let Some(obj) = state.objects.get_mut(&hit_card) {
                         obj.tapped = true;
                     }
@@ -775,6 +775,7 @@ pub(super) fn handle_resolution_choice(
                 max,
                 accumulated,
                 source_id,
+                pending_mana_ability,
             },
             GameAction::SubmitPayAmount { amount },
         ) => {
@@ -783,6 +784,13 @@ pub(super) fn handle_resolution_choice(
                     "Submitted pay amount {} outside legal range [{}, {}]",
                     amount, min, max
                 )));
+            }
+            if let Some(pending_mana_ability) = pending_mana_ability {
+                let mut pending = pending_mana_ability.as_ref().clone();
+                pending.chosen_counter_count = Some(amount);
+                let waiting_for =
+                    mana_abilities::advance_mana_ability_activation(state, pending, events)?;
+                return Ok(ResolutionChoiceOutcome::WaitingFor(waiting_for));
             }
             match resource {
                 PayableResource::Energy => {
@@ -816,6 +824,11 @@ pub(super) fn handle_resolution_choice(
                         )));
                     }
                     let _ = casting::pay_unless_cost(state, player, &cost, events);
+                }
+                PayableResource::Counters => {
+                    return Err(EngineError::InvalidAction(
+                        "Counter amount choices require a pending mana ability".to_string(),
+                    ));
                 }
             }
             // CR 603.7c: Bind the paid amount for downstream chain steps that
@@ -2146,6 +2159,24 @@ pub(super) fn handle_resolution_choice(
                 let _ = state.devour_eligible_snapshot.take();
             }
 
+            if chosen.is_empty() && matches!(effect_kind, EffectKind::CastFromZone) {
+                // CR 609.1 / CR 601.2a: Declining an optional
+                // Electrodominance-style hand cast consumes the stashed
+                // CastFromZone continuation without granting a permission. Do
+                // not call the generic resume path here; the pending ability
+                // would re-open the same optional prompt.
+                state.pending_continuation.take();
+                state.last_effect_count = Some(0);
+                events.push(GameEvent::EffectResolved {
+                    kind: effect_kind,
+                    source_id,
+                });
+                set_priority(state, player);
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
+                ));
+            }
+
             if chosen.is_empty() {
                 // Issue #423 audit: no cards chosen — this branch moves no
                 // objects and emits no battlefield-exit events, so no
@@ -2322,6 +2353,23 @@ pub(super) fn handle_resolution_choice(
                         super::zones::move_to_library_at_index(state, card_id, Some(0), events);
                     }
                 }
+                // CR 601.2c + CR 115.1: Resolution-time hand pick for
+                // `CastFromZone` (Electrodominance, Baral's Expertise).
+                EffectKind::CastFromZone => {
+                    let Some(cont) = state.pending_continuation.take() else {
+                        return Err(EngineError::InvalidAction(
+                            "CastFromZone EffectZoneChoice missing stashed ability".to_string(),
+                        ));
+                    };
+                    let ability = *cont.chain;
+                    effects::cast_from_zone::grant_lingering_permissions(
+                        &mut *state,
+                        &ability,
+                        &chosen,
+                        events,
+                    )
+                    .map_err(|e| EngineError::InvalidAction(e.to_string()))?;
+                }
                 // CR 701.68a: Place `count_param` -1/-1 counters on the creature
                 // the controller chose. The choice is non-targeted; the pool was
                 // restricted to the controller's creatures in `blight::resolve`,
@@ -2386,6 +2434,7 @@ pub(super) fn handle_resolution_choice(
                     | EffectKind::Tap
                     | EffectKind::Untap
                     | EffectKind::PutAtLibraryPosition
+                    | EffectKind::CastFromZone
             ) && state.pending_continuation.is_some()
             {
                 let tracked = if matches!(effect_kind, EffectKind::Sacrifice) {

@@ -59,7 +59,7 @@ fn optional_cost_paid_sets_flag() {
         })
         .with_additional_cost(AdditionalCost::Optional {
             cost: AbilityCost::Blight { count: 1 },
-            repeatable: false,
+            repeatability: engine::types::ability::AdditionalCostRepeatability::Once,
         })
         .id();
 
@@ -149,7 +149,7 @@ fn optional_cost_skipped_clears_flag() {
         })
         .with_additional_cost(AdditionalCost::Optional {
             cost: AbilityCost::Blight { count: 1 },
-            repeatable: false,
+            repeatability: engine::types::ability::AdditionalCostRepeatability::Once,
         })
         .id();
 
@@ -221,7 +221,7 @@ fn bargain_additional_cost_paid_reduces_self_spell_cost() {
                 cost: AbilityCost::PayLife {
                     amount: QuantityExpr::Fixed { value: 1 },
                 },
-                repeatable: false,
+                repeatability: engine::types::ability::AdditionalCostRepeatability::Once,
             })
             .with_static_definition(reduce_static)
             .id();
@@ -334,7 +334,7 @@ fn cancel_cast_at_optional_cost_choice() {
         })
         .with_additional_cost(AdditionalCost::Optional {
             cost: AbilityCost::Blight { count: 1 },
-            repeatable: false,
+            repeatability: engine::types::ability::AdditionalCostRepeatability::Once,
         })
         .id();
 
@@ -1266,7 +1266,7 @@ fn optional_blight_with_no_creatures_skips_prompt() {
         })
         .with_additional_cost(AdditionalCost::Optional {
             cost: AbilityCost::Blight { count: 1 },
-            repeatable: false,
+            repeatability: engine::types::ability::AdditionalCostRepeatability::Once,
         })
         .id();
 
@@ -1635,6 +1635,65 @@ fn add_expensive_dragon_commander(scenario: &mut GameScenario) -> ObjectId {
         .id();
     scenario.with_commander(commander_id);
     commander_id
+}
+
+/// CR 114.4 + CR 601.2b + CR 118.9a (issue #1355): Tamiyo, Field Researcher's
+/// emblem functions from the command zone and waives mana for hand spells.
+#[test]
+fn tamiyo_emblem_allows_free_cast_from_hand() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source_id = scenario
+        .add_creature(P0, "Tamiyo, Field Researcher", 0, 0)
+        .id();
+    let bolt_id = scenario.add_bolt_to_hand(P0);
+
+    let mut runner = scenario.build();
+    let emblem_static = engine::parser::oracle_static::parse_static_line(
+        "You may cast spells from your hand without paying their mana costs.",
+    )
+    .expect("Tamiyo emblem static should parse");
+    let ability = engine::types::ability::ResolvedAbility::new(
+        Effect::CreateEmblem {
+            statics: vec![emblem_static],
+            triggers: Vec::new(),
+        },
+        vec![],
+        source_id,
+        P0,
+    );
+    let mut events = Vec::<GameEvent>::new();
+    engine::game::effects::create_emblem::resolve(runner.state_mut(), &ability, &mut events)
+        .expect("Tamiyo emblem should be created");
+    let emblem_id = *runner
+        .state()
+        .command_zone
+        .last()
+        .expect("CreateEmblem should put an emblem in the command zone");
+    assert!(runner.state().objects[&emblem_id].is_emblem);
+
+    let card_id = runner.state().objects[&bolt_id].card_id;
+    let mana_before = runner.state().players[0].mana_pool.clone();
+
+    let result = runner
+        .act(GameAction::CastSpell {
+            object_id: bolt_id,
+            card_id,
+            targets: vec![],
+        })
+        .expect("Tamiyo emblem should allow casting a hand spell");
+    handle_target_selection(&mut runner, &result);
+
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "bolt should be on the stack after a free cast"
+    );
+    assert_eq!(
+        runner.state().players[0].mana_pool,
+        mana_before,
+        "no mana should have been paid under Tamiyo emblem"
+    );
 }
 
 /// CR 601.2a + CR 118.9a + CR 903.8: A hand-qualified free-cast static

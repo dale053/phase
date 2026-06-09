@@ -288,6 +288,22 @@ pub struct RoomUnlockOutcome {
     pub fully_unlocked: bool,
 }
 
+/// CR 114: Display-only provenance for an emblem — the name and printed-card
+/// reference of the source that created it (e.g. the planeswalker whose
+/// ultimate ability made the emblem). This is deliberately NOT the emblem's
+/// own `printed_ref`: an emblem is neither a card nor a permanent (CR 114.5),
+/// and setting `printed_ref` would make the layer system treat the emblem as
+/// represented by that card and leak its types/P-T/abilities. This field is
+/// purely presentational — the client uses it to render the emblem as a small
+/// chip bearing the source's art crop and a "from <name>" label, mirroring
+/// MTG Arena's emblem display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmblemSource {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printed_ref: Option<PrintedCardRef>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameObject {
     pub id: ObjectId,
@@ -336,6 +352,14 @@ pub struct GameObject {
     // Counters
     #[serde(with = "counter_map_serde")]
     pub counters: HashMap<CounterType, u32>,
+
+    /// Alchemy Intensity — a per-card escalating value (digital-only, no CR
+    /// entry). Initialized from the card's "Starting intensity N" at first
+    /// characteristic application and incremented by `Effect::Intensify`. Like
+    /// `counters`, it persists across zone changes (the object keeps its id), so
+    /// a card's intensity follows it through hand/library/stack/battlefield.
+    #[serde(default)]
+    pub intensity: u32,
 
     // Characteristics
     pub name: String,
@@ -647,6 +671,12 @@ pub struct GameObject {
     #[serde(default)]
     pub is_emblem: bool,
 
+    /// CR 114: Display-only provenance of the source that created this emblem
+    /// (planeswalker, spell, etc.). Populated at creation in `create_emblem`;
+    /// `None` for every non-emblem object. See [`EmblemSource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emblem_source: Option<EmblemSource>,
+
     /// CR 111.1: Whether this object is a token (not a card).
     #[serde(default)]
     pub is_token: bool,
@@ -742,6 +772,12 @@ pub struct GameObject {
     /// a marker for saddle-triggered abilities and "saddled Mount" filters.
     #[serde(default)]
     pub is_saddled: bool,
+
+    /// CR 702.171c: The creatures that saddled this permanent (tapped to pay the
+    /// saddle cost). Cleared in lockstep with `is_saddled` at end of turn or when
+    /// the permanent leaves the battlefield.
+    #[serde(default)]
+    pub saddled_by: Vec<ObjectId>,
 
     /// CR 613.11 + CR 510.1a: This creature assigns combat damage equal to its
     /// toughness rather than its power. Set after object-characteristic layers.
@@ -982,6 +1018,7 @@ impl GameObject {
             paired_with: None,
             pair_controller: None,
             counters: HashMap::new(),
+            intensity: 0,
             name: name.clone(),
             power: None,
             toughness: None,
@@ -1051,6 +1088,7 @@ impl GameObject {
             commander_tax: None,
             is_renowned: false,
             is_emblem: false,
+            emblem_source: None,
             is_token: false,
             is_copy: false,
             display_source: DisplaySource::Card,
@@ -1068,6 +1106,7 @@ impl GameObject {
             monstrous: false,
             prepared: None,
             is_saddled: false,
+            saddled_by: Vec::new(),
             assigns_damage_from_toughness: false,
             assigns_damage_as_though_unblocked: false,
             assigns_no_combat_damage: false,
@@ -1158,6 +1197,7 @@ impl GameObject {
         // state. Assign when WotC publishes SOS CR update.
         self.prepared = None;
         self.is_saddled = false;
+        self.saddled_by.clear();
         self.paired_with = None;
         self.pair_controller = None;
         self.chosen_attributes.clear();
@@ -1240,6 +1280,7 @@ impl GameObject {
         self.phyrexian_life_paid = 0;
         // CR 702.171b: Saddled clears when the Mount leaves the battlefield.
         self.is_saddled = false;
+        self.saddled_by.clear();
         // CR 702.xxx: Prepared (Strixhaven) is a battlefield-only designation —
         // clears on BF exit, paralleling monstrous/suspected. CR 400.7: a
         // re-entering permanent is a new object with no memory of its previous

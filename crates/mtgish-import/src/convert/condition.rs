@@ -1674,6 +1674,7 @@ pub fn convert_player_predicate_trigger(
                     qty: QuantityRef::ZoneCardCount {
                         zone: ZoneRef::Library,
                         card_types: Vec::new(),
+                        filter: None,
                         scope: CountScope::Controller,
                     },
                 },
@@ -1963,6 +1964,7 @@ pub fn convert_player_predicate_ability(
                     qty: QuantityRef::ZoneCardCount {
                         zone: ZoneRef::Library,
                         card_types: Vec::new(),
+                        filter: None,
                         scope: CountScope::Controller,
                     },
                 },
@@ -2289,6 +2291,7 @@ pub fn convert_player_predicate_static(
                     qty: QuantityRef::ZoneCardCount {
                         zone: ZoneRef::Library,
                         card_types: Vec::new(),
+                        filter: None,
                         scope: CountScope::Controller,
                     },
                 },
@@ -3310,7 +3313,7 @@ mod tests {
                         if properties.contains(&FilterProp::HasAttachment {
                             kind: engine::types::ability::AttachmentKind::Aura,
                             controller: None,
-                            exclude_source: false,
+                            exclude_source: engine::types::ability::SourceExclusion::Include,
                         })
                 ));
             }

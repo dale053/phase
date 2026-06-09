@@ -7,16 +7,18 @@ use crate::game::effects::prepare;
 use crate::game::game_object::RoomDoor;
 use crate::game::keywords;
 use crate::game::mana_sources;
-use crate::types::ability::ChoiceType;
-use crate::types::ability::TargetRef;
+use crate::types::ability::{ChoiceType, CounterCostSelection, TargetRef};
 use crate::types::actions::{
     CastChoice, GameAction, LearnOption, MulliganChoice, OutsideGameSelection,
 };
 use crate::types::card::LayoutKind;
 use crate::types::card_type::CoreType;
+use crate::types::counter::CounterMatch;
 use crate::types::game_state::{
     CastOfferKind, ConvokeMode, CounterMoveChoice, GameState, PayCostKind, TargetSelectionSlot,
     WaitingFor, ZoneManipulationKind,
+    CastOfferKind, ConvokeMode, CounterCostChoice, CounterMoveChoice, GameState, PayCostKind,
+    TargetSelectionSlot, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaType;
@@ -1677,12 +1679,16 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
             ),
         ],
         // CR 118.3 + CR 601.2b + CR 605.3b: AI selects objects to pay a cost.
-        // RemoveCounter chooses exactly one source (one permanent per
-        // candidate); Sacrifice honors the [min, max] range; every other kind
-        // selects exactly `count` objects.
+        // Single-object RemoveCounter chooses one source per candidate;
+        // from-among RemoveCounter and Sacrifice honor the [min, max] range;
+        // every other kind selects exactly `count` objects.
         WaitingFor::PayCost {
             player,
-            kind: PayCostKind::RemoveCounter { .. },
+            kind:
+                PayCostKind::RemoveCounter {
+                    selection: CounterCostSelection::SingleObject,
+                    ..
+                },
             choices,
             ..
         } => choices
@@ -1695,6 +1701,24 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
                 )
             })
             .collect(),
+        WaitingFor::PayCost {
+            player,
+            kind:
+                PayCostKind::RemoveCounter {
+                    selection: CounterCostSelection::AmongObjects,
+                    counter_type,
+                    count: counter_count,
+                    ..
+                },
+            choices,
+            ..
+        } => remove_counter_cost_distribution_candidate(
+            state,
+            *player,
+            choices,
+            counter_type,
+            *counter_count,
+        ),
         WaitingFor::PayCost {
             player,
             kind: PayCostKind::Sacrifice,
@@ -2893,9 +2917,9 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
         for &obj_id in &state.battlefield {
             if let Some(obj) = state.objects.get(&obj_id) {
                 if obj.controller == player {
-                    for (i, ability_def) in obj.abilities.iter().enumerate() {
+                    for (i, ability_def) in casting::activated_ability_definitions(state, obj_id) {
                         if ability_def.kind == crate::types::ability::AbilityKind::Activated
-                            && !crate::game::mana_abilities::is_mana_ability(ability_def)
+                            && !crate::game::mana_abilities::is_mana_ability(&ability_def)
                             && casting::can_activate_ability_now(state, player, obj_id, i)
                         {
                             actions.push(candidate(
@@ -2967,10 +2991,10 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
         for &obj_id in &state.players[player.0 as usize].hand {
             if let Some(obj) = state.objects.get(&obj_id) {
                 if obj.controller == player {
-                    for (i, ability_def) in obj.abilities.iter().enumerate() {
+                    for (i, ability_def) in casting::activated_ability_definitions(state, obj_id) {
                         if ability_def.kind == crate::types::ability::AbilityKind::Activated
                             && ability_def.activation_zone == Some(crate::types::zones::Zone::Hand)
-                            && !crate::game::mana_abilities::is_mana_ability(ability_def)
+                            && !crate::game::mana_abilities::is_mana_ability(&ability_def)
                             && casting::can_activate_ability_now(state, player, obj_id, i)
                         {
                             actions.push(candidate(
@@ -2999,11 +3023,11 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
                 // doesn't have a controller) can activate its activated
                 // ability." Restrict candidates to the acting player.
                 if obj.controller == player {
-                    for (i, ability_def) in obj.abilities.iter().enumerate() {
+                    for (i, ability_def) in casting::activated_ability_definitions(state, obj_id) {
                         if ability_def.kind == crate::types::ability::AbilityKind::Activated
                             && ability_def.activation_zone
                                 == Some(crate::types::zones::Zone::Graveyard)
-                            && !crate::game::mana_abilities::is_mana_ability(ability_def)
+                            && !crate::game::mana_abilities::is_mana_ability(&ability_def)
                             && casting::can_activate_ability_now(state, player, obj_id, i)
                         {
                             actions.push(candidate(
@@ -3134,6 +3158,9 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
                                         c.controller == player
                                             && !c.tapped
                                             && c.card_types.core_types.contains(&CoreType::Creature)
+                                            && !crate::game::static_abilities::object_has_cant_crew(
+                                                state, cid,
+                                            )
                                     })
                             });
                             if has_eligible {
@@ -3660,6 +3687,62 @@ fn bounded_select_card_candidates(
             )
         })
         .collect()
+}
+
+fn remove_counter_cost_distribution_candidate(
+    state: &GameState,
+    player: PlayerId,
+    cards: &[ObjectId],
+    counter_type: &CounterMatch,
+    count: u32,
+) -> Vec<CandidateAction> {
+    let mut remaining = count;
+    let mut distribution = Vec::new();
+    for &object_id in cards {
+        if remaining == 0 {
+            break;
+        }
+        let Some(obj) = state.objects.get(&object_id) else {
+            continue;
+        };
+        let available: Vec<_> = match counter_type {
+            CounterMatch::OfType(counter_type) => obj
+                .counters
+                .get(counter_type)
+                .copied()
+                .into_iter()
+                .map(|count| (counter_type.clone(), count))
+                .collect(),
+            CounterMatch::Any => obj
+                .counters
+                .iter()
+                .map(|(counter_type, count)| (counter_type.clone(), *count))
+                .collect(),
+        };
+        for (counter_type, available) in available {
+            if remaining == 0 {
+                break;
+            }
+            let assigned = available.min(remaining);
+            if assigned > 0 {
+                distribution.push(CounterCostChoice {
+                    object_id,
+                    counter_type,
+                    count: assigned,
+                });
+                remaining -= assigned;
+            }
+        }
+    }
+    if remaining == 0 {
+        vec![candidate(
+            GameAction::ChooseRemoveCounterCostDistribution { distribution },
+            TacticalClass::Selection,
+            Some(player),
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn mode_actions(
@@ -4335,9 +4418,11 @@ mod tests {
     use crate::types::ability::{
         AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, BasicLandType,
         ChoiceType, ChosenAttribute, ChosenSubtypeKind, ContinuousModification, Effect, EffectKind,
-        ManaContribution, ManaProduction, QuantityExpr, StaticDefinition, TargetFilter, TargetRef,
+        FilterProp, ManaContribution, ManaProduction, QuantityExpr, StaticDefinition, TargetFilter,
+        TargetRef, TypedFilter,
     };
     use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::keywords::{Keyword, KeywordKind};
     use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
     use crate::types::zones::Zone;
 
@@ -4586,6 +4671,78 @@ mod tests {
                 door: RoomDoor::Left,
             } if *object_id == room
         )));
+    }
+
+    #[test]
+    fn priority_actions_offer_runtime_granted_typecycling_from_homing_sliver() {
+        let mut state = GameState::new_two_player(42);
+        let p0 = PlayerId(0);
+        state.phase = Phase::PreCombatMain;
+        state.active_player = p0;
+        state.priority_player = p0;
+        state.waiting_for = WaitingFor::Priority { player: p0 };
+
+        let homing_sliver = create_object(
+            &mut state,
+            CardId(100),
+            p0,
+            "Homing Sliver".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&homing_sliver)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::Typed(
+                        TypedFilter::card()
+                            .subtype("Sliver".to_string())
+                            .properties(vec![FilterProp::InZone { zone: Zone::Hand }]),
+                    ))
+                    .modifications(vec![ContinuousModification::AddKeyword {
+                        keyword: Keyword::Typecycling {
+                            cost: ManaCost::NoCost,
+                            subtype: "Sliver".to_string(),
+                        },
+                    }]),
+            );
+
+        let hand_sliver = create_object(
+            &mut state,
+            CardId(101),
+            p0,
+            "Striking Sliver".to_string(),
+            Zone::Hand,
+        );
+        let printed_len = {
+            let obj = state.objects.get_mut(&hand_sliver).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Sliver".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            obj.abilities.len()
+        };
+
+        assert!(
+            crate::game::off_zone_characteristics::off_zone_has_keyword_kind(
+                &state,
+                hand_sliver,
+                KeywordKind::Typecycling,
+            ),
+            "Homing Sliver static should grant Typecycling to the Sliver card in hand"
+        );
+
+        let actions = priority_actions(&state, p0);
+        assert!(actions.iter().any(|candidate| {
+            matches!(
+                candidate.action,
+                GameAction::ActivateAbility {
+                    source_id,
+                    ability_index,
+                } if source_id == hand_sliver && ability_index == printed_len
+            )
+        }));
     }
 
     #[test]
@@ -4879,7 +5036,7 @@ mod tests {
             effect_kind: EffectKind::Sacrifice,
             zone: Zone::Battlefield,
             destination: None,
-            enter_tapped: false,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enter_transformed: false,
             enters_under_player: None,
             enters_attacking: false,
@@ -5782,7 +5939,7 @@ mod tests {
         state.players[0].mana_pool.add(ManaUnit {
             color: ManaType::Blue,
             source_id: ObjectId(0),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),
             grants: vec![],
@@ -5900,7 +6057,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: true,
+                enter_tapped: crate::types::zones::EtbTapState::Tapped,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -5922,7 +6079,7 @@ mod tests {
         state.players[player].mana_pool.add(ManaUnit {
             color,
             source_id: ObjectId(0),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),
             grants: vec![],
