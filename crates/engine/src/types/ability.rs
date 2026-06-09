@@ -2741,7 +2741,7 @@ pub enum AdditionalCostRepeatability {
 }
 
 impl AdditionalCostRepeatability {
-    pub fn is_once(self) -> bool {
+    pub fn is_once(&self) -> bool {
         matches!(self, Self::Once)
     }
 
@@ -5407,6 +5407,7 @@ pub enum AdditionalCost {
         #[serde(
             default,
             with = "additional_cost_repeatability_bool_compat",
+            skip_serializing_if = "AdditionalCostRepeatability::is_once",
             rename = "repeatable"
         )]
         repeatability: AdditionalCostRepeatability,
@@ -5421,6 +5422,7 @@ pub enum AdditionalCost {
         #[serde(
             default,
             with = "additional_cost_repeatability_bool_compat",
+            skip_serializing_if = "AdditionalCostRepeatability::is_once",
             rename = "repeatable"
         )]
         repeatability: AdditionalCostRepeatability,

@@ -917,6 +917,11 @@ pub struct PendingChangeZoneIteration {
     pub origin: Option<crate::types::zones::Zone>,
     pub destination: crate::types::zones::Zone,
     pub enter_transformed: bool,
+    #[serde(
+        default,
+        with = "crate::types::zones::etb_tap_bool_compat",
+        skip_serializing_if = "EtbTapState::is_unspecified"
+    )]
     pub enter_tapped: EtbTapState,
     /// CR 110.2a: Resolved-once controller override on ETB. `Some(pid)`
     /// routes the object to `pid`. `None` leaves the object under its
