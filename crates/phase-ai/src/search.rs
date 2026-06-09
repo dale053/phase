@@ -3,7 +3,9 @@ use rand::Rng;
 use engine::ai_support::build_decision_context;
 use engine::types::actions::{AlternativeCastDecision, GameAction, MulliganChoice};
 use engine::types::card_type::CoreType;
-use engine::types::game_state::{CastOfferKind, CostResume, GameState, WaitingFor};
+use engine::types::game_state::{
+    CastOfferKind, CostResume, GameState, WaitingFor, ZoneManipulationKind,
+};
 use engine::types::identifiers::ObjectId;
 use engine::types::player::PlayerId;
 
@@ -137,7 +139,14 @@ pub fn choose_action(
     // clones (already capped engine-side, but still wasteful relative to
     // the dedicated scorer). The deterministic path returns the chosen
     // SelectCards directly; only fall through if it produces nothing.
-    if matches!(state.waiting_for, WaitingFor::SearchChoice { .. }) {
+    if matches!(
+        &state.waiting_for,
+        WaitingFor::SearchChoice { .. }
+            | WaitingFor::ZoneManipulation {
+                kind: ZoneManipulationKind::Search { .. },
+                ..
+            }
+    ) {
         if let Some(action) = deterministic_choice(state, ai_player, config, &[], None) {
             return Some(action);
         }
@@ -281,6 +290,84 @@ pub fn emit_trace_for_candidate(
 /// pending-cast branch here means that authority has a gap: the AI entered a
 /// cast it cannot complete. Fix the gate, not the recovery.
 ///
+/// Conservative fallback for unified zone-manipulation prompts.
+fn zone_manipulation_fallback(
+    state: &GameState,
+    kind: &ZoneManipulationKind,
+) -> Option<GameAction> {
+    use engine::types::actions::OutsideGameSelection;
+    use engine::types::game_state::OutsideGameChoiceSource;
+
+    match kind {
+        ZoneManipulationKind::Scry { .. }
+        | ZoneManipulationKind::Dig { .. }
+        | ZoneManipulationKind::Surveil { .. }
+        | ZoneManipulationKind::Reveal { .. }
+        | ZoneManipulationKind::Search { .. }
+        | ZoneManipulationKind::ChooseFromZone { .. } => {
+            Some(GameAction::SelectCards { cards: Vec::new() })
+        }
+        ZoneManipulationKind::EffectZone {
+            cards,
+            count,
+            up_to,
+            effect_kind,
+            ..
+        } => {
+            if matches!(effect_kind, engine::types::ability::EffectKind::Sacrifice)
+                && !cards.is_empty()
+                && !*up_to
+                && *count > 0
+            {
+                Some(GameAction::SelectCards {
+                    cards: pick_lowest_value_sacrifices(state, cards, *count),
+                })
+            } else {
+                Some(GameAction::SelectCards { cards: Vec::new() })
+            }
+        }
+        ZoneManipulationKind::SearchPartition {
+            cards,
+            primary_count,
+            ..
+        } => Some(GameAction::SelectCards {
+            cards: cards
+                .iter()
+                .take(*primary_count as usize)
+                .copied()
+                .collect(),
+        }),
+        ZoneManipulationKind::OutsideGame { choices, count, .. } => {
+            let selections: Vec<OutsideGameSelection> = choices
+                .iter()
+                .flat_map(|choice| {
+                    let pick_count = choice.count as usize;
+                    (0..pick_count).map(move |_| match &choice.source {
+                        OutsideGameChoiceSource::Sideboard {
+                            sideboard_index, ..
+                        } => OutsideGameSelection::Sideboard {
+                            sideboard_index: *sideboard_index,
+                        },
+                        OutsideGameChoiceSource::FaceUpExile { object_id } => {
+                            OutsideGameSelection::FaceUpExile {
+                                object_id: *object_id,
+                            }
+                        }
+                    })
+                })
+                .take(*count)
+                .collect();
+            Some(GameAction::ChooseOutsideGameCards { selections })
+        }
+        ZoneManipulationKind::TopOrBottom { .. } => {
+            Some(GameAction::ChooseTopOrBottom { top: true })
+        }
+        ZoneManipulationKind::RevealUntilKept { .. } => {
+            Some(GameAction::DecideOptionalEffect { accept: true })
+        }
+    }
+}
+
 /// In release builds we still emit `CancelCast` to keep the match running, but
 /// debug builds panic so the gap surfaces during testing instead of silently
 /// degrading AI play into cast/cancel churn.
@@ -354,6 +441,8 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         } if !cards.is_empty() && !*up_to && *count > 0 => Some(GameAction::SelectCards {
             cards: pick_lowest_value_sacrifices(state, cards, *count),
         }),
+
+        WaitingFor::ZoneManipulation { kind, .. } => zone_manipulation_fallback(state, kind),
 
         // Selection states: empty selection is a valid "choose nothing".
         WaitingFor::ScryChoice { .. }
@@ -1436,7 +1525,12 @@ pub(crate) fn deterministic_choice(
     }
 
     // Scry/Dig/Surveil: use card evaluation heuristics
-    if let WaitingFor::ScryChoice { cards, .. } = &state.waiting_for {
+    if let WaitingFor::ZoneManipulation {
+        kind: ZoneManipulationKind::Scry { cards },
+        ..
+    }
+    | WaitingFor::ScryChoice { cards, .. } = &state.waiting_for
+    {
         let mut scored: Vec<_> = cards
             .iter()
             .map(|&id| (id, evaluate_card_value(state, id)))
@@ -1446,7 +1540,17 @@ pub(crate) fn deterministic_choice(
         return Some(GameAction::SelectCards { cards: top_cards });
     }
 
-    if let WaitingFor::DigChoice {
+    if let WaitingFor::ZoneManipulation {
+        kind:
+            ZoneManipulationKind::Dig {
+                selectable_cards,
+                keep_count,
+                up_to,
+                ..
+            },
+        ..
+    }
+    | WaitingFor::DigChoice {
         selectable_cards,
         keep_count,
         up_to,
@@ -1470,7 +1574,12 @@ pub(crate) fn deterministic_choice(
         return Some(GameAction::SelectCards { cards: kept });
     }
 
-    if let WaitingFor::SurveilChoice { cards, .. } = &state.waiting_for {
+    if let WaitingFor::ZoneManipulation {
+        kind: ZoneManipulationKind::Surveil { cards },
+        ..
+    }
+    | WaitingFor::SurveilChoice { cards, .. } = &state.waiting_for
+    {
         let mut scored: Vec<_> = cards
             .iter()
             .map(|&id| (id, evaluate_card_value(state, id)))
@@ -1484,7 +1593,12 @@ pub(crate) fn deterministic_choice(
         return Some(GameAction::SelectCards { cards: top_cards });
     }
 
-    if let WaitingFor::RevealChoice { cards, .. } = &state.waiting_for {
+    if let WaitingFor::ZoneManipulation {
+        kind: ZoneManipulationKind::Reveal { cards, .. },
+        ..
+    }
+    | WaitingFor::RevealChoice { cards, .. } = &state.waiting_for
+    {
         let mut scored: Vec<_> = cards
             .iter()
             .map(|&id| (id, evaluate_card_value(state, id)))
@@ -1495,7 +1609,18 @@ pub(crate) fn deterministic_choice(
         }
     }
 
-    if let WaitingFor::EffectZoneChoice {
+    if let WaitingFor::ZoneManipulation {
+        kind:
+            ZoneManipulationKind::EffectZone {
+                cards,
+                count,
+                up_to,
+                effect_kind,
+                ..
+            },
+        ..
+    }
+    | WaitingFor::EffectZoneChoice {
         cards,
         count,
         up_to,
@@ -1514,7 +1639,18 @@ pub(crate) fn deterministic_choice(
         }
     }
 
-    if let WaitingFor::SearchChoice {
+    if let WaitingFor::ZoneManipulation {
+        kind:
+            ZoneManipulationKind::Search {
+                cards,
+                count,
+                up_to,
+                constraint,
+                ..
+            },
+        ..
+    }
+    | WaitingFor::SearchChoice {
         cards,
         count,
         up_to,
@@ -1577,7 +1713,12 @@ pub(crate) fn deterministic_choice(
     }
 
     // CR 700.2: ChooseFromZoneChoice — select cards from a tracked set.
-    if let WaitingFor::ChooseFromZoneChoice {
+    if let WaitingFor::ZoneManipulation {
+        kind: ZoneManipulationKind::ChooseFromZone { cards, count, .. },
+        player,
+        ..
+    }
+    | WaitingFor::ChooseFromZoneChoice {
         cards,
         count,
         player,

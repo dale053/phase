@@ -4552,19 +4552,17 @@ impl WaitingFor {
     ///   up_to constraint, uniqueness, and the selectable-cards filter, and
     ///   preserves the chosen order for library-destined keeps.
     pub fn accepts_freeform_card_selection(&self) -> bool {
-        match self {
+        matches!(
+            self,
             WaitingFor::ZoneManipulation {
-                kind:
-                    ZoneManipulationKind::Scry { .. }
+                kind: ZoneManipulationKind::Scry { .. }
                     | ZoneManipulationKind::Surveil { .. }
                     | ZoneManipulationKind::Dig { .. },
                 ..
-            }
-            | WaitingFor::ScryChoice { .. }
-            | WaitingFor::SurveilChoice { .. }
-            | WaitingFor::DigChoice { .. } => true,
-            _ => false,
-        }
+            } | WaitingFor::ScryChoice { .. }
+                | WaitingFor::SurveilChoice { .. }
+                | WaitingFor::DigChoice { .. }
+        )
     }
 
     pub fn accepts_freeform_counter_move_distribution(&self) -> bool {
