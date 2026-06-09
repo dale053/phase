@@ -2771,7 +2771,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
-            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+            enter_tapped: false,
         },
 
         // CR 701.20e + CR 608.2c: "Look at the top N cards of your library.
@@ -4368,7 +4368,7 @@ fn convert_look_at_top(
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
-            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+            enter_tapped: false,
         }),
 
         // Brainstorm-style "put one into your hand and the rest on the
@@ -4386,7 +4386,7 @@ fn convert_look_at_top(
                 filter: TargetFilter::Any,
                 rest_destination: Some(Zone::Library),
                 reveal: false,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
 
@@ -4403,7 +4403,7 @@ fn convert_look_at_top(
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
 
@@ -4423,7 +4423,7 @@ fn convert_look_at_top(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Library),
                 reveal: true,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
 
@@ -4439,7 +4439,7 @@ fn convert_look_at_top(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Graveyard),
                 reveal: true,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
 
@@ -4498,7 +4498,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: None,
                 reveal: true,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsIntoGraveyard] => {
@@ -4511,7 +4511,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: None,
                 reveal: true,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutAGenericCardIntoHand, RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsIntoGraveyard] => {
@@ -4524,7 +4524,7 @@ fn convert_reveal_top_dig(
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: true,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::MayPutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsOnTheBottomOfLibraryInAnyOrder]
@@ -4538,7 +4538,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Library),
                 reveal: true,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsOnTheBottomOfLibraryInAnyOrder]
@@ -4552,7 +4552,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Library),
                 reveal: true,
-                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enter_tapped: false,
             })
         }
         _ => Err(prereq(format!(
@@ -5498,14 +5498,14 @@ fn apply_player_target(effect: Effect, target_filter: TargetFilter) -> ConvResul
         Effect::RevealHand {
             card_filter,
             count,
-            random,
+            selection,
             choice_optional,
             ..
         } => Effect::RevealHand {
             target: target_filter,
             card_filter,
             count,
-            random,
+            selection,
             choice_optional,
         },
         // CR 701.10 + CR 115.2: "Target player exiles the top N cards
