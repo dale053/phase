@@ -857,7 +857,7 @@ pub enum Keyword {
     Station,
 
     /// RUNTIME: `database::synthesis::synthesize_replicate` — repeatable
-    /// optional additional cost (`AdditionalCost::Optional { repeatable: true }`)
+    /// optional additional cost (`AdditionalCost::Optional { repeatability: Repeatable }`)
     /// plus a `SpellCast` trigger whose execute is
     /// `replicate_copy_ability_definition()` (a `CopySpell` with
     /// `repeat_for = AdditionalCostPaymentCount`).
@@ -3265,7 +3265,7 @@ mod tests {
     /// CR 303.4 + CR 702.5a: Daybreak Coronet — "Enchant creature with another
     /// Aura attached to it" narrows the legal host set to creatures that already
     /// carry another Aura. The qualifier folds onto the typed filter as
-    /// `FilterProp::HasAttachment { Aura, exclude_source: true }` so SBA
+    /// `FilterProp::HasAttachment { Aura, exclude_source: Exclude }` so SBA
     /// legality cannot let Daybreak Coronet count itself after it resolves.
     #[test]
     fn parse_enchant_creature_with_another_aura_attached() {

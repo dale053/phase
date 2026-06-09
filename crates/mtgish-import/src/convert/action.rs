@@ -6262,7 +6262,7 @@ fn group_filter_tag(group: &GroupFilter) -> String {
 #[derive(Debug, Default, Clone)]
 struct EnterReplacements {
     /// CR 614.1: Object enters tapped.
-    enter_tapped: bool,
+    enter_tapped: engine::types::zones::EtbTapState,
     /// CR 110.2a: Object enters under the ability controller's control
     /// (rather than its owner's). Local bool carrier — mapped at the
     /// `Effect::ChangeZone` boundary via
@@ -6304,7 +6304,7 @@ fn extract_enter_replacements(
     for r in repls {
         match r {
             R::EntersNormally | R::EntersUnderOwnersControl => {}
-            R::EntersTapped => out.enter_tapped = true,
+            R::EntersTapped => out.enter_tapped = engine::types::zones::EtbTapState::Tapped,
             R::EntersTransformed => out.enter_transformed = true,
             R::EntersAttacking => out.enters_attacking = true,
             R::EntersWithACounter(ct) => {

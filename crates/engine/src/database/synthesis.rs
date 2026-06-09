@@ -2218,7 +2218,7 @@ pub fn replicate_copy_ability_definition() -> AbilityDefinition {
 /// Replicate = two abilities (CR 702.56a):
 /// 1. Static ability: "As an additional cost to cast this spell, you may pay
 ///    [cost] any number of times" — modeled as
-///    `AdditionalCost::Optional { repeatable: true, .. }` (same shape as Squad,
+///    `AdditionalCost::Optional { repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable, .. }` (same shape as Squad,
 ///    CR 702.157a).
 /// 2. Triggered ability: "When you cast this spell, if a replicate cost was paid
 ///    for it, copy it for each time its replicate cost was paid. If the spell

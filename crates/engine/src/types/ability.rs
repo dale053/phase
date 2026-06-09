@@ -5338,7 +5338,7 @@ impl AbilityCost {
     ///
     /// `Composite` / `OneOf` recurse and OR over sub-costs, mirroring
     /// `categories()`. Costs that consume *other* permanents/cards
-    /// (`Discard { self_ref: false }`, `Sacrifice`, `Exile`, `Mill`, etc.)
+    /// (`Discard { self_scope: FromHand }`, `Sacrifice`, `Exile`, `Mill`, etc.)
     /// return `false` — they do not destroy the source. (A self-only
     /// `Sacrifice` would also qualify, but no `TargetFilter` self-only
     /// predicate exists today; cycling — issue #506 — is `Discard`-based and
@@ -5556,7 +5556,7 @@ where
 /// - `DynamicGeneric { quantity }` → `ManaDynamic { quantity }`
 /// - `PayLife { amount: i32 }` → `PayLife { amount: QuantityExpr::Fixed { value: amount } }`
 /// - `PayEnergy { amount }` → `PayEnergy { amount }` (identity)
-/// - `DiscardCard { filter }` → `Discard { count: 1, filter, random: false, self_ref: false }`
+/// - `DiscardCard { filter }` → `Discard { count: 1, filter, selection: Chosen, self_scope: FromHand }`
 /// - `Sacrifice { count, filter }` → `Sacrifice { target: filter, count }`
 /// - `ReturnToHand { count, filter, from_zone }` → `ReturnToHand { count, filter: Some(filter), from_zone }`
 pub fn deserialize_ability_cost_compat<'de, D>(d: D) -> Result<AbilityCost, D::Error>

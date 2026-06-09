@@ -1629,9 +1629,8 @@ fn build_replacement_exec(
                 needed_variant: format!("ETB counter-action shape ({})", variant_tag(act)),
             });
         }
-        // CR 614.12: Untapped-instead replacement — needs an engine
-        // "force-untapped" override since `enter_tapped: false` is the
-        // default (no replacement fires for the default).
+        // CR 614.12: Untapped-instead replacement needs an explicit
+        // force-untapped override, distinct from the default/no-modifier state.
         A::EntersUntapped => {
             return Err(ConversionGap::EnginePrerequisiteMissing {
                 engine_type: "ReplacementDefinition",

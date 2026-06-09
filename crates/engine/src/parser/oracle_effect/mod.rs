@@ -7877,7 +7877,7 @@ fn try_parse_verb_and_target<'a>(
                             origin,
                             destination: Zone::Hand,
                             enters_under: None,
-                            enter_tapped: false,
+                            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                         },
                         rem,
                     ))
@@ -7893,7 +7893,7 @@ fn try_parse_verb_and_target<'a>(
                             origin,
                             destination: d.zone,
                             enters_under: None,
-                            enter_tapped: false,
+                            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                         },
                         rem,
                     ))
@@ -44457,7 +44457,7 @@ fn issue_2405_planar_genesis_dig_land_enters_tapped() {
     );
     let Effect::Dig {
         destination: Some(Zone::Battlefield),
-        enter_tapped: true,
+        enter_tapped: crate::types::zones::EtbTapState::Tapped,
         filter,
         ..
     } = def.effect.as_ref()

@@ -2220,7 +2220,7 @@ mod tests {
                     kept_destination: None,
                     rest_destination: None,
                     source_id: None,
-                    enter_tapped: false,
+                    enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 },
             ),
             (

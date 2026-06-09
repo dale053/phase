@@ -625,7 +625,7 @@ mod tests {
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
         }));
         let f = detect(&[entry(c, 4)]);
         assert_eq!(f.cantrip_count, 4);
@@ -646,7 +646,7 @@ mod tests {
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
         }));
         let f = detect(&[entry(c, 4)]);
         // impulse-dig should NOT count as cantrip
