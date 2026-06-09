@@ -22,6 +22,7 @@ use crate::types::game_state::{
 use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::mana::ManaCost;
 use crate::types::player::{Player, PlayerId};
+use crate::types::zones::Zone;
 
 pub mod adapt;
 pub mod add_restriction;
@@ -85,6 +86,8 @@ pub mod epic;
 #[path = "epic_tests.rs"]
 mod epic_tests;
 pub mod exchange_control;
+// Tests for `intensify` live in a sibling file (declared here, not in
+// `intensify.rs`, so `intensify.rs` stays implementation-only).
 pub mod exchange_life;
 pub mod exile_from_top_until;
 pub mod exile_top;
@@ -104,6 +107,10 @@ pub mod grant_extra_loyalty_activations;
 pub mod grant_permission;
 pub mod hideaway;
 pub mod incubate;
+pub mod intensify;
+#[cfg(test)]
+#[path = "intensify_tests.rs"]
+mod intensify_tests;
 pub mod investigate;
 pub mod learn;
 pub mod life;
@@ -154,6 +161,12 @@ pub mod skip_next_turn;
 pub mod solve_case;
 pub mod specialize;
 pub mod speed_effects;
+pub mod spellbook;
+// Tests for `spellbook` live in a sibling file (declared here, not in
+// `spellbook.rs`, so `spellbook.rs` stays implementation-only).
+#[cfg(test)]
+#[path = "spellbook_tests.rs"]
+mod spellbook_tests;
 pub mod surveil;
 pub mod suspect;
 pub mod switch_pt;
@@ -1031,6 +1044,9 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::DrawnThisTurnTopdeckChoice { .. }
             | WaitingFor::CategoryChoice { .. }
             | WaitingFor::LearnChoice { .. }
+            // Digital-only Alchemy spellbook choice pauses resolution; stash
+            // the printed tail until SubmitSpellbookDraft resumes the chain.
+            | WaitingFor::SpellbookDraft { .. }
             | WaitingFor::PopulateChoice { .. }
     )
 }
@@ -2076,6 +2092,8 @@ pub fn resolve_effect(
         }
         Effect::ProcessRadCounters => rad_counters::resolve(state, ability, events),
         Effect::Conjure { .. } => conjure::resolve(state, ability, events),
+        Effect::Intensify { .. } => intensify::resolve(state, ability, events),
+        Effect::DraftFromSpellbook { .. } => spellbook::resolve(state, ability, events),
         Effect::ChooseOneOf { .. } => choose_one_of::resolve(state, ability, events),
         Effect::Unimplemented { name, .. } => {
             // Log warning and return Ok (no-op) for unimplemented effects
@@ -5663,13 +5681,24 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
         AbilityCost::Discard {
             count,
             filter,
-            random,
-            self_ref,
+            selection,
+            self_scope,
         } => AbilityCost::Discard {
             count: count.scaled_by(n),
             filter: filter.clone(),
-            random: *random,
-            self_ref: *self_ref,
+            selection: *selection,
+            self_scope: *self_scope,
+        },
+        // CR 702.24a: Thought Lash-style cumulative upkeep scales the number
+        // of top-library cards exiled by the number of age counters.
+        AbilityCost::Exile {
+            count,
+            zone: Some(Zone::Library),
+            filter: None,
+        } => AbilityCost::Exile {
+            count: count.saturating_mul(n),
+            zone: Some(Zone::Library),
+            filter: None,
         },
         // YAGNI fallback: no current cumulative-upkeep card uses these
         // base variants. If a future mechanic does, the
@@ -6286,7 +6315,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: true,
+                enter_tapped: crate::types::zones::EtbTapState::Tapped,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -6358,7 +6387,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: Some(ControllerRef::You),
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -6435,7 +6464,7 @@ mod tests {
                     owner_library: false,
                     enter_transformed: false,
                     enters_under: Some(ControllerRef::You),
-                    enter_tapped: false,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
@@ -6525,7 +6554,7 @@ mod tests {
                     owner_library: false,
                     enter_transformed: false,
                     enters_under: Some(ControllerRef::You),
-                    enter_tapped: false,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
@@ -6550,7 +6579,7 @@ mod tests {
             effect_kind: EffectKind::Sacrifice,
             zone: Zone::Battlefield,
             destination: None,
-            enter_tapped: false,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enter_transformed: false,
             enters_under_player: None,
             enters_attacking: false,
@@ -6850,23 +6879,43 @@ mod tests {
         let base = AbilityCost::Discard {
             count: QuantityExpr::Fixed { value: 1 },
             filter: Some(TargetFilter::SelfRef),
-            random: false,
-            self_ref: true,
+            selection: crate::types::ability::CardSelectionMode::Chosen,
+            self_scope: crate::types::ability::DiscardSelfScope::SourceCard,
         };
         let expanded = expand_per_counter(&base, 3);
         let AbilityCost::Discard {
             count,
             filter,
-            random,
-            self_ref,
+            selection,
+            self_scope,
         } = expanded
         else {
             panic!("expected Discard");
         };
         assert_eq!(count, QuantityExpr::Fixed { value: 3 });
         assert_eq!(filter, Some(TargetFilter::SelfRef));
-        assert!(!random);
-        assert!(self_ref);
+        assert!(selection.is_chosen());
+        assert!(self_scope.is_source_card());
+    }
+
+    #[test]
+    fn expand_per_counter_top_library_exile_scales_count() {
+        let base = AbilityCost::Exile {
+            count: 1,
+            zone: Some(Zone::Library),
+            filter: None,
+        };
+
+        let expanded = expand_per_counter(&base, 3);
+
+        assert_eq!(
+            expanded,
+            AbilityCost::Exile {
+                count: 3,
+                zone: Some(Zone::Library),
+                filter: None,
+            }
+        );
     }
 
     #[test]
@@ -7008,7 +7057,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 2 },
                 target: TargetFilter::Player,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -7020,8 +7069,8 @@ mod tests {
             cost: AbilityCost::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 filter: Some(artifact_filter),
-                random: false,
-                self_ref: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                self_scope: crate::types::ability::DiscardSelfScope::FromHand,
             },
             payer: TargetFilter::Player,
         });
@@ -7348,7 +7397,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -7813,7 +7862,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: Some(ControllerRef::You),
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -7879,7 +7928,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: Some(ControllerRef::You),
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -7970,7 +8019,7 @@ mod tests {
                         owner_library: false,
                         enter_transformed: false,
                         enters_under: None,
-                        enter_tapped: false,
+                        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                         enters_attacking: false,
                         up_to: false,
                         enter_with_counters: vec![],
@@ -7998,7 +8047,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: Some(ControllerRef::You),
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -8106,7 +8155,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: Some(ControllerRef::You),
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -8620,7 +8669,7 @@ mod tests {
                         owner_library: false,
                         enter_transformed: false,
                         enters_under: None,
-                        enter_tapped: false,
+                        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                         enters_attacking: false,
                         up_to: false,
                         enter_with_counters: vec![],
@@ -8641,7 +8690,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -8691,7 +8740,7 @@ mod tests {
                         owner_library: false,
                         enter_transformed: false,
                         enters_under: None,
-                        enter_tapped: false,
+                        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                         enters_attacking: false,
                         up_to: false,
                         enter_with_counters: vec![],
@@ -8712,7 +8761,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -8791,7 +8840,7 @@ mod tests {
                     destination: Zone::Hand,
                     target: TargetFilter::Any,
                     enters_under: None,
-                    enter_tapped: false,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     face_down_profile: None,
                 },
                 vec![],
@@ -8873,7 +8922,7 @@ mod tests {
             filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
             kept_destination: Zone::Exile,
             rest_destination: Zone::Library,
-            enter_tapped: false,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             kept_optional_to: None,
         };
@@ -9096,7 +9145,7 @@ mod tests {
                         owner_library: false,
                         enter_transformed: false,
                         enters_under: None,
-                        enter_tapped: false,
+                        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                         enters_attacking: false,
                         up_to: false,
                         enter_with_counters: vec![],
@@ -9117,7 +9166,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -9286,7 +9335,7 @@ mod tests {
                         ],
                     },
                     enters_under: None,
-                    enter_tapped: false,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     face_down_profile: None,
                 },
                 vec![],
@@ -9377,7 +9426,7 @@ mod tests {
                         ],
                     },
                     enters_under: None,
-                    enter_tapped: false,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     face_down_profile: None,
                 },
                 vec![],
@@ -9442,7 +9491,7 @@ mod tests {
                 destination: Zone::Exile,
                 target: TargetFilter::Typed(crate::types::ability::TypedFilter::creature()),
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 face_down_profile: None,
             },
             vec![],
@@ -10337,7 +10386,7 @@ mod tests {
             effect_kind: EffectKind::ChangeZone,
             zone: Zone::Library,
             destination: Some(Zone::Exile),
-            enter_tapped: false,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enter_transformed: false,
             enters_under_player: None,
             enters_attacking: false,
@@ -10372,7 +10421,7 @@ mod tests {
                 effect_kind: EffectKind::ChangeZone,
                 zone: Zone::Library,
                 destination: Some(Zone::Exile),
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enter_transformed: false,
                 enters_under_player: None,
                 enters_attacking: false,
@@ -10494,7 +10543,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: true,
+                enter_tapped: crate::types::zones::EtbTapState::Tapped,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -10703,7 +10752,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -10997,7 +11046,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -11082,7 +11131,7 @@ mod tests {
                     },
                 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -11239,7 +11288,7 @@ mod tests {
                 destination: Zone::Graveyard,
                 target: TargetFilter::ExiledBySource,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 face_down_profile: None,
             },
             vec![],
@@ -11301,7 +11350,7 @@ mod tests {
                 destination: Zone::Graveyard,
                 target: TargetFilter::ExiledBySource,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 face_down_profile: None,
             },
             vec![],
@@ -11378,7 +11427,7 @@ mod tests {
                 destination: Zone::Graveyard,
                 target: TargetFilter::ExiledBySource,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 face_down_profile: None,
             },
             vec![],
@@ -11399,7 +11448,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -11587,7 +11636,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -11747,7 +11796,7 @@ mod tests {
                     },
                 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -11824,7 +11873,7 @@ mod tests {
                     },
                 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -11905,7 +11954,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -12617,7 +12666,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -13550,7 +13599,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -13802,7 +13851,7 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -14403,7 +14452,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -14509,7 +14558,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -14889,7 +14938,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -15009,7 +15058,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },

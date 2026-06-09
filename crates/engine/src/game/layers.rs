@@ -8,9 +8,13 @@ use crate::game::conditions::{
     counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_condition,
     eval_has_city_blessing, eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn,
     eval_source_in_zone, eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
+    counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
+    eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn, eval_source_in_zone,
+    eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
 };
 use crate::game::devotion::count_devotion;
 use crate::game::filter::{matches_target_filter, FilterContext};
+use crate::game::game_object::DisplaySource;
 use crate::game::printed_cards::{apply_copiable_values, intrinsic_copiable_values};
 use crate::game::quantity::{filter_uses_recipient, quantity_expr_uses_recipient, QuantityContext};
 use crate::game::speed::{effective_speed, has_max_speed};
@@ -1195,6 +1199,28 @@ pub fn evaluate_layers(state: &mut GameState) {
             // re-applies the copied source's `printed_ref` below for objects
             // under a copy effect, so a temporary copy's art reverts on expiry.
             obj.printed_ref = obj.base_printed_ref.clone();
+            // Reset display routing to the object's own derived baseline so a
+            // copy effect's override (set by `CopyValues` below) reverts on
+            // expiry. Display routing is derived state, not a copiable value
+            // (CR 707.2): a true token — created by a token-making effect
+            // (CR 111.1), so carrying no printed identity — routes to the token
+            // art database; everything else (a real card, or a token-copy *of a
+            // real card*, which carries `base_printed_ref`) routes to the card
+            // database. Deriving here (rather than storing a `base_display_source`)
+            // keeps tokens in pre-existing saved states correct on load.
+            obj.display_source = if obj.is_token && obj.base_printed_ref.is_none() {
+                DisplaySource::Token
+            } else {
+                DisplaySource::Card
+            };
+            // A nontoken never has its own token-art pointer, so clear it to its
+            // baseline (`None`); a copy-of-token effect re-applies the source
+            // token's `token_image_ref` below while active. A true token keeps
+            // its own pointer (its baseline), which the copy layer overrides only
+            // while it is copying another object.
+            if !obj.is_token {
+                obj.token_image_ref = None;
+            }
             // CR 613.1b: Reset controller to the object's base controller;
             // Layer 2 re-applies continuous control-changing effects.
             obj.controller = obj.base_controller.unwrap_or(obj.owner);
@@ -1354,6 +1380,15 @@ pub fn evaluate_layers(state: &mut GameState) {
     // reverts obj.loyalty to base_loyalty, re-derive it from the actual counter.
     // (P/T counters are applied in-loop at Layer::CounterPT above, in layer 7c
     // before the 7d switch.)
+    //
+    // Loyalty is HYBRID: a counter-tracked planeswalker's loyalty IS its counter
+    // count (present entry wins, including 0); an un-counter-tracked planeswalker
+    // (a clone whose loyalty comes from the Copy layer, an in-place transform, an
+    // off-battlefield/pre-seed object) keeps the base/copy-layer value. So the
+    // `if let Some` is load-bearing: an ABSENT entry means "not counter-tracked,
+    // keep the field", while a PRESENT 0 means "drained to 0, must die" (CR
+    // 704.5i). `apply_counter_removal` is what keeps the 0 entry alive for a
+    // genuinely-tracked walker so this re-derive can see it.
     for &id in &bf_ids {
         if let Some(obj) = state.objects.get_mut(&id) {
             if let Some(&loyalty_counters) = obj.counters.get(&CounterType::Loyalty) {
@@ -2792,6 +2827,7 @@ fn depends_on(a: &ActiveContinuousEffect, b: &ActiveContinuousEffect, _state: &G
             | ContinuousModification::AddStaticMode { .. }
             | ContinuousModification::GrantStaticAbility { .. }
             | ContinuousModification::RetainPrintedTriggerFromSource { .. }
+            | ContinuousModification::RetainPrintedAbilityFromSource { .. }
     );
 
     if b_changes_abilities && filter_references_ability(&a.affected_filter) {
@@ -3088,6 +3124,7 @@ fn modification_dynamic_quantity(m: &ContinuousModification) -> Option<&Quantity
         | ContinuousModification::SetBasicLandType { .. }
         | ContinuousModification::SetChosenBasicLandType
         | ContinuousModification::RetainPrintedTriggerFromSource { .. }
+        | ContinuousModification::RetainPrintedAbilityFromSource { .. }
         | ContinuousModification::AddSupertype { .. }
         | ContinuousModification::RemoveSupertype { .. }
         | ContinuousModification::RemoveManaCost => None,
@@ -3299,6 +3336,20 @@ fn apply_continuous_effect_filtered(
     } else {
         None
     };
+    // CR 707.9a: Pre-read the printed activated ability to retain from the
+    // source object's `base_abilities`. Cloned before the per-object mutable
+    // borrow inside the loop (mirrors the trigger retain pre-read above).
+    let retained_printed_ability = if let ContinuousModification::RetainPrintedAbilityFromSource {
+        source_ability_index,
+    } = &effect.modification
+    {
+        state
+            .objects
+            .get(&effect.source_id)
+            .and_then(|src| src.base_abilities.get(*source_ability_index).cloned())
+    } else {
+        None
+    };
     let all_creature_types = state.all_creature_types.clone();
 
     for id in affected_ids {
@@ -3327,13 +3378,22 @@ fn apply_continuous_effect_filtered(
         match &effect.modification {
             ContinuousModification::CopyValues {
                 values,
+                display_source,
                 printed_ref,
+                token_image_ref,
             } => {
                 apply_copiable_values(obj, values);
-                // Display identity follows the copy: override the baseline
+                // Display routing follows the copy: override the baseline
                 // restored by the layer reset so the copy renders the source's
                 // art. Reverts automatically when the copy effect expires.
+                // CR 111.1 + CR 707.2: for a copy of a true token, the source's
+                // `display_source = Token` + `token_image_ref` carry the art (the
+                // copied name has no real-card printing); for a printed source,
+                // `display_source = Card` + `printed_ref`. None are copiable
+                // values — purely display routing.
+                obj.display_source = *display_source;
                 obj.printed_ref = printed_ref.clone();
+                obj.token_image_ref = token_image_ref.clone();
             }
             // CR 707.9b + CR 707.2: Name override is a copiable-value override
             // applied at Layer 1 after the base CopyValues (ordered by timestamp
@@ -3761,6 +3821,18 @@ fn apply_continuous_effect_filtered(
                     }
                 }
             }
+            // CR 707.9a: Retain the source's printed activated ability on the
+            // copy. After `CopyValues` overwrote `obj.abilities` with the
+            // copied values, push the source's printed ability back so the
+            // copy retains "this ability". Idempotent — duplicate retain calls
+            // (same ability structurally) collapse into one.
+            ContinuousModification::RetainPrintedAbilityFromSource { .. } => {
+                if let Some(ability) = retained_printed_ability.clone() {
+                    if !obj.abilities.iter().any(|a| a == &ability) {
+                        Arc::make_mut(&mut obj.abilities).push(ability);
+                    }
+                }
+            }
         }
     }
 }
@@ -3930,6 +4002,24 @@ pub(crate) fn compute_current_copiable_values(
                     let triggers = Arc::make_mut(&mut values.trigger_definitions);
                     if !triggers.iter().any(|t| t == &trigger) {
                         triggers.push(trigger);
+                    }
+                }
+            }
+            // CR 707.9a: A copy effect that retains an activated ability makes
+            // that ability part of the copiable values of the copy. Read the
+            // printed ability from the effect's source object by index,
+            // mirroring the trigger retain path above.
+            ContinuousModification::RetainPrintedAbilityFromSource {
+                source_ability_index,
+            } => {
+                if let Some(ability) = state
+                    .objects
+                    .get(&effect.source_id)
+                    .and_then(|src| src.base_abilities.get(*source_ability_index).cloned())
+                {
+                    let abilities = Arc::make_mut(&mut values.abilities);
+                    if !abilities.iter().any(|a| a == &ability) {
+                        abilities.push(ability);
                     }
                 }
             }
@@ -10520,7 +10610,9 @@ mod tests {
             TargetFilter::SpecificObject { id: target },
             vec![ContinuousModification::CopyValues {
                 values: Box::new(copy_values),
+                display_source: crate::game::game_object::DisplaySource::Card,
                 printed_ref: None,
+                token_image_ref: None,
             }],
             None,
         );
