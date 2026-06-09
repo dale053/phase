@@ -16,6 +16,8 @@ permissions:
 jobs:
   cut-nightly-release:
     name: Cut Nightly Release
+    # Forks inherit this workflow's schedule but not upstream secrets (RELEASE_BOT_TOKEN).
+    if: github.repository == 'phase-rs/phase'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     outputs:
