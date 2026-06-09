@@ -4,7 +4,7 @@ use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
 use crate::types::events::{GameEvent, PlayerActionKind};
-use crate::types::game_state::{GameState, WaitingFor};
+use crate::types::game_state::{GameState, WaitingFor, ZoneManipulationKind};
 use crate::types::proposed_event::ProposedEvent;
 
 /// CR 701.22a: Scry N — look at top N, put any number on bottom in any order, rest on top in any order.
@@ -107,10 +107,8 @@ pub(crate) fn apply_scry_after_replacement(
         .copied()
         .collect::<Vec<_>>();
 
-    state.waiting_for = WaitingFor::ScryChoice {
-        player: player_id,
-        cards,
-    };
+    state.waiting_for =
+        WaitingFor::zone_manipulation_waiting(player_id, ZoneManipulationKind::scry(cards));
 }
 
 #[cfg(test)]

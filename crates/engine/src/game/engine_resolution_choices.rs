@@ -8,7 +8,7 @@ use crate::types::actions::{GameAction, LearnOption, OutsideGameSelection};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     ActionResult, CastOfferKind, ChosenDamageSource, GameState, OutsideGameChoiceSource,
-    PayableResource, PendingContinuation, WaitingFor,
+    PayableResource, PendingContinuation, WaitingFor, ZoneManipulationKind,
 };
 use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::mana::ManaCost;
@@ -105,6 +105,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::VoteChoice { .. }
             | WaitingFor::SeparatePilesPartition { .. }
             | WaitingFor::SeparatePilesChoice { .. }
+            | WaitingFor::ZoneManipulation { .. }
             | WaitingFor::DigChoice { .. }
             | WaitingFor::SurveilChoice { .. }
             | WaitingFor::RevealChoice { .. }
@@ -286,9 +287,13 @@ pub(super) fn handle_resolution_choice(
     action: GameAction,
     events: &mut Vec<GameEvent>,
 ) -> Result<ResolutionChoiceOutcome, EngineError> {
+    let waiting_for = waiting_for.normalize_zone_manipulation();
     let outcome = match (waiting_for, action) {
         (
-            WaitingFor::ScryChoice { player, cards },
+            WaitingFor::ZoneManipulation {
+                player,
+                kind: ZoneManipulationKind::Scry { cards },
+            },
             GameAction::SelectCards { cards: top_cards },
         ) => {
             let all_cards = cards;
@@ -454,16 +459,19 @@ pub(super) fn handle_resolution_choice(
         // decline zone IS the rest pile, the hit card joins the misses so the
         // random-order placement covers it in one shuffle (CR 701.20a).
         (
-            WaitingFor::RevealUntilKeptChoice {
+            WaitingFor::ZoneManipulation {
                 player,
-                hit_card,
-                source_id,
-                accept_zone,
-                decline_zone,
-                enter_tapped,
-                enters_attacking,
-                revealed_misses,
-                rest_destination,
+                kind:
+                    ZoneManipulationKind::RevealUntilKept {
+                        hit_card,
+                        source_id,
+                        accept_zone,
+                        decline_zone,
+                        enter_tapped,
+                        enters_attacking,
+                        revealed_misses,
+                        rest_destination,
+                    },
             },
             GameAction::DecideOptionalEffect { accept },
         ) => {
@@ -746,7 +754,10 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }
         (
-            WaitingFor::TopOrBottomChoice { player, object_id },
+            WaitingFor::ZoneManipulation {
+                player,
+                kind: ZoneManipulationKind::TopOrBottom { object_id },
+            },
             GameAction::ChooseTopOrBottom { top },
         ) => {
             zones::move_to_library_position(state, object_id, top, events);
@@ -1123,17 +1134,20 @@ pub(super) fn handle_resolution_choice(
             }
         }
         (
-            WaitingFor::DigChoice {
+            WaitingFor::ZoneManipulation {
                 player,
-                library_owner,
-                cards,
-                keep_count,
-                up_to,
-                selectable_cards,
-                kept_destination,
-                rest_destination,
-                enter_tapped,
-                ..
+                kind:
+                    ZoneManipulationKind::Dig {
+                        library_owner,
+                        cards,
+                        keep_count,
+                        up_to,
+                        selectable_cards,
+                        kept_destination,
+                        rest_destination,
+                        enter_tapped,
+                        ..
+                    },
             },
             GameAction::SelectCards { cards: kept },
         ) => {
@@ -1230,7 +1244,10 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }
         (
-            WaitingFor::SurveilChoice { player, cards },
+            WaitingFor::ZoneManipulation {
+                player,
+                kind: ZoneManipulationKind::Surveil { cards },
+            },
             GameAction::SelectCards { cards: top_cards },
         ) => {
             // CR 701.25a: To surveil N, put any number of the looked-at cards into
@@ -1265,12 +1282,15 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }
         (
-            WaitingFor::RevealChoice {
+            WaitingFor::ZoneManipulation {
                 player,
-                cards,
-                filter,
-                optional,
-                decline_runs_continuation,
+                kind:
+                    ZoneManipulationKind::Reveal {
+                        cards,
+                        filter,
+                        optional,
+                        decline_runs_continuation,
+                    },
             },
             GameAction::SelectCards { cards: chosen },
         ) => {
@@ -1339,14 +1359,17 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
         }
         (
-            WaitingFor::SearchChoice {
+            WaitingFor::ZoneManipulation {
                 player,
-                cards,
-                count,
-                reveal,
-                up_to,
-                constraint,
-                split,
+                kind:
+                    ZoneManipulationKind::Search {
+                        cards,
+                        count,
+                        reveal,
+                        up_to,
+                        constraint,
+                        split,
+                    },
             },
             GameAction::SelectCards { cards: chosen },
         ) => {
@@ -1419,15 +1442,17 @@ pub(super) fn handle_resolution_choice(
                     // CR 608.2d: Genuine choice — the searcher picks which
                     // primary_count cards go to the primary destination.
                     set_priority(state, player);
-                    state.waiting_for = WaitingFor::SearchPartitionChoice {
+                    state.waiting_for = WaitingFor::zone_manipulation_waiting(
                         player,
-                        cards: chosen.clone(),
-                        primary_destination: split.primary_destination,
-                        primary_count: split.primary_count,
-                        primary_enter_tapped: split.primary_enter_tapped,
-                        rest_destination: split.rest_destination,
-                        source_id,
-                    };
+                        ZoneManipulationKind::SearchPartition {
+                            cards: chosen.clone(),
+                            primary_destination: split.primary_destination,
+                            primary_count: split.primary_count,
+                            primary_enter_tapped: split.primary_enter_tapped,
+                            rest_destination: split.rest_destination,
+                            source_id,
+                        },
+                    );
                     return Ok(ResolutionChoiceOutcome::WaitingFor(
                         state.waiting_for.clone(),
                     ));
@@ -1462,14 +1487,17 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
         }
         (
-            WaitingFor::SearchPartitionChoice {
+            WaitingFor::ZoneManipulation {
                 player,
-                cards,
-                primary_destination,
-                primary_count,
-                primary_enter_tapped,
-                rest_destination,
-                source_id,
+                kind:
+                    ZoneManipulationKind::SearchPartition {
+                        cards,
+                        primary_destination,
+                        primary_count,
+                        primary_enter_tapped,
+                        rest_destination,
+                        source_id,
+                    },
             },
             GameAction::SelectCards {
                 cards: primary_chosen,
@@ -1517,14 +1545,17 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
         }
         (
-            WaitingFor::OutsideGameChoice {
+            WaitingFor::ZoneManipulation {
                 player,
-                source_id,
-                choices,
-                count,
-                reveal,
-                up_to,
-                destination,
+                kind:
+                    ZoneManipulationKind::OutsideGame {
+                        source_id,
+                        choices,
+                        count,
+                        reveal,
+                        up_to,
+                        destination,
+                    },
             },
             GameAction::ChooseOutsideGameCards { selections },
         ) => {
@@ -1665,13 +1696,16 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }
         (
-            WaitingFor::ChooseFromZoneChoice {
+            WaitingFor::ZoneManipulation {
                 player,
-                cards,
-                count,
-                up_to,
-                constraint,
-                ..
+                kind:
+                    ZoneManipulationKind::ChooseFromZone {
+                        cards,
+                        count,
+                        up_to,
+                        constraint,
+                        ..
+                    },
             },
             GameAction::SelectCards { cards: chosen },
         ) => {
@@ -2031,23 +2065,26 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(waiting_for)
         }
         (
-            WaitingFor::EffectZoneChoice {
+            WaitingFor::ZoneManipulation {
                 player,
-                cards,
-                count,
-                min_count,
-                up_to,
-                source_id,
-                effect_kind,
-                zone,
-                destination,
-                enter_tapped,
-                enter_transformed,
-                enters_under_player,
-                enters_attacking,
-                owner_library: _,
-                track_exiled_by_source,
-                count_param,
+                kind:
+                    ZoneManipulationKind::EffectZone {
+                        cards,
+                        count,
+                        min_count,
+                        up_to,
+                        source_id,
+                        effect_kind,
+                        zone,
+                        destination,
+                        enter_tapped,
+                        enter_transformed,
+                        enters_under_player,
+                        enters_attacking,
+                        owner_library: _,
+                        track_exiled_by_source,
+                        count_param,
+                    },
             },
             GameAction::SelectCards { cards: chosen },
         ) => {

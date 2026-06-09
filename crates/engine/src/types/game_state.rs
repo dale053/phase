@@ -2117,6 +2117,150 @@ pub enum CostResume {
     },
 }
 
+/// CR 608.2c + CR 700.2: Per-mechanic payload for interactive zone/manipulation
+/// prompts under `WaitingFor::ZoneManipulation` (mirrors `PayCostKind`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ZoneManipulationKind {
+    /// CR 701.22a: Scry N — reorder looked-at library cards (top/bottom).
+    Scry { cards: Vec<ObjectId> },
+    /// CR 701.20e: Look at the top N and keep a subset.
+    Dig {
+        #[serde(default)]
+        library_owner: PlayerId,
+        cards: Vec<ObjectId>,
+        keep_count: usize,
+        #[serde(default)]
+        up_to: bool,
+        #[serde(default)]
+        selectable_cards: Vec<ObjectId>,
+        #[serde(default)]
+        kept_destination: Option<Zone>,
+        #[serde(default)]
+        rest_destination: Option<Zone>,
+        #[serde(default)]
+        source_id: Option<ObjectId>,
+        #[serde(default)]
+        enter_tapped: bool,
+    },
+    /// CR 701.46a: Surveil N — library top to graveyard or leave on top.
+    Surveil { cards: Vec<ObjectId> },
+    /// CR 701.20a: Reveal from hand and optionally act on revealed cards.
+    Reveal {
+        cards: Vec<ObjectId>,
+        #[serde(default = "super::ability::default_target_filter_any")]
+        filter: TargetFilter,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optional: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        decline_runs_continuation: bool,
+    },
+    /// CR 701.23a: Choose card(s) from a filtered library search.
+    Search {
+        cards: Vec<ObjectId>,
+        count: usize,
+        #[serde(default)]
+        reveal: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        up_to: bool,
+        #[serde(default)]
+        constraint: SearchSelectionConstraint,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        split: Option<SearchDestinationSplit>,
+    },
+    /// CR 701.23a + CR 608.2c: Split-destination partition after search.
+    SearchPartition {
+        cards: Vec<ObjectId>,
+        primary_destination: Zone,
+        primary_count: u32,
+        primary_enter_tapped: bool,
+        rest_destination: Zone,
+        source_id: ObjectId,
+    },
+    /// CR 400.11/400.11a + CR 701.23j: Choose from sideboard / outside-game set.
+    OutsideGame {
+        source_id: ObjectId,
+        choices: Vec<OutsideGameChoiceEntry>,
+        count: usize,
+        #[serde(default)]
+        reveal: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        up_to: bool,
+        destination: Zone,
+    },
+    /// CR 700.2: Select from a tracked set (exile, etc.) for continuation.
+    ChooseFromZone {
+        cards: Vec<ObjectId>,
+        count: usize,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        up_to: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        constraint: Option<ChooseFromZoneConstraint>,
+        source_id: ObjectId,
+    },
+    /// CR 608.2d: Sacrifice, change-zone, or similar zone selection during resolution.
+    EffectZone {
+        cards: Vec<ObjectId>,
+        count: usize,
+        #[serde(default, skip_serializing_if = "is_zero_usize")]
+        min_count: usize,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        up_to: bool,
+        source_id: ObjectId,
+        effect_kind: EffectKind,
+        zone: Zone,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination: Option<Zone>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        enter_tapped: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        enter_transformed: bool,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            alias = "under_your_control",
+            deserialize_with = "super::ability::deserialize_enters_under_player_compat"
+        )]
+        enters_under_player: Option<PlayerId>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        enters_attacking: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        owner_library: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        track_exiled_by_source: bool,
+        #[serde(default)]
+        count_param: u32,
+    },
+    /// CR 401.4: Put a single card on top or bottom of its owner's library.
+    TopOrBottom { object_id: ObjectId },
+    /// CR 701.20a + CR 608.2c: Accept or decline a RevealUntil hit card.
+    RevealUntilKept {
+        hit_card: ObjectId,
+        source_id: ObjectId,
+        accept_zone: Zone,
+        decline_zone: Zone,
+        enter_tapped: bool,
+        #[serde(default)]
+        enters_attacking: bool,
+        revealed_misses: Vec<ObjectId>,
+        rest_destination: Zone,
+    },
+}
+
+impl ZoneManipulationKind {
+    pub fn scry(cards: Vec<ObjectId>) -> Self {
+        Self::Scry { cards }
+    }
+
+    pub fn surveil(cards: Vec<ObjectId>) -> Self {
+        Self::Surveil { cards }
+    }
+
+    pub fn top_or_bottom(object_id: ObjectId) -> Self {
+        Self::TopOrBottom { object_id }
+    }
+}
+
 /// CR 601.2h + CR 702.48c: Identifies which spell-cost component a
 /// `WaitingFor::PayCost` choice is paying when the same `AbilityCost` shape can
 /// come from different rules.
@@ -2476,6 +2620,14 @@ pub enum WaitingFor {
         saddle_power: u32,
         /// Untapped creatures the player controls (excluding the Mount itself).
         eligible_creatures: Vec<ObjectId>,
+    },
+    /// CR 608.2c + CR 700.2: Unified zone/manipulation player choice. Replaces
+    /// ScryChoice, DigChoice, SurveilChoice, SearchChoice, SearchPartitionChoice,
+    /// RevealChoice, ChooseFromZoneChoice, EffectZoneChoice, OutsideGameChoice,
+    /// TopOrBottomChoice, and RevealUntilKeptChoice.
+    ZoneManipulation {
+        player: PlayerId,
+        kind: ZoneManipulationKind,
     },
     ScryChoice {
         player: PlayerId,
@@ -3754,6 +3906,7 @@ impl WaitingFor {
             WaitingFor::CrewVehicle { .. } => "CrewVehicle",
             WaitingFor::StationTarget { .. } => "StationTarget",
             WaitingFor::SaddleMount { .. } => "SaddleMount",
+            WaitingFor::ZoneManipulation { .. } => "ZoneManipulation",
             WaitingFor::ScryChoice { .. } => "ScryChoice",
             WaitingFor::CoinFlipKeepChoice { .. } => "CoinFlipKeepChoice",
             WaitingFor::DigChoice { .. } => "DigChoice",
@@ -3888,6 +4041,7 @@ impl WaitingFor {
             | WaitingFor::CrewVehicle { player, .. }
             | WaitingFor::StationTarget { player, .. }
             | WaitingFor::SaddleMount { player, .. }
+            | WaitingFor::ZoneManipulation { player, .. }
             | WaitingFor::ScryChoice { player, .. }
             | WaitingFor::CoinFlipKeepChoice { player, .. }
             | WaitingFor::DigChoice { player, .. }
@@ -4105,6 +4259,227 @@ impl WaitingFor {
             )
     }
 
+    /// Whether this pause is a zone/manipulation choice (unified or legacy shape).
+    pub fn is_zone_manipulation(&self) -> bool {
+        matches!(
+            self,
+            WaitingFor::ZoneManipulation { .. }
+                | WaitingFor::ScryChoice { .. }
+                | WaitingFor::DigChoice { .. }
+                | WaitingFor::SurveilChoice { .. }
+                | WaitingFor::RevealChoice { .. }
+                | WaitingFor::SearchChoice { .. }
+                | WaitingFor::SearchPartitionChoice { .. }
+                | WaitingFor::OutsideGameChoice { .. }
+                | WaitingFor::ChooseFromZoneChoice { .. }
+                | WaitingFor::EffectZoneChoice { .. }
+                | WaitingFor::TopOrBottomChoice { .. }
+                | WaitingFor::RevealUntilKeptChoice { .. }
+        )
+    }
+
+    /// Normalize legacy zone/manipulation variants to `WaitingFor::ZoneManipulation`.
+    pub fn normalize_zone_manipulation(self) -> Self {
+        if matches!(self, WaitingFor::ZoneManipulation { .. }) {
+            return self;
+        }
+        match self {
+            WaitingFor::ZoneManipulation { .. } => unreachable!(),
+            WaitingFor::ScryChoice { player, cards } => {
+                WaitingFor::zone_manipulation_waiting(player, ZoneManipulationKind::Scry { cards })
+            }
+            WaitingFor::DigChoice {
+                player,
+                library_owner,
+                cards,
+                keep_count,
+                up_to,
+                selectable_cards,
+                kept_destination,
+                rest_destination,
+                source_id,
+                enter_tapped,
+            } => WaitingFor::zone_manipulation_waiting(
+                player,
+                ZoneManipulationKind::Dig {
+                    library_owner,
+                    cards,
+                    keep_count,
+                    up_to,
+                    selectable_cards,
+                    kept_destination,
+                    rest_destination,
+                    source_id,
+                    enter_tapped,
+                },
+            ),
+            WaitingFor::SurveilChoice { player, cards } => WaitingFor::zone_manipulation_waiting(
+                player,
+                ZoneManipulationKind::Surveil { cards },
+            ),
+            WaitingFor::RevealChoice {
+                player,
+                cards,
+                filter,
+                optional,
+                decline_runs_continuation,
+            } => WaitingFor::zone_manipulation_waiting(
+                player,
+                ZoneManipulationKind::Reveal {
+                    cards,
+                    filter,
+                    optional,
+                    decline_runs_continuation,
+                },
+            ),
+            WaitingFor::SearchChoice {
+                player,
+                cards,
+                count,
+                reveal,
+                up_to,
+                constraint,
+                split,
+            } => WaitingFor::zone_manipulation_waiting(
+                player,
+                ZoneManipulationKind::Search {
+                    cards,
+                    count,
+                    reveal,
+                    up_to,
+                    constraint,
+                    split,
+                },
+            ),
+            WaitingFor::SearchPartitionChoice {
+                player,
+                cards,
+                primary_destination,
+                primary_count,
+                primary_enter_tapped,
+                rest_destination,
+                source_id,
+            } => WaitingFor::zone_manipulation_waiting(
+                player,
+                ZoneManipulationKind::SearchPartition {
+                    cards,
+                    primary_destination,
+                    primary_count,
+                    primary_enter_tapped,
+                    rest_destination,
+                    source_id,
+                },
+            ),
+            WaitingFor::OutsideGameChoice {
+                player,
+                source_id,
+                choices,
+                count,
+                reveal,
+                up_to,
+                destination,
+            } => WaitingFor::zone_manipulation_waiting(
+                player,
+                ZoneManipulationKind::OutsideGame {
+                    source_id,
+                    choices,
+                    count,
+                    reveal,
+                    up_to,
+                    destination,
+                },
+            ),
+            WaitingFor::ChooseFromZoneChoice {
+                player,
+                cards,
+                count,
+                up_to,
+                constraint,
+                source_id,
+            } => WaitingFor::zone_manipulation_waiting(
+                player,
+                ZoneManipulationKind::ChooseFromZone {
+                    cards,
+                    count,
+                    up_to,
+                    constraint,
+                    source_id,
+                },
+            ),
+            WaitingFor::EffectZoneChoice {
+                player,
+                cards,
+                count,
+                min_count,
+                up_to,
+                source_id,
+                effect_kind,
+                zone,
+                destination,
+                enter_tapped,
+                enter_transformed,
+                enters_under_player,
+                enters_attacking,
+                owner_library,
+                track_exiled_by_source,
+                count_param,
+            } => WaitingFor::zone_manipulation_waiting(
+                player,
+                ZoneManipulationKind::EffectZone {
+                    cards,
+                    count,
+                    min_count,
+                    up_to,
+                    source_id,
+                    effect_kind,
+                    zone,
+                    destination,
+                    enter_tapped,
+                    enter_transformed,
+                    enters_under_player,
+                    enters_attacking,
+                    owner_library,
+                    track_exiled_by_source,
+                    count_param,
+                },
+            ),
+            WaitingFor::TopOrBottomChoice { player, object_id } => {
+                WaitingFor::zone_manipulation_waiting(
+                    player,
+                    ZoneManipulationKind::TopOrBottom { object_id },
+                )
+            }
+            WaitingFor::RevealUntilKeptChoice {
+                player,
+                hit_card,
+                source_id,
+                accept_zone,
+                decline_zone,
+                enter_tapped,
+                enters_attacking,
+                revealed_misses,
+                rest_destination,
+            } => WaitingFor::zone_manipulation_waiting(
+                player,
+                ZoneManipulationKind::RevealUntilKept {
+                    hit_card,
+                    source_id,
+                    accept_zone,
+                    decline_zone,
+                    enter_tapped,
+                    enters_attacking,
+                    revealed_misses,
+                    rest_destination,
+                },
+            ),
+            other => other,
+        }
+    }
+
+    pub fn zone_manipulation_waiting(player: PlayerId, kind: ZoneManipulationKind) -> Self {
+        WaitingFor::ZoneManipulation { player, kind }
+    }
+
     /// Look-at-top-N states whose legal selections cannot be captured by the
     /// candidate enumerator (it lists only {empty, full-in-original-order,
     /// singletons}), so the multiplayer legality gate would wrongly reject a
@@ -4118,12 +4493,19 @@ impl WaitingFor {
     ///   up_to constraint, uniqueness, and the selectable-cards filter, and
     ///   preserves the chosen order for library-destined keeps.
     pub fn accepts_freeform_card_selection(&self) -> bool {
-        matches!(
-            self,
-            WaitingFor::ScryChoice { .. }
-                | WaitingFor::SurveilChoice { .. }
-                | WaitingFor::DigChoice { .. }
-        )
+        match self {
+            WaitingFor::ZoneManipulation {
+                kind:
+                    ZoneManipulationKind::Scry { .. }
+                    | ZoneManipulationKind::Surveil { .. }
+                    | ZoneManipulationKind::Dig { .. },
+                ..
+            }
+            | WaitingFor::ScryChoice { .. }
+            | WaitingFor::SurveilChoice { .. }
+            | WaitingFor::DigChoice { .. } => true,
+            _ => false,
+        }
     }
 
     pub fn accepts_freeform_counter_move_distribution(&self) -> bool {

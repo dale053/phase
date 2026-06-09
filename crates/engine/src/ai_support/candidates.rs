@@ -16,7 +16,7 @@ use crate::types::card::LayoutKind;
 use crate::types::card_type::CoreType;
 use crate::types::game_state::{
     CastOfferKind, ConvokeMode, CounterMoveChoice, GameState, PayCostKind, TargetSelectionSlot,
-    WaitingFor,
+    WaitingFor, ZoneManipulationKind,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaType;
@@ -305,6 +305,204 @@ fn permute_into(
     }
 }
 
+fn zone_manipulation_kind_candidates(
+    state: &GameState,
+    player: PlayerId,
+    kind: &ZoneManipulationKind,
+) -> Vec<CandidateAction> {
+    use crate::types::game_state::OutsideGameChoiceSource;
+    match kind {
+        ZoneManipulationKind::Scry { cards } | ZoneManipulationKind::Surveil { cards } => {
+            select_cards_variants(player, cards, None)
+        }
+        ZoneManipulationKind::Dig {
+            keep_count,
+            up_to,
+            selectable_cards,
+            ..
+        } => {
+            let max_keep = (*keep_count).min(selectable_cards.len());
+            if *up_to {
+                bounded_select_card_candidates(player, selectable_cards, 0..=max_keep)
+            } else {
+                bounded_select_card_candidates(player, selectable_cards, [max_keep])
+            }
+        }
+        ZoneManipulationKind::Reveal {
+            cards, optional, ..
+        } => {
+            let mut variants = select_cards_variants(player, cards, Some(1));
+            if *optional {
+                variants.push(candidate(
+                    GameAction::SelectCards { cards: vec![] },
+                    TacticalClass::Selection,
+                    Some(player),
+                ));
+            }
+            variants
+        }
+        ZoneManipulationKind::Search {
+            cards,
+            count,
+            up_to,
+            constraint,
+            ..
+        } => {
+            const ENGINE_CANDIDATE_CAP: usize = 12;
+            let sizes: Vec<usize> = if *up_to {
+                (0..=*count).collect()
+            } else {
+                vec![*count]
+            };
+            let beam_cards = cap_search_choice_pool(state, cards, constraint, ENGINE_CANDIDATE_CAP);
+            sizes
+                .into_iter()
+                .flat_map(|size| combinations(&beam_cards, size))
+                .filter(|combo| {
+                    crate::game::effects::search_library::selection_satisfies_constraint(
+                        state, combo, constraint,
+                    )
+                })
+                .map(|combo| {
+                    candidate(
+                        GameAction::SelectCards { cards: combo },
+                        TacticalClass::Selection,
+                        Some(player),
+                    )
+                })
+                .collect()
+        }
+        ZoneManipulationKind::SearchPartition {
+            cards,
+            primary_count,
+            ..
+        } => combinations(cards, *primary_count as usize)
+            .into_iter()
+            .map(|combo| {
+                candidate(
+                    GameAction::SelectCards { cards: combo },
+                    TacticalClass::Selection,
+                    Some(player),
+                )
+            })
+            .collect(),
+        ZoneManipulationKind::OutsideGame {
+            choices,
+            count,
+            up_to,
+            ..
+        } => {
+            let mut pool: Vec<OutsideGameSelection> = Vec::new();
+            for choice in choices.iter() {
+                match &choice.source {
+                    OutsideGameChoiceSource::Sideboard {
+                        sideboard_index, ..
+                    } => {
+                        for _ in 0..choice.count {
+                            pool.push(OutsideGameSelection::Sideboard {
+                                sideboard_index: *sideboard_index,
+                            });
+                        }
+                    }
+                    OutsideGameChoiceSource::FaceUpExile { object_id } => {
+                        pool.push(OutsideGameSelection::FaceUpExile {
+                            object_id: *object_id,
+                        });
+                    }
+                }
+            }
+            let sizes = if *up_to {
+                (0..=*count).collect()
+            } else {
+                vec![*count]
+            };
+            bounded_combinations_generic(&pool, sizes, SELECTION_POOL_CAP, SELECTION_CANDIDATE_CAP)
+                .into_iter()
+                .map(|selections| {
+                    candidate(
+                        GameAction::ChooseOutsideGameCards { selections },
+                        TacticalClass::Selection,
+                        Some(player),
+                    )
+                })
+                .collect()
+        }
+        ZoneManipulationKind::ChooseFromZone {
+            cards,
+            count,
+            up_to,
+            constraint,
+            ..
+        } => {
+            let sizes = if *up_to {
+                (0..=*count).collect()
+            } else {
+                vec![*count]
+            };
+            bounded_combinations_for_sizes(
+                cards,
+                sizes,
+                SELECTION_POOL_CAP,
+                SELECTION_CANDIDATE_CAP,
+            )
+            .into_iter()
+            .filter(|combo| {
+                crate::game::effects::choose_from_zone::selection_satisfies_constraint(
+                    state,
+                    combo,
+                    constraint.as_ref(),
+                )
+            })
+            .map(|combo| {
+                candidate(
+                    GameAction::SelectCards { cards: combo },
+                    TacticalClass::Selection,
+                    Some(player),
+                )
+            })
+            .collect()
+        }
+        ZoneManipulationKind::EffectZone {
+            cards,
+            count,
+            min_count,
+            up_to,
+            ..
+        } => {
+            let sizes = if *up_to {
+                (*min_count..=*count).collect()
+            } else {
+                vec![*count]
+            };
+            bounded_select_card_candidates(player, cards, sizes)
+        }
+        ZoneManipulationKind::TopOrBottom { .. } => vec![
+            candidate(
+                GameAction::ChooseTopOrBottom { top: true },
+                TacticalClass::Selection,
+                Some(player),
+            ),
+            candidate(
+                GameAction::ChooseTopOrBottom { top: false },
+                TacticalClass::Selection,
+                Some(player),
+            ),
+        ],
+        ZoneManipulationKind::RevealUntilKept { .. } => vec![
+            candidate(
+                GameAction::DecideOptionalEffect { accept: true },
+                TacticalClass::Selection,
+                Some(player),
+            ),
+            candidate(
+                GameAction::DecideOptionalEffect { accept: false },
+                TacticalClass::Selection,
+                Some(player),
+            ),
+        ],
+    }
+}
+
 /// `GameAction::Concede` is intentionally NOT produced by any of the
 /// `candidate_actions*` enumerators. Per CR 104.3a a player may concede "at any
 /// time" regardless of priority or `WaitingFor` state, so `engine.rs::apply()`
@@ -314,7 +512,11 @@ fn permute_into(
 /// surfaces directly. Callers that need to submit a concede do so by
 /// constructing `GameAction::Concede { player_id }` directly.
 pub fn candidate_actions_exact(state: &GameState) -> Vec<CandidateAction> {
-    match &state.waiting_for {
+    let waiting_for = state.waiting_for.clone().normalize_zone_manipulation();
+    if let WaitingFor::ZoneManipulation { player, kind } = &waiting_for {
+        return zone_manipulation_kind_candidates(state, *player, kind);
+    }
+    match &waiting_for {
         WaitingFor::ReplacementChoice {
             candidate_count,
             player,
@@ -667,7 +869,11 @@ pub fn candidate_actions_exact(state: &GameState) -> Vec<CandidateAction> {
 }
 
 pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
-    let actions = match &state.waiting_for {
+    let waiting_for = state.waiting_for.clone().normalize_zone_manipulation();
+    let actions = match &waiting_for {
+        WaitingFor::ZoneManipulation { player, kind } => {
+            zone_manipulation_kind_candidates(state, *player, kind)
+        }
         WaitingFor::Priority { player } => priority_actions(state, *player),
         WaitingFor::ManaPayment {
             player,

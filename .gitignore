@@ -104,6 +104,13 @@ replay_dtypes.py
 parser-batch-plan.md
 parser-fallback-plan.md
 tmp/
+issue-drafts/
+
+# Local nested repos / accidental checkouts (not part of phase.rs)
+gittensory/
+
+# pnpm content-addressable store when created at repo root (not committed)
+.pnpm-store/
 
 # External reference / scratch
 mtgish/

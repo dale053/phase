@@ -1443,7 +1443,10 @@ function GamePageContent({
           )}
 
         {/* CR 401.4: Owner puts permanent on top or bottom of library */}
-        {(waitingFor?.type === "TopOrBottomChoice" || waitingFor?.type === "ClashCardPlacement") &&
+        {(waitingFor?.type === "TopOrBottomChoice" ||
+          waitingFor?.type === "ClashCardPlacement" ||
+          (waitingFor?.type === "ZoneManipulation" &&
+            waitingFor.data.kind.type === "TopOrBottom")) &&
           canActForWaitingState && (
             <TopOrBottomModal />
           )}
@@ -2579,9 +2582,35 @@ function TopOrBottomModal() {
   const waitingFor = useGameStore((s) => s.gameState?.waiting_for);
   const objects = useGameStore((s) => s.gameState?.objects);
 
-  if (waitingFor?.type !== "TopOrBottomChoice" && waitingFor?.type !== "ClashCardPlacement") return null;
+  if (!waitingFor) return null;
 
-  return <TopOrBottomChoiceModalContent waitingFor={waitingFor} objects={objects} dispatch={dispatch} />;
+  if (waitingFor.type === "TopOrBottomChoice" || waitingFor.type === "ClashCardPlacement") {
+    return (
+      <TopOrBottomChoiceModalContent
+        waitingFor={waitingFor}
+        objects={objects}
+        dispatch={dispatch}
+      />
+    );
+  }
+
+  if (waitingFor.type === "ZoneManipulation" && waitingFor.data.kind.type === "TopOrBottom") {
+    return (
+      <TopOrBottomChoiceModalContent
+        waitingFor={{
+          type: "TopOrBottomChoice",
+          data: {
+            player: waitingFor.data.player,
+            object_id: waitingFor.data.kind.object_id,
+          },
+        }}
+        objects={objects}
+        dispatch={dispatch}
+      />
+    );
+  }
+
+  return null;
 }
 
 // ── Mutate Merge Choice Modal (CR 702.140c + CR 730.2a) ────────────────

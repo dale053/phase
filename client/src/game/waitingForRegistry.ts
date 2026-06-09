@@ -92,6 +92,8 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "CrewVehicle",
     "StationTarget",
     "SaddleMount",
+    // CR 608.2c + CR 700.2: unified zone/manipulation choice (dispatches on `kind`).
+    "ZoneManipulation",
     "ScryChoice",
     "CoinFlipKeepChoice",
     "DigChoice",

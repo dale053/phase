@@ -69,6 +69,7 @@ type PairChoice = Extract<WaitingFor, { type: "PairChoice" }>;
 type ChooseLegend = Extract<WaitingFor, { type: "ChooseLegend" }>;
 type CommanderZoneChoice = Extract<WaitingFor, { type: "CommanderZoneChoice" }>;
 type RevealUntilKeptChoice = Extract<WaitingFor, { type: "RevealUntilKeptChoice" }>;
+type ZoneManipulation = Extract<WaitingFor, { type: "ZoneManipulation" }>;
 type RepeatDecision = Extract<WaitingFor, { type: "RepeatDecision" }>;
 type ManifestDreadChoice = Extract<WaitingFor, { type: "ManifestDreadChoice" }>;
 type CrewVehicle = Extract<WaitingFor, { type: "CrewVehicle" }>;
@@ -89,6 +90,9 @@ export function CardChoiceModal() {
   if (!waitingFor) return null;
 
   switch (waitingFor.type) {
+    case "ZoneManipulation":
+      if (!canActForWaitingState) return null;
+      return <ZoneManipulationDispatch data={waitingFor.data} />;
     case "ScryChoice":
       if (!canActForWaitingState) return null;
       return <ScryModal data={waitingFor.data} />;
@@ -327,6 +331,145 @@ function RingBearerModal({ data }: { data: ChooseRingBearer["data"] }) {
       </ScrollableCardStrip>
     </ChoiceOverlay>
   );
+}
+
+// ── Zone manipulation dispatch (unified WaitingFor::ZoneManipulation) ────────
+
+function ZoneManipulationDispatch({ data }: { data: ZoneManipulation["data"] }) {
+  const { player, kind } = data;
+  switch (kind.type) {
+    case "Scry":
+      return <ScryModal data={{ player, cards: kind.cards }} />;
+    case "Dig":
+      return (
+        <DigModal
+          data={{
+            player,
+            cards: kind.cards,
+            keep_count: kind.keep_count,
+            up_to: kind.up_to,
+            selectable_cards: kind.selectable_cards,
+            kept_destination: kind.kept_destination,
+            rest_destination: kind.rest_destination,
+          }}
+        />
+      );
+    case "Surveil":
+      return <SurveilModal data={{ player, cards: kind.cards }} />;
+    case "Reveal":
+      return (
+        <RevealModal
+          data={{
+            player,
+            cards: kind.cards,
+            filter: kind.filter,
+            optional: kind.optional,
+          }}
+        />
+      );
+    case "Search":
+      return (
+        <SearchModal
+          data={{
+            player,
+            cards: kind.cards,
+            count: kind.count,
+            reveal: kind.reveal,
+            up_to: kind.up_to,
+            constraint: kind.constraint,
+            split: kind.split,
+          }}
+        />
+      );
+    case "SearchPartition":
+      return (
+        <SearchPartitionModal
+          data={{
+            player,
+            cards: kind.cards,
+            primary_destination: kind.primary_destination,
+            primary_count: kind.primary_count,
+            primary_enter_tapped: kind.primary_enter_tapped,
+            rest_destination: kind.rest_destination,
+            source_id: kind.source_id,
+          }}
+        />
+      );
+    case "OutsideGame":
+      return (
+        <OutsideGameModal
+          key={outsideGameChoiceKey({
+            player,
+            source_id: kind.source_id,
+            choices: kind.choices,
+            count: kind.count,
+            destination: kind.destination,
+          })}
+          data={{
+            player,
+            source_id: kind.source_id,
+            choices: kind.choices,
+            count: kind.count,
+            reveal: kind.reveal,
+            up_to: kind.up_to,
+            destination: kind.destination,
+          }}
+        />
+      );
+    case "ChooseFromZone":
+      return (
+        <ChooseFromZoneModal
+          data={{
+            player,
+            cards: kind.cards,
+            count: kind.count,
+            up_to: kind.up_to,
+            constraint: kind.constraint,
+            source_id: kind.source_id,
+          }}
+        />
+      );
+    case "EffectZone":
+      return (
+        <EffectZoneModal
+          data={{
+            player,
+            cards: kind.cards,
+            count: kind.count,
+            min_count: kind.min_count,
+            up_to: kind.up_to,
+            source_id: kind.source_id,
+            effect_kind: kind.effect_kind,
+            zone: kind.zone,
+            destination: kind.destination,
+            enter_tapped: kind.enter_tapped,
+            enter_transformed: kind.enter_transformed,
+            enters_under_player: kind.enters_under_player,
+            enters_attacking: kind.enters_attacking,
+            owner_library: kind.owner_library,
+            track_exiled_by_source: kind.track_exiled_by_source,
+          }}
+        />
+      );
+    case "RevealUntilKept":
+      return (
+        <RevealUntilKeptChoiceModal
+          data={{
+            player,
+            hit_card: kind.hit_card,
+            source_id: kind.source_id,
+            accept_zone: kind.accept_zone,
+            decline_zone: kind.decline_zone,
+            enter_tapped: kind.enter_tapped,
+            enters_attacking: kind.enters_attacking,
+            revealed_misses: kind.revealed_misses,
+            rest_destination: kind.rest_destination,
+          }}
+        />
+      );
+    case "TopOrBottom":
+      return null;
+  }
 }
 
 // ── Search Modal ─────────────────────────────────────────────────────────────

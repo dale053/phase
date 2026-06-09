@@ -1457,6 +1457,7 @@ impl GameRunner {
             WaitingFor::ExploreChoice { .. } => "ExploreChoice",
             WaitingFor::ReturnAsAuraTarget { .. } => "ReturnAsAuraTarget",
             WaitingFor::EquipTarget { .. } => "EquipTarget",
+            WaitingFor::ZoneManipulation { .. } => "ZoneManipulation",
             WaitingFor::ScryChoice { .. } => "ScryChoice",
             WaitingFor::CoinFlipKeepChoice { .. } => "CoinFlipKeepChoice",
             WaitingFor::DigChoice { .. } => "DigChoice",

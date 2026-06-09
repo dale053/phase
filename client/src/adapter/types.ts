@@ -312,6 +312,96 @@ export type CostResume =
   | { type: "Spell"; Spell: PendingCast }
   | { type: "ManaAbility"; ManaAbility: unknown };
 
+// CR 608.2c + CR 700.2: per-mechanic payload for unified zone/manipulation
+// choices (`WaitingFor::ZoneManipulation`, mirrors `PayCostKind`).
+export type ZoneManipulationKind =
+  | { type: "Scry"; cards: ObjectId[] }
+  | {
+      type: "Dig";
+      library_owner?: PlayerId;
+      cards: ObjectId[];
+      keep_count: number;
+      up_to?: boolean;
+      selectable_cards?: ObjectId[];
+      kept_destination?: Zone | null;
+      rest_destination?: Zone | null;
+      source_id?: ObjectId | null;
+      enter_tapped?: boolean;
+    }
+  | { type: "Surveil"; cards: ObjectId[] }
+  | {
+      type: "Reveal";
+      cards: ObjectId[];
+      filter?: unknown;
+      optional?: boolean;
+      decline_runs_continuation?: boolean;
+    }
+  | {
+      type: "Search";
+      cards: ObjectId[];
+      count: number;
+      reveal?: boolean;
+      up_to?: boolean;
+      constraint?: SearchSelectionConstraint;
+      split?: SearchDestinationSplit | null;
+    }
+  | {
+      type: "SearchPartition";
+      cards: ObjectId[];
+      primary_destination: Zone;
+      primary_count: number;
+      primary_enter_tapped: boolean;
+      rest_destination: Zone;
+      source_id: ObjectId;
+    }
+  | {
+      type: "OutsideGame";
+      source_id: ObjectId;
+      choices: OutsideGameChoiceEntry[];
+      count: number;
+      reveal?: boolean;
+      up_to?: boolean;
+      destination: Zone;
+    }
+  | {
+      type: "ChooseFromZone";
+      cards: ObjectId[];
+      count: number;
+      up_to?: boolean;
+      constraint?: ChooseFromZoneConstraint | null;
+      source_id: ObjectId;
+    }
+  | {
+      type: "EffectZone";
+      cards: ObjectId[];
+      count: number;
+      min_count?: number;
+      up_to?: boolean;
+      source_id: ObjectId;
+      effect_kind: string;
+      zone: Zone;
+      destination?: Zone | null;
+      enter_tapped?: boolean;
+      enter_transformed?: boolean;
+      enters_under_player?: PlayerId | null;
+      enters_attacking?: boolean;
+      owner_library?: boolean;
+      track_exiled_by_source?: boolean;
+      count_param?: number;
+    }
+  | { type: "TopOrBottom"; object_id: ObjectId }
+  | {
+      type: "RevealUntilKept";
+      hit_card: ObjectId;
+      source_id: ObjectId;
+      accept_zone: string;
+      decline_zone: string;
+      enter_tapped: boolean;
+      enters_attacking: boolean;
+      revealed_misses: ObjectId[];
+      rest_destination: string;
+    };
+
 export type ManaColor = "White" | "Blue" | "Black" | "Red" | "Green";
 
 export type CoreType =
@@ -1097,6 +1187,7 @@ export type WaitingFor =
   | { type: "CrewVehicle"; data: { player: PlayerId; vehicle_id: ObjectId; crew_power: number; eligible_creatures: ObjectId[] } }
   | { type: "StationTarget"; data: { player: PlayerId; spacecraft_id: ObjectId; eligible_creatures: ObjectId[] } }
   | { type: "SaddleMount"; data: { player: PlayerId; mount_id: ObjectId; saddle_power: number; eligible_creatures: ObjectId[] } }
+  | { type: "ZoneManipulation"; data: { player: PlayerId; kind: ZoneManipulationKind } }
   | { type: "ScryChoice"; data: { player: PlayerId; cards: ObjectId[] } }
   | { type: "CoinFlipKeepChoice"; data: { player: PlayerId; results: boolean[]; keep_count: number } }
   | { type: "DigChoice"; data: { player: PlayerId; cards: ObjectId[]; keep_count: number; up_to?: boolean; selectable_cards?: ObjectId[]; kept_destination?: Zone | null; rest_destination?: Zone | null } }
