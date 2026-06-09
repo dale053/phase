@@ -8,9 +8,6 @@ use crate::game::conditions::{
     counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_condition,
     eval_has_city_blessing, eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn,
     eval_source_in_zone, eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
-    counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
-    eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn, eval_source_in_zone,
-    eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
 };
 use crate::game::devotion::count_devotion;
 use crate::game::filter::{matches_target_filter, FilterContext};

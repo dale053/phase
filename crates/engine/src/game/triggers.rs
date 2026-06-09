@@ -26,9 +26,6 @@ use super::conditions::{
     counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_condition,
     eval_has_city_blessing, eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn,
     eval_source_in_zone, eval_source_is_attacking, eval_source_is_tapped,
-    counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
-    eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn, eval_source_in_zone,
-    eval_source_is_attacking, eval_source_is_tapped,
 };
 use super::filter::{matches_target_filter, spell_record_matches_filter, FilterContext};
 use super::game_object::GameObject;
@@ -4242,7 +4239,6 @@ pub(crate) fn check_trigger_condition(
         }
         // CR 508.1: "if it's attacking" — true when the trigger source is in combat.attackers.
         TriggerCondition::SourceIsAttacking => {
-            eval_source_is_attacking(state, source_id.unwrap_or(ObjectId(0)))
             source_id.is_some_and(|id| eval_source_is_attacking(state, id))
         }
         // CR 702.49 + CR 702.190a + CR 603.4: "if its sneak/ninjutsu cost was paid
