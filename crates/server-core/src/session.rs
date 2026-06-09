@@ -2109,7 +2109,7 @@ mod tests {
             kept_destination: Some(Zone::Library),
             rest_destination: Some(Zone::Library),
             source_id: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
         };
 
         // Non-canonical permutation [c, a, b] — not an enumerated candidate.

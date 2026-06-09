@@ -2310,7 +2310,7 @@ fn convert_many_with_bindings(a: &Action, bindings: &VariableBindings) -> ConvRe
                     target: TargetFilter::Controller,
                     card_filter: filter_mod::cards_to_filter(cards)?,
                     count: None,
-                    random: false,
+                    selection: engine::types::ability::CardSelectionMode::Chosen,
                     choice_optional: false,
                 },
                 Effect::DiscardCard {
@@ -2339,7 +2339,7 @@ fn convert_many_with_bindings(a: &Action, bindings: &VariableBindings) -> ConvRe
                     target: TargetFilter::Controller,
                     card_filter: filter_mod::cards_to_filter(cards)?,
                     count: None,
-                    random: false,
+                    selection: engine::types::ability::CardSelectionMode::Chosen,
                     choice_optional: false,
                 },
                 Effect::ChangeZone {
@@ -2349,7 +2349,7 @@ fn convert_many_with_bindings(a: &Action, bindings: &VariableBindings) -> ConvRe
                     owner_library: false,
                     enter_transformed: false,
                     enters_under: None,
-                    enter_tapped: false,
+                    enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
@@ -2379,7 +2379,7 @@ fn convert_many_with_bindings(a: &Action, bindings: &VariableBindings) -> ConvRe
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -2394,7 +2394,7 @@ fn convert_many_with_bindings(a: &Action, bindings: &VariableBindings) -> ConvRe
                     owner_library: false,
                     enter_transformed: false,
                     enters_under: None,
-                    enter_tapped: false,
+                    enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
@@ -2771,7 +2771,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
         },
 
         // CR 701.20e + CR 608.2c: "Look at the top N cards of your library.
@@ -2824,7 +2824,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
@@ -2837,7 +2837,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
@@ -2856,7 +2856,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
@@ -2878,7 +2878,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
@@ -2983,7 +2983,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
@@ -3003,7 +3003,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
@@ -3241,7 +3241,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
@@ -3477,7 +3477,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
@@ -3599,7 +3599,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             target: TargetFilter::Controller,
             card_filter: TargetFilter::Any,
             count: None,
-            random: false,
+            selection: engine::types::ability::CardSelectionMode::Chosen,
             choice_optional: false,
         },
 
@@ -3666,7 +3666,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
                 },
             },
             target: TargetFilter::Controller,
-            random: false,
+            selection: engine::types::ability::CardSelectionMode::Chosen,
             unless_filter: None,
             filter: None,
         },
@@ -4368,7 +4368,7 @@ fn convert_look_at_top(
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
         }),
 
         // Brainstorm-style "put one into your hand and the rest on the
@@ -4386,7 +4386,7 @@ fn convert_look_at_top(
                 filter: TargetFilter::Any,
                 rest_destination: Some(Zone::Library),
                 reveal: false,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             })
         }
 
@@ -4403,7 +4403,7 @@ fn convert_look_at_top(
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             })
         }
 
@@ -4423,7 +4423,7 @@ fn convert_look_at_top(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Library),
                 reveal: true,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             })
         }
 
@@ -4439,7 +4439,7 @@ fn convert_look_at_top(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Graveyard),
                 reveal: true,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             })
         }
 
@@ -4498,7 +4498,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: None,
                 reveal: true,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsIntoGraveyard] => {
@@ -4511,7 +4511,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: None,
                 reveal: true,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutAGenericCardIntoHand, RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsIntoGraveyard] => {
@@ -4524,7 +4524,7 @@ fn convert_reveal_top_dig(
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: true,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::MayPutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsOnTheBottomOfLibraryInAnyOrder]
@@ -4538,7 +4538,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Library),
                 reveal: true,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsOnTheBottomOfLibraryInAnyOrder]
@@ -4552,7 +4552,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Library),
                 reveal: true,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             })
         }
         _ => Err(prereq(format!(
@@ -6752,8 +6752,8 @@ mod tests {
                 cost: AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false,
+                    selection: engine::types::ability::CardSelectionMode::Chosen,
+                    self_scope: engine::types::ability::DiscardSelfScope::FromHand,
                 },
             }
         ));
@@ -7118,7 +7118,7 @@ mod tests {
             Effect::ChangeZone {
                 origin: Some(Zone::Library),
                 destination: Zone::Battlefield,
-                enter_tapped: true,
+                enter_tapped: engine::types::zones::EtbTapState::Tapped,
                 ..
             }
         ));
@@ -7156,7 +7156,7 @@ mod tests {
             &effects[1],
             Effect::ChangeZone {
                 destination: Zone::Battlefield,
-                enter_tapped: true,
+                enter_tapped: engine::types::zones::EtbTapState::Tapped,
                 ..
             }
         ));
@@ -7278,7 +7278,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Any,
-                random: false,
+                selection: engine::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
