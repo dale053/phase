@@ -103,6 +103,10 @@ pub mod etb_tap_bool_compat {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(state: &EtbTapState, serializer: S) -> Result<S::Ok, S::Error> {
+        debug_assert!(
+            !state.is_untapped(),
+            "EtbTapState::Untapped is a runtime-only replacement override and must not be persisted through the legacy bool adapter"
+        );
         serializer.serialize_bool(state.is_tapped())
     }
 
