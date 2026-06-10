@@ -11868,8 +11868,6 @@ pub enum TriggerCondition {
     ControlsCommander {
         ownership: CommanderOwnership,
     },
-    /// CR 702.112a: "if ~ is renowned" — true when the source has been made renowned.
-    SourceIsRenowned,
     /// CR 702.112: True when the referenced creature has the renowned designation.
     ///   - `RenownSubject::Source` — "if ~ is renowned" (CR 702.112a, the canonical
     ///     Renown intervening-if; subject == the ability's own permanent).

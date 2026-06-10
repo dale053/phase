@@ -780,16 +780,6 @@ fn evaluate_condition_with_context(
     source_id: ObjectId,
     recipient_id: Option<ObjectId>,
 ) -> bool {
-    if let Some(shared) = condition.to_condition() {
-        return eval_condition(
-            state,
-            &shared,
-            controller,
-            source_id,
-            recipient_id,
-            SourceIsTappedEval::OnBattlefield,
-        );
-    }
     match condition {
         StaticCondition::DevotionGE { colors, threshold } => {
             count_devotion(state, controller, colors) >= *threshold

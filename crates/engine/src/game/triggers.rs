@@ -4742,11 +4742,6 @@ pub(crate) fn check_trigger_condition(
                 .and_then(|id| state.objects.get(&id))
                 .is_some_and(|obj| obj.is_renowned),
         },
-        // CR 702.112a: "if ~ is renowned" — true when the source permanent has the renowned
-        // designation. Flat alias for IsRenowned { subject: RenownSubject::Source }.
-        TriggerCondition::SourceIsRenowned => source_id
-            .and_then(|id| state.objects.get(&id))
-            .is_some_and(|obj| obj.is_renowned),
         // CR 711.2a + CR 711.2b: Level-up creature trigger gating — check counter count on source.
         // `CounterMatch::Any` sums across every counter type; `OfType(ct)` reads a single type.
         // Mirrors `StaticCondition::HasCounters` evaluation in `layers.rs`.
