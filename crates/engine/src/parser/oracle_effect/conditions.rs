@@ -2651,6 +2651,9 @@ pub(crate) fn ability_condition_to_static_condition(
         | AbilityCondition::ControllerControlsMatching { .. }
         | AbilityCondition::And { .. }
         | AbilityCondition::Or { .. } => None,
+        // Shared conditions are runtime-only wrappers constructed after parsing;
+        // they have no parse-time lowering target.
+        AbilityCondition::Shared { .. } => None,
     }
 }
 

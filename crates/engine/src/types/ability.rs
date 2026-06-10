@@ -11870,14 +11870,15 @@ pub enum TriggerCondition {
     },
     /// CR 702.112a: "if ~ is renowned" — true when the source has been made renowned.
     SourceIsRenowned,
-    ControlsCommander { ownership: CommanderOwnership },
     /// CR 702.112: True when the referenced creature has the renowned designation.
     ///   - `RenownSubject::Source` — "if ~ is renowned" (CR 702.112a, the canonical
     ///     Renown intervening-if; subject == the ability's own permanent).
     ///   - `RenownSubject::EventSubject` — "if it's renowned" (CR 702.112b; the
     ///     triggering/event creature, a creature OTHER than the source, whose
     ///     renowned designation other spells and abilities can identify).
-    IsRenowned { subject: RenownSubject },
+    IsRenowned {
+        subject: RenownSubject,
+    },
     /// CR 711.2a + CR 711.2b: Level-up creature trigger gating — true when the source has at least
     /// `minimum` counters (and at most `maximum` if specified) matching `counters`.
     /// `CounterMatch::Any` sums across every counter type on the source; `OfType(ct)`
