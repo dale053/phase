@@ -36,7 +36,6 @@ use super::ability_utils::{
     has_legal_target_assignment_for_ability, modal_choice_for_player,
     target_constraints_from_modal,
 };
-use super::casting_costs::{self, check_additional_cost_or_pay};
 use super::engine::EngineError;
 use super::functioning_abilities::active_static_definitions;
 use super::game_object::{GameObject, PreparedState, PrototypeFormState};
@@ -47,6 +46,11 @@ use super::speed::{effective_speed, set_speed};
 use super::splice;
 use super::stack;
 use super::targeting;
+use costs::check_additional_cost_or_pay;
+use costs::{self as casting_costs};
+
+pub(crate) mod costs;
+pub(crate) mod targets;
 
 const FORETELL_SPECIAL_ACTION_COST: u32 = 2;
 
@@ -361,7 +365,7 @@ fn spell_record_for_restrictions(spell_obj: &super::game_object::GameObject) -> 
         mana_value: spell_obj
             .mana_cost
             .mana_value_with_x(spell_obj.zone, spell_obj.cost_x_paid),
-        has_x_in_cost: super::casting_costs::cost_has_x(&spell_obj.mana_cost),
+        has_x_in_cost: costs::cost_has_x(&spell_obj.mana_cost),
         from_zone: spell_obj.zone,
         cast_variant: crate::types::game_state::CastingVariant::Normal,
     }
@@ -740,6 +744,7 @@ fn an_opponent_lost_life_this_turn(state: &GameState, caster: PlayerId) -> bool 
 }
 
 fn foretell_cost(obj: &crate::game::game_object::GameObject) -> Option<ManaCost> {
+    // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
     obj.keywords.iter().find_map(|keyword| match keyword {
         Keyword::Foretell(cost) => Some(cost.clone()),
         _ => None,
@@ -3051,6 +3056,7 @@ fn prepare_spell_cast_with_variant_override_inner(
 
     // Warp: when casting from hand with Keyword::Warp, use the warp mana cost.
     let warp_cost = if obj.zone == Zone::Hand {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Warp(cost) => Some(cost.clone()),
             _ => None,
@@ -3062,6 +3068,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // CR 702.109a: Dash — when casting from hand with Keyword::Dash, the dash
     // mana cost replaces the printed cost (opt-in via `variant_override`).
     let dash_cost = if obj.zone == Zone::Hand {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Dash(cost) => Some(cost.clone()),
             _ => None,
@@ -3090,6 +3097,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // spectacle mana cost replaces the printed cost (opt-in via `variant_override`,
     // gated on an opponent having lost life this turn at offer time).
     let spectacle_cost = if obj.zone == Zone::Hand {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Spectacle(cost) => Some(cost.clone()),
             _ => None,
@@ -3108,6 +3116,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // Harmonize: use harmonize mana cost when casting from graveyard.
     // Tap cost reduction is handled in casting_costs::pay_and_push_adventure.
     let harmonize_cost = if obj.zone == Zone::Graveyard {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Harmonize(cost) => Some(cost.clone()),
             _ => None,
@@ -3296,6 +3305,7 @@ fn prepare_spell_cast_with_variant_override_inner(
             })
             .or_else(|| {
                 obj.back_face.as_ref().and_then(|front_face| {
+                    // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
                     front_face.keywords.iter().find_map(|k| match k {
                         crate::types::keywords::Keyword::MoreThanMeetsTheEye(cost) => {
                             Some(cost.clone())
@@ -3354,6 +3364,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // `prepare_spell_cast_with_variant_override` (which holds an immutable
     // borrow).
     let bestow_cost = if casting_variant == CastingVariant::Bestow {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Bestow(cost) => Some(cost.clone()),
             _ => None,
@@ -3368,6 +3379,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // non-Human creature you own, CR 702.140a) is attached separately in
     // `continue_with_prepared` because it needs a `&mut GameState` handle.
     let mutate_cost = if casting_variant == CastingVariant::Mutate {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Mutate(cost) => Some(cost.clone()),
             _ => None,
@@ -3383,6 +3395,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // This is the sole awaken-cost substitution site; the standard resolver pays
     // the substituted cost and no call site inspects the awaken cost.
     let awaken_payload = if casting_variant == CastingVariant::Awaken {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Awaken { count, cost } => Some((*count, cost.clone())),
             _ => None,
@@ -3398,6 +3411,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // applied separately by `handle_cleave_cost_choice` because it requires a
     // `&mut GameState` handle and must outlive this immutable-borrow function.
     let cleave_cost = if casting_variant == CastingVariant::Cleave {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Cleave(cost) => Some(cost.clone()),
             _ => None,
@@ -3410,6 +3424,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // impending mana cost taken from `Keyword::Impending { cost, .. }`.
     // Mirrors Overload / Bestow / Cleave / Awaken cost substitution.
     let impending_cost = if casting_variant == CastingVariant::Impending {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Impending { cost, .. } => Some(cost.clone()),
             _ => None,
@@ -3421,6 +3436,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // `variant_override = Some(CastingVariant::Prototype)`), substitute the
     // prototype mana cost carried by the keyword payload.
     let prototype_cost = if casting_variant == CastingVariant::Prototype {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Prototype { cost, .. } => Some(cost.clone()),
             _ => None,
@@ -3487,6 +3503,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // on the hand object. Only honored when the caller explicitly opted into the
     // Miracle variant via the reveal prompt.
     let miracle_cost = if casting_variant == CastingVariant::Miracle {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Miracle(cost) => Some(cost.clone()),
             _ => None,
@@ -3495,6 +3512,7 @@ fn prepare_spell_cast_with_variant_override_inner(
         None
     };
     let madness_cost = if casting_variant == CastingVariant::Madness {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         obj.keywords.iter().find_map(|k| match k {
             crate::types::keywords::Keyword::Madness(cost) => Some(cost.clone()),
             _ => None,
@@ -5358,6 +5376,7 @@ pub fn handle_impending_cost_choice_with_payment_mode(
 fn prototype_form_from_object(
     obj: &crate::game::game_object::GameObject,
 ) -> Option<PrototypeFormState> {
+    // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
     obj.keywords.iter().find_map(|keyword| {
         let Keyword::Prototype {
             cost,
@@ -6974,6 +6993,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // present a choice. Auto-skip when only one cost is viable.
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand {
+            // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
             if let Some(warp_cost) = obj.keywords.iter().find_map(|k| match k {
                 crate::types::keywords::Keyword::Warp(cost) => Some(cost.clone()),
                 _ => None,
@@ -7147,6 +7167,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // affordable, present the choice; auto-route when only dash is payable.
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand {
+            // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
             if let Some(dash_cost) = obj.keywords.iter().find_map(|k| match k {
                 crate::types::keywords::Keyword::Dash(cost) => Some(cost.clone()),
                 _ => None,
@@ -7253,6 +7274,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // opt-in flow (spectacle has no resolution riders).
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand && an_opponent_lost_life_this_turn(state, player) {
+            // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
             if let Some(spectacle_cost) = obj.keywords.iter().find_map(|k| match k {
                 crate::types::keywords::Keyword::Spectacle(cost) => Some(cost.clone()),
                 _ => None,
@@ -7304,6 +7326,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // routing needed is when the player picks the overload cost.
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand {
+            // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
             if let Some(overload_cost) = obj.keywords.iter().find_map(|k| match k {
                 crate::types::keywords::Keyword::Overload(cost) => Some(cost.clone()),
                 _ => None,
@@ -7360,6 +7383,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // other hand-zone alternative-cost keyword (Overload, Cleave, Evoke, ...).
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand {
+            // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
             if let Some(mtmte_cost) = obj.keywords.iter().find_map(|k| match k {
                 crate::types::keywords::Keyword::MoreThanMeetsTheEye(cost) => Some(cost.clone()),
                 _ => None,
@@ -7414,6 +7438,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // an object whose alternate ability set was not parsed.
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand && obj.cleave_variant.is_some() {
+            // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
             if let Some(cleave_cost) = obj.keywords.iter().find_map(|k| match k {
                 crate::types::keywords::Keyword::Cleave(cost) => Some(cost.clone()),
                 _ => None,
@@ -7470,6 +7495,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // class and mirrors the other alt-cost prompts.
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand {
+            // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
             if let Some(bestow_cost) = obj.keywords.iter().find_map(|k| match k {
                 crate::types::keywords::Keyword::Bestow(cost) => Some(cost.clone()),
                 _ => None,
@@ -7542,6 +7568,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // `FilterProp::Owned { controller: You }` — no new filter prop / variant.
     if let Some(obj) = state.objects.get(&object_id) {
         if matches!(obj.zone, Zone::Hand | Zone::Command) {
+            // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
             if let Some(mutate_cost) = obj.keywords.iter().find_map(|k| match k {
                 crate::types::keywords::Keyword::Mutate(cost) => Some(cost.clone()),
                 _ => None,
@@ -7604,6 +7631,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // `has_legal_creature_target` gate).
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand {
+            // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
             if let Some(awaken_cost) = obj.keywords.iter().find_map(|k| match k {
                 crate::types::keywords::Keyword::Awaken { cost, .. } => Some(cost.clone()),
                 _ => None,
@@ -7663,6 +7691,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // proceeds as a normal creature cast with no time counters.
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand {
+            // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
             if let Some(impending_cost) = obj.keywords.iter().find_map(|k| match k {
                 crate::types::keywords::Keyword::Impending { cost, .. } => Some(cost.clone()),
                 _ => None,
@@ -7997,6 +8026,7 @@ fn continue_with_prepared(
     let obj = state.objects.get(&prepared.object_id).unwrap();
     let is_aura = obj.card_types.subtypes.iter().any(|s| s == "Aura");
     if is_aura {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         let enchant_filter = obj.keywords.iter().find_map(|k| {
             if let crate::types::keywords::Keyword::Enchant(filter) = k {
                 Some(filter.clone())
@@ -8590,6 +8620,7 @@ pub fn spell_has_legal_targets(
     // Aura spells target via the Enchant keyword rather than the effect's target field.
     let is_aura = obj.card_types.subtypes.iter().any(|s| s == "Aura");
     if is_aura {
+        // allow-raw-authority: extracting keyword cost parameter — no authority helper for parameterized keyword data
         let enchant_filter = obj.keywords.iter().find_map(|k| {
             if let crate::types::keywords::Keyword::Enchant(filter) = k {
                 Some(filter.clone())
@@ -9011,8 +9042,7 @@ fn can_cast_prepared_now(
     }
 
     if (prepared.modal.is_some() || spell_has_legal_targets(state, obj, player))
-        && super::casting_costs::payable_spell_alternative_cost(state, player, prepared.object_id)
-            .is_some()
+        && costs::payable_spell_alternative_cost(state, player, prepared.object_id).is_some()
     {
         return true;
     }
@@ -9063,7 +9093,7 @@ fn can_pay_mana_cost_after_auto_tap_with_context(
     excluded_sources: &HashSet<ObjectId>,
 ) -> bool {
     let mut tap_events: Vec<crate::types::events::GameEvent> = Vec::new();
-    super::casting_costs::auto_tap_mana_sources_with_context_excluding(
+    costs::auto_tap_mana_sources_with_context_excluding(
         &mut simulated,
         player,
         cost,
@@ -9357,7 +9387,7 @@ pub(super) fn can_feasibly_pay_mana_cost(
     // `{X}{C}{C}` with only Eldrazi Temple was treated as uncastable). X only
     // adds generic mana, so X=0 is the cheapest concrete affordability probe.
     if let Some(sid) = source_id {
-        if super::casting_costs::cost_has_x(cost) {
+        if costs::cost_has_x(cost) {
             let mut concrete = cost.clone();
             concrete.concretize_x(0);
             return can_feasibly_pay_mana_cost_without_x(state, player, Some(sid), &concrete);
@@ -9508,7 +9538,7 @@ pub(super) fn can_pay_effect_mana_cost_after_auto_tap(
 
     let mut tap_events: Vec<crate::types::events::GameEvent> = Vec::new();
     let effect_ctx = PaymentContext::Effect;
-    super::casting_costs::auto_tap_mana_sources_with_context(
+    costs::auto_tap_mana_sources_with_context(
         &mut simulated,
         player,
         cost,
@@ -9541,9 +9571,7 @@ pub(super) fn can_pay_effect_mana_cost_after_auto_tap(
 }
 
 // Target/mode selection handlers are in casting_targets module.
-pub(crate) use super::casting_targets::{
-    handle_choose_target, handle_select_modes, handle_select_targets,
-};
+pub(crate) use targets::{handle_choose_target, handle_select_modes, handle_select_targets};
 
 /// Activate an ability from a permanent on the battlefield.
 /// Check whether an ability cost includes a tap component (either directly or
@@ -9809,7 +9837,7 @@ pub(super) fn pay_effect_mana_cost(
 
     let effect_ctx = PaymentContext::Effect;
     let events_before = events.len();
-    super::casting_costs::auto_tap_mana_sources_with_context(
+    costs::auto_tap_mana_sources_with_context(
         state,
         player,
         cost,
@@ -9912,7 +9940,7 @@ fn auto_tap_and_pay_cost_excluding(
     excluded_sources: &HashSet<ObjectId>,
 ) -> Result<Vec<crate::types::mana::ManaUnit>, EngineError> {
     let events_before = events.len();
-    super::casting_costs::auto_tap_mana_sources_with_context_excluding(
+    costs::auto_tap_mana_sources_with_context_excluding(
         state,
         player,
         cost,
@@ -11887,7 +11915,7 @@ pub fn handle_activate_ability(
                 source_id,
             });
             // CR 702.142b: Emit additional event when a boast ability is activated.
-            super::casting_targets::emit_keyword_ability_event_if_tagged(
+            targets::emit_keyword_ability_event_if_tagged(
                 state,
                 source_id,
                 ability_index,
@@ -11975,13 +12003,7 @@ pub fn handle_activate_ability(
         source_id,
     });
     // CR 702.142b: Emit additional event when a boast ability is activated.
-    super::casting_targets::emit_keyword_ability_event_if_tagged(
-        state,
-        source_id,
-        ability_index,
-        player,
-        events,
-    );
+    targets::emit_keyword_ability_event_if_tagged(state, source_id, ability_index, player, events);
 
     state.priority_passes.clear();
     state.priority_pass_count = 0;
@@ -12080,7 +12102,7 @@ pub fn handle_cancel_cast(
 }
 
 // Cost payment handlers are in casting_costs module.
-pub(crate) use super::casting_costs::{
+pub(crate) use costs::{
     handle_activation_cost_one_of_choice, handle_discard_for_cost, handle_return_to_hand_for_cost,
     handle_sacrifice_for_cost,
 };
@@ -12539,7 +12561,7 @@ fn cant_cast_filter_matches(
                 keywords: spell_obj.keywords.clone(),
                 colors: spell_obj.color.clone(),
                 mana_value: spell_obj.mana_cost.mana_value(),
-                has_x_in_cost: super::casting_costs::cost_has_x(&spell_obj.mana_cost),
+                has_x_in_cost: costs::cost_has_x(&spell_obj.mana_cost),
                 from_zone: spell_obj.zone,
                 cast_variant: crate::types::game_state::CastingVariant::Normal,
             };
@@ -12591,7 +12613,7 @@ fn is_blocked_by_per_turn_cast_limit(
                     keywords: spell_obj.keywords.clone(),
                     colors: spell_obj.color.clone(),
                     mana_value: spell_obj.mana_cost.mana_value(),
-                    has_x_in_cost: super::casting_costs::cost_has_x(&spell_obj.mana_cost),
+                    has_x_in_cost: costs::cost_has_x(&spell_obj.mana_cost),
                     from_zone: spell_obj.zone,
                     cast_variant: crate::types::game_state::CastingVariant::Normal,
                 };
@@ -16325,7 +16347,7 @@ mod tests {
     /// Waterbend/Convoke reaches `ManaPayment` with the mode intact.
     #[test]
     fn x_cost_preserves_convoke_mode_through_choice() {
-        use crate::game::casting_costs::enter_payment_step;
+        use crate::game::casting::costs::enter_payment_step;
         use crate::types::ability::QuantityRef;
 
         let mut state = setup_game_at_main_phase();
@@ -26239,7 +26261,7 @@ mod tests {
             &mut events,
         );
 
-        let waiting_for = crate::game::casting_costs::pay_and_push(
+        let waiting_for = crate::game::casting::costs::pay_and_push(
             &mut state,
             PlayerId(0),
             object_id,
@@ -30757,7 +30779,7 @@ mod tests {
         assert!(!cards.contains(&nonland));
 
         let mut events = Vec::new();
-        let resumed = super::casting_costs::handle_discard_for_cost(
+        let resumed = costs::handle_discard_for_cost(
             &mut state,
             PlayerId(0),
             *pending_cast,
@@ -30833,7 +30855,7 @@ mod tests {
             } => (cards, pending_cast),
             other => panic!("expected PayCost Discard, got {other:?}"),
         };
-        super::casting_costs::handle_discard_for_cost(
+        costs::handle_discard_for_cost(
             &mut state,
             PlayerId(0),
             *pending_cast,
@@ -30986,7 +31008,7 @@ mod tests {
         );
 
         let mut events = Vec::new();
-        let resumed = super::casting_costs::handle_discard_for_cost(
+        let resumed = costs::handle_discard_for_cost(
             &mut state,
             PlayerId(0),
             *pending_cast,
@@ -31033,7 +31055,7 @@ mod tests {
             } => (cards, pending_cast),
             other => panic!("expected PayCost Discard, got {other:?}"),
         };
-        super::casting_costs::handle_discard_for_cost(
+        costs::handle_discard_for_cost(
             &mut state,
             PlayerId(0),
             *pending_cast,
@@ -32009,7 +32031,7 @@ mod tests {
         };
 
         let chosen: Vec<ObjectId> = exile_cards.iter().copied().take(3).collect();
-        let waiting2 = super::casting_costs::handle_exile_for_cost(
+        let waiting2 = costs::handle_exile_for_cost(
             &mut state,
             PlayerId(0),
             crate::types::zones::ExileCostSourceZone::Graveyard,
@@ -32041,7 +32063,7 @@ mod tests {
         );
 
         let choices = vec![crate::types::game_state::ShardChoice::PayLife];
-        super::casting_costs::finalize_mana_payment_with_phyrexian_choices(
+        costs::finalize_mana_payment_with_phyrexian_choices(
             &mut state,
             PlayerId(0),
             &choices,
@@ -33486,7 +33508,7 @@ mod tests {
         }
         // Submit PayMana choice via direct resume helper.
         let choices = vec![crate::types::game_state::ShardChoice::PayMana];
-        let result = super::casting_costs::finalize_mana_payment_with_phyrexian_choices(
+        let result = costs::finalize_mana_payment_with_phyrexian_choices(
             &mut state,
             PlayerId(0),
             &choices,
@@ -33645,7 +33667,7 @@ mod tests {
             crate::types::game_state::ShardChoice::PayMana,
             crate::types::game_state::ShardChoice::PayLife,
         ];
-        let result = super::casting_costs::finalize_mana_payment_with_phyrexian_choices(
+        let result = costs::finalize_mana_payment_with_phyrexian_choices(
             &mut state,
             PlayerId(0),
             &choices,
@@ -34493,7 +34515,7 @@ mod tests {
             }
             let life_before = state.players[0].life;
             let choices = vec![crate::types::game_state::ShardChoice::PayLife];
-            super::super::casting_costs::finalize_mana_payment_with_phyrexian_choices(
+            super::costs::finalize_mana_payment_with_phyrexian_choices(
                 &mut state,
                 PlayerId(0),
                 &choices,
@@ -41866,7 +41888,7 @@ mod tests {
         }
 
         let cost = state.objects[&command].mana_cost.clone();
-        let max_x = super::casting_costs::max_x_value_excluding(
+        let max_x = costs::max_x_value_excluding(
             &state,
             PlayerId(0),
             &cost,

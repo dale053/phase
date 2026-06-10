@@ -1,8 +1,9 @@
+use crate::game::casting;
+use crate::game::casting::costs as casting_costs;
 use crate::game::life_costs::{can_pay_life_cost, pay_life_as_cost, PayLifeCostResult};
 use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::speed::{effective_speed, set_speed};
 use crate::game::targeting::resolve_effect_player_ref;
-use crate::game::{casting, casting_costs};
 use crate::types::ability::{
     AbilityCost, Effect, EffectKind, PaymentCost, QuantityExpr, QuantityRef,
 };

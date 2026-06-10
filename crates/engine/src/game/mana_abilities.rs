@@ -465,7 +465,7 @@ fn complete_mana_ability_activation(
     events: &mut Vec<GameEvent>,
 ) {
     super::restrictions::record_ability_activation(state, source_id, ability_index);
-    super::casting_targets::emit_keyword_ability_event_if_tagged(
+    super::casting::targets::emit_keyword_ability_event_if_tagged(
         state,
         source_id,
         ability_index,

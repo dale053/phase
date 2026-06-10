@@ -10,8 +10,6 @@ pub mod blitz;
 mod blitz_tests;
 pub mod bracket_estimate;
 pub mod casting;
-pub(crate) mod casting_costs;
-pub(crate) mod casting_targets;
 pub mod cipher;
 // Tests for `cipher` live in a sibling file (declared here, not in `cipher.rs`,
 // so `cipher.rs` stays implementation-only).

@@ -9,11 +9,12 @@ use super::ability_utils::{
     build_target_slots_labelled, flatten_targets_in_chain, random_select_targets_for_ability,
     record_modal_mode_choices, target_constraints_from_modal, validate_modal_indices,
 };
+use super::casting;
+use super::casting::costs as casting_costs;
 use super::engine::EngineError;
 use super::engine_stack;
 use super::restrictions;
 use super::triggers;
-use super::{casting, casting_costs};
 
 pub(super) fn handle_ability_mode_choice(
     state: &mut GameState,
@@ -284,7 +285,7 @@ fn handle_activated_mode_choice(
     });
     // CR 702.142b: Emit additional event when a boast ability is activated.
     if let Some(index) = ability_index {
-        super::casting_targets::emit_keyword_ability_event_if_tagged(
+        super::casting::targets::emit_keyword_ability_event_if_tagged(
             state, source_id, index, player, events,
         );
     }

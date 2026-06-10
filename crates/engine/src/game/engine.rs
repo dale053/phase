@@ -22,7 +22,7 @@ use super::ability_utils::{
     has_legal_target_assignment_for_ability, modal_choice_for_player,
 };
 use super::casting;
-use super::casting_costs;
+use super::casting::costs as casting_costs;
 use super::effects;
 use super::engine_casting;
 use super::engine_combat;

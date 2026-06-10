@@ -22,7 +22,7 @@
 
 use crate::game::ability_utils::{append_to_sub_chain, build_resolved_from_def};
 use crate::game::casting::combined_spell_ability_def;
-use crate::game::casting_costs::begin_deferred_target_selection;
+use crate::game::casting::costs::begin_deferred_target_selection;
 use crate::game::engine::EngineError;
 use crate::game::game_object::GameObject;
 use crate::types::ability::{CastTimingPermission, ResolvedAbility};

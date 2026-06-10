@@ -2073,7 +2073,7 @@ fn spell_cast_record_from_object(spell_obj: &GameObject) -> SpellCastRecord {
         mana_value: spell_obj
             .mana_cost
             .mana_value_with_x(spell_obj.zone, spell_obj.cost_x_paid),
-        has_x_in_cost: crate::game::casting_costs::cost_has_x(&spell_obj.mana_cost),
+        has_x_in_cost: crate::game::casting::costs::cost_has_x(&spell_obj.mana_cost),
         from_zone: spell_obj.zone,
         cast_variant: crate::types::game_state::CastingVariant::Normal,
     }
@@ -2797,7 +2797,7 @@ fn matches_filter_prop(
         // CR 107.3 + CR 202.1: "spell with {X} in its mana cost" — inspects the
         // printed mana cost for an `{X}` shard. Applies to spells on the stack
         // and to any live-object evaluation path (e.g. static-ability filters).
-        FilterProp::HasXInManaCost => crate::game::casting_costs::cost_has_x(&obj.mana_cost),
+        FilterProp::HasXInManaCost => crate::game::casting::costs::cost_has_x(&obj.mana_cost),
         // CR 605.1: Delegate to the single mana-ability classifier instead of
         // duplicating the definition at the filter layer.
         FilterProp::HasManaAbility => obj

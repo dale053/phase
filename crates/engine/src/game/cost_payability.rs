@@ -479,7 +479,7 @@ impl AbilityCost {
                 }
             }
             AbilityCost::Behold { count, filter, .. } => {
-                super::casting_costs::eligible_behold_choices(state, player, source, filter).len()
+                super::casting::costs::eligible_behold_choices(state, player, source, filter).len()
                     >= *count as usize
             }
             // CR 601.2b: Every sub-cost must be payable. When the composite

@@ -552,7 +552,8 @@ pub(super) fn handle_replacement_choice(
             if matches!(waiting_for, WaitingFor::Priority { .. })
                 && (state.pending_cast.is_some() || state.pending_discard_for_cost.is_some())
             {
-                waiting_for = super::casting_costs::resume_interrupted_cost_payment(state, events)?;
+                waiting_for =
+                    super::casting::costs::resume_interrupted_cost_payment(state, events)?;
             }
 
             Ok(waiting_for)

@@ -201,7 +201,7 @@ pub fn record_spell_cast_from_zone(
         // CR 107.3 + CR 601.2b: Capture X-in-cost at record time so later
         // trigger-filter evaluation (e.g. "your first spell with {X} in its
         // mana cost each turn") does not need to re-examine the spell object.
-        has_x_in_cost: crate::game::casting_costs::cost_has_x(&obj.mana_cost),
+        has_x_in_cost: crate::game::casting::costs::cost_has_x(&obj.mana_cost),
         from_zone,
         // CR 702.185c: Capture the alternative-cast variant so per-turn
         // spell-history conditions ("a spell was warped this turn") can

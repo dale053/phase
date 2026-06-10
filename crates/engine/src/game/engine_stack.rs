@@ -9,7 +9,7 @@ use super::ability_utils::{
     assign_selected_slots_in_chain, assign_targets_in_chain, choose_target_for_ability,
     flatten_targets_in_chain, validate_selected_targets_for_ability, TargetSelectionAdvance,
 };
-use super::casting_targets::extract_distribution_total;
+use super::casting::targets::extract_distribution_total;
 use super::effects;
 use super::engine::{resume_pending_continuation_if_priority, EngineError};
 use super::triggers::PendingTrigger;

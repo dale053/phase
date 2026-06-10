@@ -9,21 +9,21 @@ use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
 use crate::types::player::PlayerId;
 
-use super::ability_utils::{
+use super::super::ability_utils::{
     ability_target_legality_needs_chosen_x, assign_selected_slots_in_chain,
     assign_targets_in_chain, auto_select_targets_for_ability, begin_target_selection_for_ability,
     build_chained_resolved, build_target_slots_labelled, choose_target_for_ability,
     flatten_targets_in_chain, random_select_targets_for_ability, validate_modal_indices,
     validate_selected_targets_for_ability, TargetSelectionAdvance,
 };
-use super::casting::{emit_targeting_events, pay_ability_cost_for_activation};
-use super::casting_costs::{
+use super::super::engine::EngineError;
+use super::super::restrictions;
+use super::super::stack;
+use super::costs::{
     cost_has_x, drain_deferred_triggers_after_stack_object_announcement, enter_payment_step,
     finish_pending_cast_cost_or_pay,
 };
-use super::engine::EngineError;
-use super::restrictions;
-use super::stack;
+use super::{emit_targeting_events, pay_ability_cost_for_activation};
 
 /// Handle mode selection for a modal spell.
 ///
@@ -128,7 +128,7 @@ pub(crate) fn handle_select_modes(
     }
 
     // Check for targeting on the combined ability
-    super::layers::flush_layers(state);
+    super::super::layers::flush_layers(state);
 
     // CR 700.2 / CR 601.2b: Build slots and their per-mode display labels
     // together against the SAME post-flush state, so `mode_labels.len()` can
@@ -467,11 +467,9 @@ fn pay_activation_costs_after_target_selection(
         let excluded_sources = pending
             .activation_cost
             .as_ref()
-            .map(|cost| {
-                super::casting::ability_mana_payment_excluded_sources(cost, pending.object_id)
-            })
+            .map(|cost| super::ability_mana_payment_excluded_sources(cost, pending.object_id))
             .unwrap_or_default();
-        super::casting::pay_ability_mana_cost_excluding(
+        super::pay_ability_mana_cost_excluding(
             state,
             player,
             pending.object_id,
@@ -483,19 +481,19 @@ fn pay_activation_costs_after_target_selection(
 
     if let Some(ref activation_cost) = pending.activation_cost {
         let should_record_loyalty = matches!(activation_cost, AbilityCost::Loyalty { .. })
-            && super::planeswalker::can_activate_loyalty_ability(
+            && super::super::planeswalker::can_activate_loyalty_ability(
                 state,
                 pending.object_id,
                 player,
                 ability_index,
             );
-        super::casting::stamp_self_ref_discard_cost_paid_object(
+        super::stamp_self_ref_discard_cost_paid_object(
             state,
             pending.object_id,
             &mut assigned_ability,
             activation_cost,
         );
-        if let super::casting::AbilityCostPaymentOutcome::Paused { remaining_cost } =
+        if let super::AbilityCostPaymentOutcome::Paused { remaining_cost } =
             pay_ability_cost_for_activation(
                 state,
                 player,
@@ -511,7 +509,7 @@ fn pay_activation_costs_after_target_selection(
             return Ok(Some(state.waiting_for.clone()));
         }
         if should_record_loyalty {
-            super::planeswalker::record_loyalty_activation(state, pending.object_id, player);
+            super::super::planeswalker::record_loyalty_activation(state, pending.object_id, player);
         }
     }
 
@@ -559,7 +557,7 @@ fn escalate_cost_for_selected_modes(
         return None;
     }
 
-    let cost = super::casting::effective_spell_keywords(state, player, pending.object_id)
+    let cost = super::effective_spell_keywords(state, player, pending.object_id)
         .into_iter()
         .find_map(|keyword| match keyword {
             Keyword::Escalate(cost) => Some(cost),
@@ -596,7 +594,7 @@ pub(super) fn extract_fixed_distribution_total(effect: &Effect) -> Option<u32> {
 }
 
 /// CR 601.2d + CR 603.3d: Resolve the distribution pool for damage/counter division.
-pub(super) fn extract_distribution_total(
+pub(in crate::game) fn extract_distribution_total(
     state: &GameState,
     ability: &ResolvedAbility,
     effect: &Effect,
@@ -610,7 +608,8 @@ pub(super) fn extract_distribution_total(
         _ => return None,
     };
     let (inner, _) = count_expr.peel_up_to();
-    let total = super::quantity::resolve_quantity_with_targets(state, inner, ability).max(0) as u32;
+    let total =
+        super::super::quantity::resolve_quantity_with_targets(state, inner, ability).max(0) as u32;
     (total > 0).then_some(total)
 }
 
@@ -646,8 +645,8 @@ pub(crate) fn emit_keyword_ability_event_if_tagged(
             });
             return;
         }
-        let is_mana_ability =
-            ability_tag == AbilityTag::Exhaust && super::mana_abilities::is_mana_ability(def);
+        let is_mana_ability = ability_tag == AbilityTag::Exhaust
+            && super::super::mana_abilities::is_mana_ability(def);
         events.push(GameEvent::KeywordAbilityActivated {
             ability_tag,
             player_id: player,

@@ -175,7 +175,7 @@ pub(crate) fn handle_choice(
             let mut pending = pending_cast.as_ref().clone();
             pending.ability.context.additional_cost_paid = true;
             let base_cost = pending.base_cost.clone();
-            super::super::casting_costs::pay_and_push(
+            super::super::casting::costs::pay_and_push(
                 state,
                 player,
                 pending.object_id,
