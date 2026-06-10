@@ -71,6 +71,34 @@ fn runtime_granted_cycling_abilities(
         .collect()
 }
 
+/// CR 604.1 (seam 4: activated-ability-on-grant): synthesize graveyard activated
+/// abilities (Encore, Scavenge) for keywords granted to a graveyard card by a
+/// static. The `AddKeyword` layer seam installs only the keyword + triggers, so a
+/// granted graveyard activated keyword carries no activatable ability without
+/// this on-the-fly synthesis. Mirrors `runtime_granted_cycling_abilities`: only
+/// keywords present in the *effective* (granted-inclusive) set but NOT printed on
+/// the card are synthesized, so a printed Encore/Scavenge ability (already in
+/// `obj.abilities`) is never double-counted.
+fn runtime_granted_graveyard_activated_abilities(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Vec<AbilityDefinition> {
+    let Some(obj) = state.objects.get(&source_id) else {
+        return Vec::new();
+    };
+    if obj.zone != Zone::Graveyard {
+        return Vec::new();
+    }
+
+    crate::game::off_zone_characteristics::effective_off_zone_keywords(state, source_id)
+        .into_iter()
+        .filter(|keyword| !obj.base_keywords.iter().any(|printed| printed == keyword))
+        .filter_map(|keyword| {
+            crate::database::synthesis::graveyard_activated_ability_for_keyword(&keyword)
+        })
+        .collect()
+}
+
 pub fn activated_ability_definitions(
     state: &GameState,
     source_id: ObjectId,
@@ -84,6 +112,9 @@ pub fn activated_ability_definitions(
     abilities.extend(
         runtime_granted_cycling_abilities(state, source_id)
             .into_iter()
+            .chain(runtime_granted_graveyard_activated_abilities(
+                state, source_id,
+            ))
             .enumerate()
             .map(|(offset, ability)| (printed_len + offset, ability)),
     );
@@ -101,8 +132,14 @@ fn activation_ability_definition(
     }
 
     let offset = ability_index.checked_sub(obj.abilities.len())?;
+    // Must match the append order in `activated_ability_definitions`: printed
+    // abilities first, then runtime-granted cycling, then runtime-granted
+    // graveyard activated (Encore/Scavenge).
     runtime_granted_cycling_abilities(state, source_id)
         .into_iter()
+        .chain(runtime_granted_graveyard_activated_abilities(
+            state, source_id,
+        ))
         .nth(offset)
 }
 
@@ -478,12 +515,13 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
 
     // CR 715.3d + CR 400.7i: Cards in exile with casting permissions are
     // castable by their owner, except PlayFromExile binds to the player the
-    // resolving effect granted the permission to.
+    // resolving effect granted the permission to. CR 305.1 land exclusion lives
+    // in `exile_object_castable_by_permission`.
     objects.extend(state.exile.iter().copied().filter(|&obj_id| {
         state
             .objects
             .get(&obj_id)
-            .is_some_and(|obj| has_exile_cast_permission(state, obj, player, state.turn_number))
+            .is_some_and(|obj| exile_object_castable_by_permission(state, obj, player))
     }));
 
     // CR 601.2a + CR 611.2a: Opponent's exiled cards with an alt-cost
@@ -1190,6 +1228,25 @@ fn has_exile_cast_permission(
         || exile_cast_permission_source(state, player, obj.id).is_some()
 }
 
+/// CR 305.1 + CR 601.2a: Lands in exile may be played by permissions that say
+/// "play", but they never enter the spell-cast path.
+fn exile_object_can_enter_cast_path(obj: &GameObject) -> bool {
+    obj.zone == Zone::Exile
+        && !obj
+            .card_types
+            .core_types
+            .contains(&crate::types::card_type::CoreType::Land)
+}
+
+fn exile_object_castable_by_permission(
+    state: &GameState,
+    obj: &GameObject,
+    player: PlayerId,
+) -> bool {
+    exile_object_can_enter_cast_path(obj)
+        && has_exile_cast_permission(state, obj, player, state.turn_number)
+}
+
 pub(super) fn cast_permission_constraint_allows_cast(
     state: &GameState,
     obj: &crate::game::game_object::GameObject,
@@ -1715,19 +1772,7 @@ fn exile_objects_castable_by_permission(
             let Some(obj) = state.objects.get(&exiled_id) else {
                 continue;
             };
-            if obj.zone != Zone::Exile {
-                continue;
-            }
-            // CR 305.1 + CR 116.1: Land cards are never offered through the
-            // cast path — they are "played", not "cast". For `Play` sources
-            // (The Matrix of Time) lands are surfaced via
-            // `exile_lands_playable_by_permission`; for `Cast` sources lands
-            // are never eligible.
-            if obj
-                .card_types
-                .core_types
-                .contains(&crate::types::card_type::CoreType::Land)
-            {
+            if !exile_object_can_enter_cast_path(obj) {
                 continue;
             }
             if super::filter::matches_target_filter(state, exiled_id, source.filter, &ctx) {
@@ -1770,7 +1815,7 @@ pub(crate) fn exile_cast_permission_source(
     exiled_id: ObjectId,
 ) -> Option<(ObjectId, CastFrequency, ExileCastCost)> {
     let obj = state.objects.get(&exiled_id)?;
-    if obj.zone != Zone::Exile {
+    if !exile_object_can_enter_cast_path(obj) {
         return None;
     }
     // Same empty-pool fast exit as `exile_objects_castable_by_permission`: with
@@ -1787,17 +1832,6 @@ pub(crate) fn exile_cast_permission_source(
         // CR 117.1c: A `YourTurnOnly` permission does not authorize a cast
         // outside the controller's turn.
         if !exile_permission_timing_active(state, &source, player) {
-            return None;
-        }
-        // CR 305.1 + CR 116.1: Lands are played, not cast — the cast-finalize
-        // path never authorizes a land here. The land-play path
-        // (`exile_lands_playable_by_permission`) admits lands for `Play`
-        // sources.
-        if obj
-            .card_types
-            .core_types
-            .contains(&crate::types::card_type::CoreType::Land)
-        {
             return None;
         }
         let pool = exile_permission_pool(state, &source);
@@ -2242,6 +2276,18 @@ fn cast_free_origin_admits_object(
     }
 }
 
+/// CR 114.4: `CastFromHandFree` granting sources function on the battlefield
+/// (Omniscience, Zaffai, Dracogenesis) and from the command zone when they are
+/// emblems (Tamiyo, Field Researcher). `active_static_definitions` applies the
+/// CR 113.6b opt-in gate for non-emblem command-zone objects.
+fn iter_cast_free_permission_source_ids(state: &GameState) -> impl Iterator<Item = ObjectId> + '_ {
+    state
+        .battlefield
+        .iter()
+        .chain(state.command_zone.iter())
+        .copied()
+}
+
 fn cast_free_permission_from_source(
     state: &GameState,
     player: PlayerId,
@@ -2284,7 +2330,7 @@ pub(crate) fn hand_cast_free_permission_source(
     player: PlayerId,
     obj: &crate::game::game_object::GameObject,
 ) -> Option<(ObjectId, CastFrequency)> {
-    state.battlefield.iter().find_map(|&src_id| {
+    iter_cast_free_permission_source_ids(state).find_map(|src_id| {
         cast_free_permission_from_source(state, player, obj, src_id)
             .map(|frequency| (src_id, frequency))
     })
@@ -2747,10 +2793,12 @@ fn casting_variant_candidates(
 
     // CR 702.152a: Blitz is an opt-in alternative cost from hand; surface it as a
     // candidate so the gate offers it (and so it is reachable when the printed
-    // cost is unaffordable).
+    // cost is unaffordable). Read the *effective* spell keywords so a Blitz cost
+    // granted by a static (CR 604.1) is honored, not just printed Blitz.
+    // CR 702.152b: only one Blitz may be applied to a spell, so the dedup-by-kind
+    // `effective_spell_keywords` is the correct (single-instance) collector here.
     if obj.zone == Zone::Hand
-        && obj
-            .keywords
+        && effective_spell_keywords(state, player, object_id)
             .iter()
             .any(|k| matches!(k, crate::types::keywords::Keyword::Blitz(_)))
     {
@@ -3023,12 +3071,17 @@ fn prepare_spell_cast_with_variant_override_inner(
     };
 
     // CR 702.152a: Blitz — when casting from hand with Keyword::Blitz, the blitz
-    // mana cost replaces the printed cost (opt-in via `variant_override`).
+    // mana cost replaces the printed cost (opt-in via `variant_override`). Read
+    // the *effective* spell keywords so a Blitz cost granted by a static
+    // (CR 604.1) is honored; CR 702.152b makes Blitz single-instance, so the
+    // dedup-by-kind collector is correct.
     let blitz_cost = if obj.zone == Zone::Hand {
-        obj.keywords.iter().find_map(|k| match k {
-            crate::types::keywords::Keyword::Blitz(cost) => Some(cost.clone()),
-            _ => None,
-        })
+        effective_spell_keywords(state, player, object_id)
+            .iter()
+            .find_map(|k| match k {
+                crate::types::keywords::Keyword::Blitz(cost) => Some(cost.clone()),
+                _ => None,
+            })
     } else {
         None
     };
@@ -3830,7 +3883,7 @@ fn apply_non_floor_cost_modifiers(
     object_id: ObjectId,
     mana_cost: &mut ManaCost,
 ) {
-    // CR 117.7 + CR 601.2f: collect self-spell statics ("This spell costs
+    // CR 601.2f: collect self-spell statics ("This spell costs
     // {N} less ...") and battlefield statics together so all increases apply
     // before any reductions across both passes.
     let mut collected = collect_self_spell_cost_modifiers(state, player, object_id, None, false);
@@ -4030,10 +4083,9 @@ pub(super) fn recompute_pending_cast_cost(
     apply_cost_modifiers_to_base(state, player, object_id, obj.mana_cost.clone())
 }
 
-/// CR 117.7 + CR 601.2f: Apply self-spell cost modifications — `ReduceCost` / `RaiseCost`
+/// CR 601.2f: Apply self-spell cost modifications — `ReduceCost` / `RaiseCost`
 /// statics printed on the spell being cast, with `affected = SelfRef` and `active_zones`
-/// covering the card's current zone (Hand for normal casting, Stack for the cost-
-/// determination step). Handles cards like Tolarian Terror where the cost reduction is
+/// covering the card's current castable zone. Handles cards like Tolarian Terror where the cost reduction is
 /// inherent to the spell and must apply before the spell resolves.
 ///
 /// Test-only isolation helper: production cost calculation now collects self-spell
@@ -4095,7 +4147,7 @@ fn collect_self_spell_cost_modifiers(
         if !def.active_zones.contains(&spell_obj.zone) {
             continue;
         }
-        // CR 117.7: Only self-referential cost statics apply here. Any other
+        // CR 601.2f: Only self-referential cost statics apply here. Any other
         // `affected` scoping would indicate a battlefield-style static that
         // should be handled by the battlefield scanner.
         if !matches!(def.affected, Some(TargetFilter::SelfRef)) {
@@ -7144,10 +7196,16 @@ pub fn handle_cast_spell_with_payment_mode(
     // affordable, present the choice; auto-route when only blitz is payable.
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand {
-            if let Some(blitz_cost) = obj.keywords.iter().find_map(|k| match k {
-                crate::types::keywords::Keyword::Blitz(cost) => Some(cost.clone()),
-                _ => None,
-            }) {
+            // CR 604.1: honor a Blitz cost granted by a static, not only printed
+            // Blitz. CR 702.152b makes Blitz single-instance, so the dedup-by-kind
+            // `effective_spell_keywords` collector is correct here.
+            if let Some(blitz_cost) = effective_spell_keywords(state, player, object_id)
+                .iter()
+                .find_map(|k| match k {
+                    crate::types::keywords::Keyword::Blitz(cost) => Some(cost.clone()),
+                    _ => None,
+                })
+            {
                 // CR 601.2f: affordability and displayed costs reflect active
                 // cost modifiers, applied to both the printed and blitz costs.
                 let normal_cost =
@@ -8624,32 +8682,31 @@ pub fn hand_cast_free_candidates(
 ) -> Vec<(ObjectId, ObjectId, CastFrequency)> {
     // CR 601.2b + CR 400.7: Collect active (source_id, frequency, filter)
     // triples for OncePerTurn permissions that haven't been consumed this turn.
-    let sources: Vec<(ObjectId, TargetFilter, CastFrequency, CastFreeOrigin)> = state
-        .battlefield
-        .iter()
-        .filter_map(|&src_id| {
-            let src_obj = state.objects.get(&src_id)?;
-            if src_obj.controller != player {
-                return None;
-            }
-            active_static_definitions(state, src_obj).find_map(|s| match s.mode {
-                StaticMode::CastFromHandFree { frequency, origin } => {
-                    if frequency == CastFrequency::OncePerTurn
-                        && state.hand_cast_free_permissions_used.contains(&src_id)
-                    {
-                        None
-                    } else if frequency == CastFrequency::OncePerTurn {
-                        s.affected
-                            .as_ref()
-                            .map(|f| (src_id, f.clone(), frequency, origin))
-                    } else {
-                        None
-                    }
+    let sources: Vec<(ObjectId, TargetFilter, CastFrequency, CastFreeOrigin)> =
+        iter_cast_free_permission_source_ids(state)
+            .filter_map(|src_id| {
+                let src_obj = state.objects.get(&src_id)?;
+                if src_obj.controller != player {
+                    return None;
                 }
-                _ => None,
+                active_static_definitions(state, src_obj).find_map(|s| match s.mode {
+                    StaticMode::CastFromHandFree { frequency, origin } => {
+                        if frequency == CastFrequency::OncePerTurn
+                            && state.hand_cast_free_permissions_used.contains(&src_id)
+                        {
+                            None
+                        } else if frequency == CastFrequency::OncePerTurn {
+                            s.affected
+                                .as_ref()
+                                .map(|f| (src_id, f.clone(), frequency, origin))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
             })
-        })
-        .collect();
+            .collect();
 
     if sources.is_empty() {
         return Vec::new();
@@ -12288,7 +12345,6 @@ fn evaluate_casting_prohibition_condition(
     source_controller: PlayerId,
     caster: PlayerId,
 ) -> bool {
-    use crate::types::phase::Phase;
     match when {
         // CR 109.5: "during your turn" — bound to the static's source controller.
         CastingProhibitionCondition::DuringYourTurn => state.active_player == source_controller,
@@ -12307,13 +12363,10 @@ fn evaluate_casting_prohibition_condition(
         // of "[every player] can [action] only during their own [time]".
         CastingProhibitionCondition::NotDuringAffectedPlayersTurn => state.active_player != caster,
         // CR 117.1a + CR 117.1b: "only any time they could cast a sorcery"
-        // — blocked when not at sorcery speed (active player's main phase
-        // + empty stack + caster is the active player).
+        // — blocked when not at sorcery speed. `restrictions` owns the
+        // sorcery-speed timing predicate (CR 307.1); never re-derive it.
         CastingProhibitionCondition::NotSorcerySpeed => {
-            let at_sorcery_speed = state.active_player == caster
-                && matches!(state.phase, Phase::PreCombatMain | Phase::PostCombatMain)
-                && state.stack.is_empty();
-            !at_sorcery_speed
+            !super::restrictions::is_sorcery_speed_window(state, caster)
         }
     }
 }
@@ -12594,12 +12647,13 @@ mod tests {
         AbilityCost, AbilityTag, ActivationRestriction, AdditionalCost, AggregateFunction,
         BasicLandType, CastPermissionConstraint, CastVariantPaid, CastingPermission,
         ChosenAttribute, ChosenSubtypeKind, Comparator, ContinuousModification, ControllerRef,
-        CostCategory, FilterProp, GameRestriction, KickerVariant, ManaContribution, ManaProduction,
-        ManaSpendPermission, ManaSpendRestriction, ModalChoice, ModalSelectionCondition,
-        ModalSelectionConstraint, MultiTargetSpec, ObjectProperty, ProhibitedActivity, PtStat,
-        PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode,
-        RestrictionExpiry, RestrictionPlayerScope, SearchSelectionConstraint, StaticCondition,
-        StaticDefinition, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+        CostCategory, CountScope, FilterProp, GameRestriction, KickerVariant, ManaContribution,
+        ManaProduction, ManaSpendPermission, ManaSpendRestriction, ModalChoice,
+        ModalSelectionCondition, ModalSelectionConstraint, MultiTargetSpec, ObjectProperty,
+        ProhibitedActivity, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
+        ReplacementDefinition, ReplacementMode, RestrictionExpiry, RestrictionPlayerScope,
+        SearchSelectionConstraint, StaticCondition, StaticDefinition, TargetFilter, TargetRef,
+        TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::{CoreType, Supertype};
@@ -16707,6 +16761,7 @@ mod tests {
                 Effect::CopySpell {
                     target: TargetFilter::StackAbility {
                         controller: Some(ControllerRef::You),
+                        tag: None,
                     },
                     retarget: CopyRetargetPermission::MayChooseNewTargets,
                     copier: None,
@@ -18323,11 +18378,11 @@ mod tests {
         );
     }
 
-    /// CR 117.7 + CR 601.2f: A self-spell cost reduction printed on the card itself
+    /// CR 601.2f: A self-spell cost reduction printed on the card itself
     /// ("This spell costs {1} less to cast for each instant and sorcery card in your
     /// graveyard.") must fire while the card is in hand. Verifies the parser-emitted
-    /// static (affected = SelfRef, active_zones = [Hand, Stack, Command]) is picked up by the
-    /// casting-time scanner and reduces the spell's generic cost.
+    /// static (affected = SelfRef, active_zones = self_spell_cost_mod_active_zones()) is
+    /// picked up by the casting-time scanner and reduces the spell's generic cost.
     #[test]
     fn tolarian_terror_self_cost_reduction_applies_from_hand() {
         use crate::types::statics::StaticMode;
@@ -18357,11 +18412,12 @@ mod tests {
                 dynamic_count: Some(QuantityRef::ZoneCardCount {
                     zone: ZoneRef::Graveyard,
                     card_types: vec![TypeFilter::Instant, TypeFilter::Sorcery],
+                    filter: None,
                     scope: CountScope::Controller,
                 }),
             })
             .affected(TargetFilter::SelfRef);
-            def.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
+            def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
             obj.static_definitions.push(def);
         }
 
@@ -18599,7 +18655,7 @@ mod tests {
                 }),
             })
             .affected(TargetFilter::SelfRef);
-            def.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
+            def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
             obj.static_definitions.push(def);
         }
 
@@ -18629,6 +18685,107 @@ mod tests {
             ManaCost::Cost { generic, shards } => {
                 assert_eq!(generic, 5);
                 assert_eq!(shards, vec![ManaCostShard::Green, ManaCostShard::Green]);
+            }
+            other => panic!("expected ManaCost::Cost, got {other:?}"),
+        }
+    }
+
+    /// CR 601.2f + CR 702.138a: Demilich's self-spell cost reduction must apply
+    /// while the card is in the graveyard, before it is cast via its graveyard
+    /// permission.
+    #[test]
+    fn self_cost_reduction_applies_from_graveyard() {
+        use crate::types::statics::StaticMode;
+
+        let mut state = setup_game_at_main_phase();
+        let demilich = create_object(
+            &mut state,
+            CardId(993),
+            PlayerId(0),
+            "Demilich".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&demilich).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![
+                    ManaCostShard::Blue,
+                    ManaCostShard::Blue,
+                    ManaCostShard::Blue,
+                    ManaCostShard::Blue,
+                ],
+                generic: 0,
+            };
+            let instant_sorcery_filter = TargetFilter::Or {
+                filters: vec![
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)),
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Sorcery)),
+                ],
+            };
+            let mut def = StaticDefinition::new(StaticMode::ModifyCost {
+                mode: CostModifyMode::Reduce,
+                amount: ManaCost::Cost {
+                    generic: 0,
+                    shards: vec![ManaCostShard::Blue],
+                },
+                spell_filter: None,
+                dynamic_count: Some(QuantityRef::SpellsCastThisTurn {
+                    scope: CountScope::Controller,
+                    filter: Some(instant_sorcery_filter),
+                }),
+            })
+            .affected(TargetFilter::SelfRef);
+            def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
+            obj.static_definitions.push(def);
+        }
+
+        state.spells_cast_this_turn_by_player.insert(
+            PlayerId(0),
+            crate::im::Vector::from(vec![
+                crate::types::SpellCastRecord {
+                    name: "Shock".to_string(),
+                    core_types: vec![CoreType::Instant],
+                    supertypes: vec![],
+                    subtypes: vec![],
+                    keywords: vec![],
+                    colors: vec![],
+                    mana_value: 1,
+                    has_x_in_cost: false,
+                    from_zone: Zone::Hand,
+                    cast_variant: CastingVariant::Normal,
+                },
+                crate::types::SpellCastRecord {
+                    name: "Opt".to_string(),
+                    core_types: vec![CoreType::Instant],
+                    supertypes: vec![],
+                    subtypes: vec![],
+                    keywords: vec![],
+                    colors: vec![],
+                    mana_value: 1,
+                    has_x_in_cost: false,
+                    from_zone: Zone::Hand,
+                    cast_variant: CastingVariant::Normal,
+                },
+            ]),
+        );
+
+        let mut mana_cost = state.objects.get(&demilich).unwrap().mana_cost.clone();
+        super::super::casting::apply_self_spell_cost_modifiers(
+            &state,
+            PlayerId(0),
+            demilich,
+            &mut mana_cost,
+        );
+
+        match mana_cost {
+            ManaCost::Cost { shards, generic } => {
+                assert_eq!(generic, 0);
+                assert_eq!(
+                    shards,
+                    vec![ManaCostShard::Blue, ManaCostShard::Blue],
+                    "two instant/sorcery spells cast this turn should reduce UUUU by UU"
+                );
             }
             other => panic!("expected ManaCost::Cost, got {other:?}"),
         }
@@ -18959,7 +19116,7 @@ mod tests {
                 dynamic_count: None,
             })
             .affected(TargetFilter::SelfRef);
-            def.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
+            def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
             obj.static_definitions.push(def);
         }
 
@@ -19065,7 +19222,10 @@ mod tests {
                     TargetFilter::Or {
                         filters: vec![
                             TargetFilter::StackSpell,
-                            TargetFilter::StackAbility { controller: None },
+                            TargetFilter::StackAbility {
+                                controller: None,
+                                tag: None,
+                            },
                         ],
                     },
                     TargetFilter::Typed(TypedFilter::default().properties(vec![
@@ -19086,7 +19246,7 @@ mod tests {
                 dynamic_count: None,
             })
             .affected(TargetFilter::SelfRef);
-            def.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
+            def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
             obj.static_definitions.push(def);
         }
 
@@ -19207,7 +19367,10 @@ mod tests {
         });
         let not_of_this_world_targeting_ability = ResolvedAbility::new(
             Effect::Counter {
-                target: TargetFilter::StackAbility { controller: None },
+                target: TargetFilter::StackAbility {
+                    controller: None,
+                    tag: None,
+                },
                 source_rider: None,
             },
             vec![TargetRef::Object(stack_ability_id)],
@@ -21284,6 +21447,125 @@ mod tests {
         );
     }
 
+    /// CR 114.4 + CR 601.2b + CR 118.9a (issue #1355): Tamiyo, Field
+    /// Researcher's emblem grants `CastFromHandFree` from the command zone.
+    #[test]
+    fn tamiyo_emblem_free_casts_spells_from_hand() {
+        let mut state = setup_game_at_main_phase();
+
+        let emblem_id = create_object(
+            &mut state,
+            CardId(920),
+            PlayerId(0),
+            "Emblem".to_string(),
+            Zone::Command,
+        );
+        {
+            let emblem = state.objects.get_mut(&emblem_id).unwrap();
+            emblem.is_emblem = true;
+            emblem.static_definitions.push(
+                parse_static_line(
+                    "You may cast spells from your hand without paying their mana costs.",
+                )
+                .expect("Tamiyo emblem static should parse"),
+            );
+        }
+
+        let spell_id = create_object(
+            &mut state,
+            CardId(921),
+            PlayerId(0),
+            "Counterspell".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&spell_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+                generic: 0,
+            };
+            Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Unimplemented {
+                    name: "Counterspell".to_string(),
+                    description: None,
+                },
+            ));
+        }
+
+        let cost = effective_spell_cost(&state, PlayerId(0), spell_id)
+            .expect("hand spell cost should compute");
+        assert!(
+            matches!(cost, ManaCost::NoCost),
+            "Tamiyo emblem should zero the hand spell's mana cost, got {cost:?}"
+        );
+        assert!(can_cast_object_now(&state, PlayerId(0), spell_id));
+        assert_eq!(
+            hand_cast_free_permission_source(
+                &state,
+                PlayerId(0),
+                state.objects.get(&spell_id).unwrap()
+            ),
+            Some((emblem_id, CastFrequency::Unlimited)),
+            "permission source should be the command-zone emblem"
+        );
+    }
+
+    /// Issue #1355 regression: Tamiyo emblem's hand qualifier must not free-cast
+    /// commanders from the command zone (mirrors Omniscience guard).
+    #[test]
+    fn tamiyo_emblem_does_not_free_cast_commander_from_command_zone() {
+        let mut state = setup_game_at_main_phase();
+        state.format_config.command_zone = true;
+
+        let emblem_id = create_object(
+            &mut state,
+            CardId(922),
+            PlayerId(0),
+            "Emblem".to_string(),
+            Zone::Command,
+        );
+        {
+            let emblem = state.objects.get_mut(&emblem_id).unwrap();
+            emblem.is_emblem = true;
+            emblem.static_definitions.push(
+                parse_static_line(
+                    "You may cast spells from your hand without paying their mana costs.",
+                )
+                .expect("Tamiyo emblem static should parse"),
+            );
+        }
+
+        let commander_id = create_object(
+            &mut state,
+            CardId(923),
+            PlayerId(0),
+            "Dragon Commander".to_string(),
+            Zone::Command,
+        );
+        {
+            let obj = state.objects.get_mut(&commander_id).unwrap();
+            obj.is_commander = true;
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.mana_cost = ManaCost::generic(5);
+            Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Unimplemented {
+                    name: "Commander".to_string(),
+                    description: None,
+                },
+            ));
+        }
+
+        let cost = effective_spell_cost(&state, PlayerId(0), commander_id)
+            .expect("commander cost should compute");
+        assert!(
+            !matches!(cost, ManaCost::NoCost),
+            "Tamiyo emblem must not apply to command-zone commanders, got {cost:?}"
+        );
+    }
+
     /// Issue #2432: Omniscience must offer a free normal cast for spells whose
     /// printed mana cost is unaffordable but whose alternative cost is payable.
     mod omniscience_alt_cost_2432 {
@@ -22028,6 +22310,149 @@ mod tests {
                 .any(|o| o.variant == CastingVariant::Blitz),
             "choice set must include the Blitz option; got {:?}",
             choices.options
+        );
+    }
+
+    /// CR 702.152a + CR 604.1: Blitz granted to a hand creature by a battlefield
+    /// `CastWithKeyword` static (the card itself prints no Blitz) must surface the
+    /// Blitz alternative-cast option. The candidate read routes through
+    /// `effective_spell_keywords`; before that routing, `casting_variant_candidates`
+    /// inspected only printed `obj.keywords`, so the Blitz option would be absent.
+    #[test]
+    fn granted_blitz_offers_blitz_variant() {
+        use crate::types::ability::{TargetFilter, TypeFilter, TypedFilter};
+        use crate::types::keywords::Keyword;
+        use crate::types::statics::StaticMode;
+
+        let mut state = setup_game_at_main_phase();
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 5);
+
+        // Grantor: "creatures you control have blitz {2}" (modeled directly as a
+        // CastWithKeyword static, the same shape the parser emits for such grants).
+        let grantor = create_object(
+            &mut state,
+            CardId(9100),
+            PlayerId(0),
+            "Blitz Grantor".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&grantor).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            let def = StaticDefinition::new(StaticMode::CastWithKeyword {
+                keyword: Keyword::Blitz(ManaCost::generic(2)),
+            })
+            .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)));
+            obj.static_definitions = vec![def].into();
+        }
+
+        // Recipient: a vanilla creature in hand with NO printed Blitz.
+        let spell = create_object(
+            &mut state,
+            CardId(9101),
+            PlayerId(0),
+            "Vanilla Creature".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            obj.mana_cost = ManaCost::generic(4);
+            obj.base_mana_cost = ManaCost::generic(4);
+        }
+
+        assert!(
+            !state
+                .objects
+                .get(&spell)
+                .unwrap()
+                .keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Blitz(_))),
+            "recipient must have no printed Blitz — the option must come from the grant"
+        );
+
+        let choices = casting_variant_choice_set(&state, PlayerId(0), spell);
+        assert!(
+            choices
+                .options
+                .iter()
+                .any(|o| o.variant == CastingVariant::Blitz),
+            "granted Blitz must surface the Blitz option; got {:?}",
+            choices.options
+        );
+    }
+
+    /// CR 702.141a + CR 604.1 (seam 4: activated-ability-on-grant): Encore
+    /// granted to a graveyard card by an `AddKeyword` effect must surface its
+    /// graveyard activated ability. The `AddKeyword` layer seam installs only the
+    /// keyword + triggers (never activated abilities), so the gather
+    /// (`activated_ability_definitions`) must synthesize the Encore ability from
+    /// the card's *effective* keyword set. Before that synthesis, the card had
+    /// the bare Encore keyword but no activatable Encore ability.
+    #[test]
+    fn granted_encore_surfaces_graveyard_activated_ability() {
+        let mut state = setup_game_at_main_phase();
+
+        // Grantor on the battlefield; recipient is a creature card in graveyard
+        // with NO printed Encore.
+        let grantor = create_object(
+            &mut state,
+            CardId(9200),
+            PlayerId(0),
+            "Encore Grantor".to_string(),
+            Zone::Battlefield,
+        );
+        let card = create_object(
+            &mut state,
+            CardId(9201),
+            PlayerId(0),
+            "Some Creature".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&card).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+        }
+
+        // Sanity: before the grant, no Encore ability is surfaced.
+        let before = activated_ability_definitions(&state, card);
+        assert!(
+            !before
+                .iter()
+                .any(|(_, a)| matches!(&*a.effect, crate::types::ability::Effect::Encore)),
+            "no printed Encore ability should exist before the grant"
+        );
+
+        // Grant Encore {2}{R} to this graveyard card.
+        state.add_transient_continuous_effect(
+            grantor,
+            PlayerId(0),
+            crate::types::ability::Duration::UntilEndOfTurn,
+            TargetFilter::SpecificObject { id: card },
+            vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Encore(ManaCost::Cost {
+                    generic: 2,
+                    shards: vec![ManaCostShard::Red],
+                }),
+            }],
+            None,
+        );
+
+        let after = activated_ability_definitions(&state, card);
+        let encore = after
+            .iter()
+            .find(|(_, a)| matches!(&*a.effect, crate::types::ability::Effect::Encore))
+            .expect("granted Encore must surface a graveyard activated ability");
+        assert_eq!(
+            encore.1.activation_zone,
+            Some(Zone::Graveyard),
+            "synthesized Encore ability must function only from the graveyard"
         );
     }
 
@@ -28781,7 +29206,7 @@ mod tests {
                 dynamic_count: None,
             })
             .affected(TargetFilter::SelfRef);
-            reduction.active_zones = vec![Zone::Hand, Zone::Stack];
+            reduction.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
             obj.static_definitions.push(reduction);
         }
 
@@ -36499,7 +36924,7 @@ mod tests {
                 dynamic_count: None,
             })
             .affected(TargetFilter::SelfRef);
-            def.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
+            def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
             obj.static_definitions.push(def);
         }
 
@@ -40873,6 +41298,42 @@ mod tests {
         assert!(
             !spell_objects_available_to_cast(&state, player).contains(&land),
             "lands are never offered on the cast path"
+        );
+    }
+
+    /// CR 305.1 + CR 400.7i: Object-tagged `PlayFromExile` impulse grants (The
+    /// Legend of Roku chapter I, Act on Impulse class) surface exiled lands on
+    /// the play-land path only — never on `spell_objects_available_to_cast`.
+    #[test]
+    fn impulse_play_from_exile_land_uses_play_path_not_cast_path() {
+        let mut state = setup_game_at_main_phase();
+        let player = PlayerId(0);
+        let land = add_exiled_land(&mut state, player, "Exiled Forest");
+        state
+            .objects
+            .get_mut(&land)
+            .unwrap()
+            .casting_permissions
+            .push(CastingPermission::PlayFromExile {
+                duration: crate::types::ability::Duration::UntilEndOfNextTurnOf {
+                    player: crate::types::ability::PlayerScope::Controller,
+                },
+                granted_to: player,
+                frequency: CastFrequency::Unlimited,
+                source_id: Some(ObjectId(999)),
+                exiled_by_ability_controller: Some(player),
+                mana_spend_permission: None,
+            });
+
+        assert!(
+            exile_lands_playable_by_permission(&state, player)
+                .iter()
+                .any(|(id, _)| *id == land),
+            "impulse-granted exiled land must be playable"
+        );
+        assert!(
+            !spell_objects_available_to_cast(&state, player).contains(&land),
+            "impulse-granted lands must not surface on the cast path"
         );
     }
 

@@ -470,6 +470,46 @@ pub(super) fn strip_additional_cost_conditional(text: &str) -> (Option<AbilityCo
             );
         }
     }
+    if body.is_none() && scan_contains_phrase(&lower, "surge cost was paid") {
+        if let Some(after) = tp.strip_after("instead ") {
+            return (
+                Some(AbilityCondition::CastVariantPaidInstead {
+                    variant: CastVariantPaid::Surge,
+                }),
+                after.original.to_string(),
+            );
+        }
+        // CR 702.117a: "if its surge cost was paid, [effect]" — non-"instead"
+        // variant that gates a sub-ability on surge payment.
+        if let Some(after) = tp.strip_after("surge cost was paid, ") {
+            return (
+                Some(AbilityCondition::CastVariantPaid {
+                    variant: CastVariantPaid::Surge,
+                }),
+                after.original.to_string(),
+            );
+        }
+    }
+    if body.is_none() && scan_contains_phrase(&lower, "spectacle cost was paid") {
+        if let Some(after) = tp.strip_after("instead ") {
+            return (
+                Some(AbilityCondition::CastVariantPaidInstead {
+                    variant: CastVariantPaid::Spectacle,
+                }),
+                after.original.to_string(),
+            );
+        }
+        // CR 702.137a: "if its spectacle cost was paid, [effect]" — non-"instead"
+        // variant that gates a sub-ability on spectacle payment.
+        if let Some(after) = tp.strip_after("spectacle cost was paid, ") {
+            return (
+                Some(AbilityCondition::CastVariantPaid {
+                    variant: CastVariantPaid::Spectacle,
+                }),
+                after.original.to_string(),
+            );
+        }
+    }
 
     match body {
         Some(body) => {
@@ -606,7 +646,55 @@ pub(super) fn strip_cast_from_zone_conditional(text: &str) -> (Option<AbilityCon
     (None, text.to_string())
 }
 
+fn type_filter_to_core_type(tf: &TypeFilter) -> Option<CoreType> {
+    match tf {
+        TypeFilter::Creature => Some(CoreType::Creature),
+        TypeFilter::Land => Some(CoreType::Land),
+        TypeFilter::Artifact => Some(CoreType::Artifact),
+        TypeFilter::Enchantment => Some(CoreType::Enchantment),
+        TypeFilter::Instant => Some(CoreType::Instant),
+        TypeFilter::Sorcery => Some(CoreType::Sorcery),
+        TypeFilter::Planeswalker => Some(CoreType::Planeswalker),
+        TypeFilter::Battle => Some(CoreType::Battle),
+        _ => None,
+    }
+}
+
+/// CR 608.2c: "If an instant or sorcery card is revealed this way, ..."
+/// (Delver of Secrets class) — gates a sub_ability on the last revealed card's type.
+fn parse_if_revealed_card_type_conditional(text: &str) -> Option<(AbilityCondition, String)> {
+    let lower = text.to_lowercase();
+    let (type_filters, remainder) = nom_on_lower(text, &lower, |input| {
+        let (rest, _) = alt((
+            tag::<_, _, OracleError<'_>>("if an "),
+            tag::<_, _, OracleError<'_>>("if a "),
+        ))
+        .parse(input)?;
+        let (rest, type_filters) = nom_quantity::parse_type_filter_list(rest)?;
+        let (rest, _) = tag::<_, _, OracleError<'_>>(" card is revealed this way").parse(rest)?;
+        Ok((rest, type_filters))
+    })?;
+    let core_types: Vec<CoreType> = type_filters
+        .iter()
+        .filter_map(type_filter_to_core_type)
+        .collect();
+    if core_types.is_empty() {
+        return None;
+    }
+    Some((
+        AbilityCondition::RevealedHasCardType {
+            card_types: core_types,
+            additional_filter: None,
+            subtype_filter: None,
+        },
+        remainder_after_optional_comma(remainder).to_string(),
+    ))
+}
+
 pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityCondition>, String) {
+    if let Some((condition, remainder)) = parse_if_revealed_card_type_conditional(text) {
+        return (Some(condition), remainder);
+    }
     let lower = text.to_lowercase();
     let rest = alt((
         tag::<_, _, OracleError<'_>>("if it's a "),
@@ -622,6 +710,25 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
         .parse(rest)
         .map(|(rest, matched)| (rest, matched.is_some()))
         .unwrap_or((rest, false));
+    // CR 608.2c: "if it's a card of the chosen type" (Gathering Stone) — the
+    // chosen creature type can match any card whose type line includes it.
+    if let Ok((after_chosen, _)) =
+        tag::<_, _, OracleError<'_>>("card of the chosen type").parse(rest)
+    {
+        let remainder = remainder_after_optional_comma(after_chosen);
+        let offset = text.len() - remainder.len();
+        return (
+            Some(maybe_negate(
+                AbilityCondition::RevealedHasCardType {
+                    card_types: vec![],
+                    additional_filter: Some(FilterProp::IsChosenCreatureType),
+                    subtype_filter: None,
+                },
+                negated,
+            )),
+            text[offset..].to_string(),
+        );
+    }
     // CR 205.3m: Multi-subtype creature gates ("Kraken, Leviathan, Octopus,
     // or Serpent creature card") must not collapse to bare CoreType::Creature.
     if let Some((subtype_filter, after_type)) = parse_creature_subtype_card_tail(rest) {
@@ -630,7 +737,7 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
         return (
             Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
-                    card_type: CoreType::Creature,
+                    card_types: vec![CoreType::Creature],
                     additional_filter: None,
                     subtype_filter: Some(Box::new(subtype_filter)),
                 },
@@ -653,10 +760,23 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
     // "permanent card" → TargetFilter::Typed(TypeFilter::Permanent) — and gate on it
     // with TargetMatchesFilter (the same condition variant the sibling MV arms use).
     if type_word == "permanent" {
-        let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase("permanent card");
+        let (mut filter, leftover) =
+            crate::parser::oracle_target::parse_type_phrase("permanent card");
         if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
-            // allow-noncombinator: structural separator after parsed clause
-            let remainder = after_type.strip_prefix(", ").unwrap_or(after_type);
+            let (after_type, chosen_type) = if let Ok((rest_after_chosen, _)) =
+                tag::<_, _, OracleError<'_>>(" of the chosen type").parse(after_type)
+            {
+                (rest_after_chosen, true)
+            } else {
+                (after_type, false)
+            };
+            if chosen_type {
+                let TargetFilter::Typed(typed) = &mut filter else {
+                    return (None, text.to_string());
+                };
+                typed.properties.push(FilterProp::IsChosenCreatureType);
+            }
+            let remainder = remainder_after_optional_comma(after_type);
             let offset = text.len() - remainder.len();
             return (
                 Some(maybe_negate(
@@ -684,7 +804,7 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
         return (
             Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
-                    card_type,
+                    card_types: vec![card_type],
                     additional_filter,
                     subtype_filter: None,
                 },
@@ -713,7 +833,7 @@ fn parse_its_a_type_condition(condition_text: &str) -> Option<AbilityCondition> 
     if let Some(subtype_filter) = parse_creature_subtype_type_tail(type_str) {
         return Some(maybe_negate(
             AbilityCondition::RevealedHasCardType {
-                card_type: CoreType::Creature,
+                card_types: vec![CoreType::Creature],
                 additional_filter: None,
                 subtype_filter: Some(Box::new(subtype_filter)),
             },
@@ -725,7 +845,7 @@ fn parse_its_a_type_condition(condition_text: &str) -> Option<AbilityCondition> 
     let card_type = CoreType::from_str(&capitalized).ok()?;
     Some(maybe_negate(
         AbilityCondition::RevealedHasCardType {
-            card_type,
+            card_types: vec![card_type],
             additional_filter: None,
             subtype_filter: None,
         },
@@ -2203,6 +2323,12 @@ pub(crate) fn condition_to_ability_condition(
     }
 }
 
+/// Bridge a `StaticCondition` (from the nom condition parser) to an
+/// `AbilityCondition`. Returns `None` for variants that have no
+/// effect-resolution equivalent — the caller falls through to the next strategy.
+///
+/// Exhaustive on purpose — when you add a `StaticCondition` variant, decide
+/// here whether it bridges (CLAUDE.md: bridges must be kept exhaustive).
 pub(crate) fn static_condition_to_ability_condition(
     sc: &StaticCondition,
     ctx: &mut ParseContext,
@@ -2399,6 +2525,9 @@ pub(crate) fn static_condition_to_ability_condition(
         | StaticCondition::SourceIsEquipped
         | StaticCondition::SourceIsPaired
         | StaticCondition::SourceIsMonstrous
+        // CR 702.171b: the saddled designation is a static-only predicate with no
+        // effect-resolution (`AbilityCondition`) equivalent.
+        | StaticCondition::SourceIsSaddled
         | StaticCondition::SourceAttachedToCreature
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
@@ -2432,6 +2561,9 @@ pub(crate) fn static_condition_to_ability_condition(
 /// GE, 1 }` shape — the bridge target of `IsPresent` — is restored to
 /// `IsPresent` so the keyword-swap path (`rewrite_condition_keyword`) handles
 /// it uniformly.
+///
+/// Exhaustive on purpose — when you add an `AbilityCondition` variant, decide
+/// here whether it bridges (CLAUDE.md: bridges must be kept exhaustive).
 pub(crate) fn ability_condition_to_static_condition(
     ac: &AbilityCondition,
 ) -> Option<StaticCondition> {
@@ -2464,7 +2596,61 @@ pub(crate) fn ability_condition_to_static_condition(
         AbilityCondition::Not { condition } => Some(StaticCondition::Not {
             condition: Box::new(ability_condition_to_static_condition(condition)?),
         }),
-        _ => None,
+
+        // Casting-context conditions — read `SpellContext` / cast history at
+        // resolution time; no continuous-evaluation (`StaticCondition`)
+        // equivalent.
+        AbilityCondition::AdditionalCostPaid { .. }
+        | AbilityCondition::AdditionalCostPaidInstead
+        | AbilityCondition::AlternativeManaCostPaid
+        | AbilityCondition::CastFromZone { .. }
+        | AbilityCondition::CastDuringPhase { .. }
+        | AbilityCondition::CastTimingPermission { .. }
+        | AbilityCondition::ManaColorSpent { .. }
+        | AbilityCondition::ControllerControlledMatchingAsCast { .. }
+        | AbilityCondition::CastVariantPaid { .. }
+        | AbilityCondition::CastVariantPaidInstead { .. } => None,
+
+        // Resolution-flow conditions — read in-resolution signals (effect
+        // outcomes, reveals, resolved targets, zone-change events, player-scope
+        // iteration); only meaningful inside `resolve_ability_chain`, never as
+        // a continuous-effect gate.
+        AbilityCondition::EffectOutcome { .. }
+        | AbilityCondition::EventOutcomeWon
+        | AbilityCondition::WhenYouDo
+        | AbilityCondition::RevealedHasCardType { .. }
+        | AbilityCondition::PreviousEffectAmount { .. }
+        | AbilityCondition::TargetHasKeywordInstead { .. }
+        | AbilityCondition::TargetMatchesFilter { .. }
+        | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
+        | AbilityCondition::ZoneChangedThisWay { .. }
+        | AbilityCondition::CostPaidObjectMatchesFilter { .. }
+        | AbilityCondition::ConditionInstead { .. }
+        | AbilityCondition::NthResolutionThisTurn { .. }
+        | AbilityCondition::ScopedPlayerMatches { .. } => None,
+
+        // No `StaticCondition` counterpart exists for these game-state
+        // predicates.
+        AbilityCondition::FirstCombatPhaseOfTurn
+        | AbilityCondition::DayNightIsNeither
+        | AbilityCondition::SourceLacksKeyword { .. } => None,
+
+        // A `StaticCondition` counterpart exists, but `strip_suffix_conditional`
+        // never emits these shapes for per-`StaticDefinition` keyword-grant
+        // gates, so the condition stays on `AbilityDefinition.condition` as
+        // before. Invert here if the lowering path ever needs them.
+        AbilityCondition::SourceEnteredThisTurn
+        | AbilityCondition::HasMaxSpeed
+        | AbilityCondition::IsMonarch
+        | AbilityCondition::HasCityBlessing
+        | AbilityCondition::WasStartingPlayer { .. }
+        | AbilityCondition::SpellCastWithVariantThisTurn { .. }
+        | AbilityCondition::SourceIsTapped
+        | AbilityCondition::SourceMatchesFilter { .. }
+        | AbilityCondition::DayNightIs { .. }
+        | AbilityCondition::ControllerControlsMatching { .. }
+        | AbilityCondition::And { .. }
+        | AbilityCondition::Or { .. } => None,
     }
 }
 
@@ -2936,7 +3122,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
             "nonland" => {
                 return Some(maybe_negate(
                     AbilityCondition::RevealedHasCardType {
-                        card_type: CoreType::Land,
+                        card_types: vec![CoreType::Land],
                         additional_filter: None,
                         subtype_filter: None,
                     },
@@ -2953,7 +3139,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
         if let Some(card_type) = card_type {
             return Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
-                    card_type,
+                    card_types: vec![card_type],
                     additional_filter: None,
                     subtype_filter: None,
                 },
@@ -2964,7 +3150,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
         if let Some(subtype_filter) = parse_creature_subtype_type_tail(rest) {
             return Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
-                    card_type: CoreType::Creature,
+                    card_types: vec![CoreType::Creature],
                     additional_filter: None,
                     subtype_filter: Some(Box::new(subtype_filter)),
                 },
@@ -3914,6 +4100,7 @@ mod tests {
                 "if the player doesn't, draw a card",
                 Some(not_effect.clone()),
             ),
+            ("if they don't, draw a card", Some(not_effect.clone())),
             ("if you do, draw a card", Some(effect.clone())),
         ];
         for (input, expected) in cases {
@@ -4456,6 +4643,40 @@ mod tests {
         assert_eq!(body, "surveil 2.");
     }
 
+    /// CR 702.137a + CR 603.4: Rix Maadi Reveler — "If this creature's
+    /// spectacle cost was paid, instead [effect]" → CastVariantPaidInstead
+    /// { Spectacle }, stripping the leading "instead ".
+    #[test]
+    fn spectacle_instead_emits_cast_variant_paid_instead() {
+        let (cond, body) = strip_additional_cost_conditional(
+            "If this creature's spectacle cost was paid, instead discard your hand, then draw three cards.",
+        );
+        assert_eq!(
+            cond,
+            Some(AbilityCondition::CastVariantPaidInstead {
+                variant: CastVariantPaid::Spectacle,
+            })
+        );
+        assert_eq!(body, "discard your hand, then draw three cards.");
+    }
+
+    /// CR 702.117a + CR 603.4: surge "...instead" rider mirrors the spectacle
+    /// path — building-block coverage of the parameterized condition over a
+    /// second variant.
+    #[test]
+    fn surge_instead_emits_cast_variant_paid_instead() {
+        let (cond, body) = strip_additional_cost_conditional(
+            "If its surge cost was paid, instead draw two cards.",
+        );
+        assert_eq!(
+            cond,
+            Some(AbilityCondition::CastVariantPaidInstead {
+                variant: CastVariantPaid::Surge,
+            })
+        );
+        assert_eq!(body, "draw two cards.");
+    }
+
     /// CR 702.33b + CR 603.4: "if it was kicked twice, …" → min_count = 2.
     /// Archangel of Wrath's second trigger.
     #[test]
@@ -4499,6 +4720,23 @@ mod tests {
         assert_eq!(body, "target player discards three cards.");
     }
 
+    /// Delver of Secrets: instant/sorcery gate on revealed card.
+    #[test]
+    fn issue_2367_if_instant_or_sorcery_revealed_this_way() {
+        let (cond, body) = strip_card_type_conditional(
+            "If an instant or sorcery card is revealed this way, transform this creature.",
+        );
+        assert_eq!(
+            cond,
+            Some(AbilityCondition::RevealedHasCardType {
+                card_types: vec![CoreType::Instant, CoreType::Sorcery],
+                additional_filter: None,
+                subtype_filter: None,
+            })
+        );
+        assert_eq!(body, "transform this creature.");
+    }
+
     /// CR 608.2c: "permanent" is not a CoreType — strip_card_type_conditional must
     /// still gate on it via TargetMatchesFilter (parse_type_phrase building block).
     /// Covers Primal Surge's "If it's a permanent card, you may put it onto the
@@ -4517,6 +4755,31 @@ mod tests {
             tf.type_filters.contains(&TypeFilter::Permanent),
             "expected Permanent type filter, got {:?}",
             tf.type_filters
+        );
+        assert_eq!(body, "draw a card.");
+    }
+
+    #[test]
+    fn strip_card_type_conditional_permanent_of_chosen_type() {
+        let (cond, body) = strip_card_type_conditional(
+            "If it's a permanent card of the chosen type, draw a card.",
+        );
+        let Some(AbilityCondition::TargetMatchesFilter { filter, use_lki }) = cond else {
+            panic!("expected TargetMatchesFilter for permanent chosen type, got {cond:?}");
+        };
+        assert!(!use_lki, "present-tense 'it's a' check must not use LKI");
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter for permanent chosen type");
+        };
+        assert!(
+            tf.type_filters.contains(&TypeFilter::Permanent),
+            "expected Permanent type filter, got {:?}",
+            tf.type_filters
+        );
+        assert!(
+            tf.properties.contains(&FilterProp::IsChosenCreatureType),
+            "expected chosen-type property, got {:?}",
+            tf.properties
         );
         assert_eq!(body, "draw a card.");
     }
@@ -4645,13 +4908,14 @@ mod tests {
             &mut ParseContext::default(),
         );
         let Some(AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Creature,
+            card_types,
             subtype_filter: Some(subtype_filter),
             ..
         }) = cond
         else {
             panic!("expected RevealedHasCardType creature subtype Or, got {cond:?}");
         };
+        assert_eq!(card_types, vec![CoreType::Creature]);
         let TargetFilter::Or { filters } = *subtype_filter else {
             panic!("expected subtype Or filter, got {subtype_filter:?}");
         };
@@ -4674,13 +4938,14 @@ mod tests {
             &mut ParseContext::default(),
         );
         let Some(AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Creature,
+            card_types,
             subtype_filter: Some(subtype_filter),
             ..
         }) = cond
         else {
             panic!("expected multi-subtype RevealedHasCardType, got {cond:?}");
         };
+        assert_eq!(card_types, vec![CoreType::Creature]);
         let TargetFilter::Or { filters } = *subtype_filter else {
             panic!("expected subtype Or filter");
         };
@@ -4693,17 +4958,34 @@ mod tests {
             "it's a kraken, leviathan, octopus, or serpent creature card",
         );
         let Some(AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Creature,
+            card_types,
             subtype_filter: Some(subtype_filter),
             ..
         }) = cond
         else {
             panic!("expected multi-subtype RevealedHasCardType, got {cond:?}");
         };
+        assert_eq!(card_types, vec![CoreType::Creature]);
         let TargetFilter::Or { filters } = *subtype_filter else {
             panic!("expected subtype Or filter");
         };
         assert_eq!(filters.len(), 4);
+    }
+
+    /// Issue #1525 — Gathering Stone: "if it's a card of the chosen type".
+    #[test]
+    fn if_its_a_card_of_the_chosen_type_revealed_condition() {
+        let (cond, _) = strip_card_type_conditional(
+            "If it's a card of the chosen type, you may reveal it and put it into your hand.",
+        );
+        assert_eq!(
+            cond,
+            Some(AbilityCondition::RevealedHasCardType {
+                card_types: vec![],
+                additional_filter: Some(FilterProp::IsChosenCreatureType),
+                subtype_filter: None,
+            })
+        );
     }
 
     /// CR 608.2c: Regression guard for the subtype fall-through. parse_type_phrase

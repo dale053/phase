@@ -476,6 +476,16 @@ pub struct GameObject {
     // Timestamp for layer ordering
     pub timestamp: u64,
 
+    /// CR 400.7: Monotonic per-object incarnation, bumped on every battlefield
+    /// entry (`reset_for_battlefield_entry`). A permanent that leaves and
+    /// re-enters the battlefield becomes a new object even though the engine
+    /// reuses its `ObjectId` as storage identity. Pairing the id with this
+    /// counter distinguishes the new object from the old one at the same id, so
+    /// a pending ability that captured the previous incarnation no longer
+    /// resolves its self-reference against the re-entered permanent (blink/flicker).
+    #[serde(default)]
+    pub incarnation: u64,
+
     // CR 603.6a: Turn on which this object entered the battlefield (global turn
     // counter). Used for "entered this turn" triggers and `EnteredThisTurn`
     // filters — NOT for summoning-sickness (see `summoning_sick`).
@@ -773,6 +783,12 @@ pub struct GameObject {
     #[serde(default)]
     pub is_saddled: bool,
 
+    /// CR 702.171c: The creatures that saddled this permanent (tapped to pay the
+    /// saddle cost). Cleared in lockstep with `is_saddled` at end of turn or when
+    /// the permanent leaves the battlefield.
+    #[serde(default)]
+    pub saddled_by: Vec<ObjectId>,
+
     /// CR 613.11 + CR 510.1a: This creature assigns combat damage equal to its
     /// toughness rather than its power. Set after object-characteristic layers.
     #[serde(default)]
@@ -1052,6 +1068,7 @@ impl GameObject {
             base_color: Vec::new(),
             base_characteristics_initialized: false,
             timestamp: 0,
+            incarnation: 0,
             entered_battlefield_turn: None,
             discarded_turn: None,
             summoning_sick: false,
@@ -1100,6 +1117,7 @@ impl GameObject {
             monstrous: false,
             prepared: None,
             is_saddled: false,
+            saddled_by: Vec::new(),
             assigns_damage_from_toughness: false,
             assigns_damage_as_though_unblocked: false,
             assigns_no_combat_damage: false,
@@ -1163,6 +1181,10 @@ impl GameObject {
     /// A permanent entering the battlefield is a new object with no memory of its previous
     /// existence. Callers that need enter_tapped=true override `tapped` after this call.
     pub fn reset_for_battlefield_entry(&mut self, turn_number: u32) {
+        // CR 400.7: This (re-)entry creates a new object at the same storage id.
+        // Bump the incarnation so self-references captured by abilities created
+        // for the previous incarnation no longer match this permanent.
+        self.incarnation += 1;
         self.base_controller = Some(self.owner);
         self.controller = self.owner;
         self.entered_battlefield_turn = Some(turn_number);
@@ -1190,6 +1212,7 @@ impl GameObject {
         // state. Assign when WotC publishes SOS CR update.
         self.prepared = None;
         self.is_saddled = false;
+        self.saddled_by.clear();
         self.paired_with = None;
         self.pair_controller = None;
         self.chosen_attributes.clear();
@@ -1272,6 +1295,7 @@ impl GameObject {
         self.phyrexian_life_paid = 0;
         // CR 702.171b: Saddled clears when the Mount leaves the battlefield.
         self.is_saddled = false;
+        self.saddled_by.clear();
         // CR 702.xxx: Prepared (Strixhaven) is a battlefield-only designation —
         // clears on BF exit, paralleling monstrous/suspected. CR 400.7: a
         // re-entering permanent is a new object with no memory of its previous

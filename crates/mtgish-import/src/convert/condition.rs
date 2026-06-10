@@ -9,8 +9,8 @@
 use engine::types::ability::{
     AbilityCondition, AdditionalCostPaymentSource, AggregateFunction, CardTypeSetSource,
     Comparator, ControllerRef, CountScope, FilterProp, ParsedCondition, PlayerFilter, PlayerScope,
-    QuantityExpr, QuantityRef, StaticCondition, TargetFilter, TriggerCondition, TypeFilter,
-    TypedFilter, ZoneRef,
+    QuantityExpr, QuantityRef, RenownSubject, StaticCondition, TargetFilter, TriggerCondition,
+    TypeFilter, TypedFilter, ZoneRef,
 };
 use engine::types::card_type::CoreType;
 use engine::types::counter::CounterMatch;
@@ -855,7 +855,9 @@ fn entering_permanent_filter_to_trigger(pred: &Permanents) -> ConvResult<Trigger
             min_count: 2,
         },
         // CR 702.112a: "if ~ is renowned" — source-bound renowned check.
-        Permanents::IsRenowned => TriggerCondition::SourceIsRenowned,
+        Permanents::IsRenowned => TriggerCondition::IsRenowned {
+            subject: RenownSubject::Source,
+        },
         // CR 208.3 + CR 603.4: "if its mana value is X" — comparison against the
         // source's current mana value via QuantityComparison.
         Permanents::ManaValueIs(cmp) => {
@@ -1674,6 +1676,7 @@ pub fn convert_player_predicate_trigger(
                     qty: QuantityRef::ZoneCardCount {
                         zone: ZoneRef::Library,
                         card_types: Vec::new(),
+                        filter: None,
                         scope: CountScope::Controller,
                     },
                 },
@@ -1963,6 +1966,7 @@ pub fn convert_player_predicate_ability(
                     qty: QuantityRef::ZoneCardCount {
                         zone: ZoneRef::Library,
                         card_types: Vec::new(),
+                        filter: None,
                         scope: CountScope::Controller,
                     },
                 },
@@ -2289,6 +2293,7 @@ pub fn convert_player_predicate_static(
                     qty: QuantityRef::ZoneCardCount {
                         zone: ZoneRef::Library,
                         card_types: Vec::new(),
+                        filter: None,
                         scope: CountScope::Controller,
                     },
                 },

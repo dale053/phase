@@ -1,67 +1,16 @@
 use rand::Rng;
 
-use crate::game::replacement::{self, ReplacementResult};
 use crate::game::zones;
 use crate::types::ability::{
     ControllerRef, Duration, Effect, EffectError, EffectKind, FilterProp, ResolvedAbility,
-    StaticDefinition, TargetChoiceTiming, TargetFilter, TargetRef, TargetSelectionMode,
-    TypedFilter,
+    TargetChoiceTiming, TargetFilter, TargetSelectionMode, TypedFilter,
 };
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
-use crate::types::game_state::{
-    ExileLink, ExileLinkKind, GameState, PendingCounterPostAction, WaitingFor,
-    ZoneDeliveryExileTracking,
-};
+use crate::types::game_state::{GameState, PendingCounterPostAction, WaitingFor};
 use crate::types::identifiers::ObjectId;
-use crate::types::keywords::Keyword;
 use crate::types::player::PlayerId;
-use crate::types::proposed_event::ProposedEvent;
 use crate::types::zones::{EtbTapState, Zone};
-
-/// CR 614.1c + CR 122.1: Collect the additional ETB counters that active
-/// "[scope] creatures you control enter with an additional [counter] counter on
-/// them" statics contribute to the object that just entered the battlefield.
-///
-/// Scans the static sources that were already functioning before the zone move
-/// for the `StaticMode::EntersWithAdditionalCounters` variant and tests each
-/// one's `affected` filter against the entering object, using a `FilterContext`
-/// anchored at the STATIC's source. Anchoring at the source is what makes the
-/// "Other creatures you control" qualifier exclude the static's own permanent
-/// (`FilterProp::Another` compares the candidate against the context source).
-///
-/// Returns an aggregated `(CounterType, count)` list so multiple active sources
-/// stack additively (CR 616.1f: repeat the replacement process until none apply).
-/// The caller folds this through the shared `apply_etb_counters` resolver.
-fn enters_with_additional_counters_for_entry(
-    state: &GameState,
-    object_id: ObjectId,
-    static_defs: &[(ObjectId, StaticDefinition)],
-) -> Vec<(CounterType, u32)> {
-    let mut additional: Vec<(CounterType, u32)> = Vec::new();
-    for (source_id, def) in static_defs {
-        let Some(source_obj) = state.objects.get(source_id) else {
-            continue;
-        };
-        let crate::types::statics::StaticMode::EntersWithAdditionalCounters {
-            counter_type,
-            count,
-        } = &def.mode
-        else {
-            continue;
-        };
-        let Some(affected) = def.affected.as_ref() else {
-            continue;
-        };
-        // CR 109.5: evaluate the "you control" + Other/Legendary/Nontoken filter
-        // with the static's source as the context anchor.
-        let ctx = crate::game::filter::FilterContext::from_source(state, source_obj.id);
-        if crate::game::filter::matches_target_filter(state, object_id, affected, &ctx) {
-            additional.push((counter_type.clone(), *count));
-        }
-    }
-    additional
-}
 
 /// CR 701.24a: Shuffle a player's library using the game's seeded RNG.
 /// Reusable helper for auto-shuffle after zone moves to Library.
@@ -78,26 +27,33 @@ pub fn shuffle_library(state: &mut GameState, player: PlayerId, events: &mut Vec
     });
 }
 
-/// CR 701.17c + CR 603.7: For a `TrackedSet` / `TrackedSetFiltered` target,
-/// resolve the zone its members currently occupy. Tracked sets are not
-/// zone-constrained — milled cards land in the graveyard, revealed cards stay
-/// in the library/hand — so an interactive `ChangeZone` selecting "from among"
-/// such a set must scan the members' actual zone, not the battlefield default.
+/// CR 608.2c: For a `TrackedSet` / `TrackedSetFiltered` target, resolve the
+/// zones its members currently occupy. Tracked sets are not zone-constrained —
+/// milled cards land in the graveyard, revealed cards stay in the library/hand
+/// — so a `ChangeZone` selecting "from among" such a set must scan the
+/// members' actual zones, not the battlefield default.
 ///
 /// The `TrackedSetId(0)` sentinel resolves through the same chain-first binding
-/// authority as `matches_target_filter` (CR 603.7). Returns `None` when the
-/// filter is not tracked-set-backed or the set is empty/unbound.
-fn tracked_set_member_zone(state: &GameState, filter: &TargetFilter) -> Option<Zone> {
+/// authority as `matches_target_filter`. Returns `None` when the filter is not
+/// tracked-set-backed or the set is empty/unbound.
+fn tracked_set_member_zones(state: &GameState, filter: &TargetFilter) -> Option<Vec<Zone>> {
     let filter = crate::game::targeting::resolve_tracked_set_sentinel(state, filter.clone());
     let id = match &filter {
         TargetFilter::TrackedSet { id } | TargetFilter::TrackedSetFiltered { id, .. } => *id,
         _ => return None,
     };
-    state
+    let zones = state
         .tracked_object_sets
         .get(&id)?
         .iter()
-        .find_map(|obj_id| state.objects.get(obj_id).map(|obj| obj.zone))
+        .filter_map(|obj_id| state.objects.get(obj_id).map(|obj| obj.zone))
+        .fold(Vec::new(), |mut zones, zone| {
+            if !zones.contains(&zone) {
+                zones.push(zone);
+            }
+            zones
+        });
+    (!zones.is_empty()).then_some(zones)
 }
 
 fn resolve_enters_under_player(
@@ -143,20 +99,14 @@ fn resolution_choice_cardinality(
     }
 }
 
-/// Result of a single zone-move attempt through the replacement pipeline.
-pub(crate) enum ZoneMoveResult {
-    /// Object was moved (or prevented). Continue processing.
-    Done,
-    /// A replacement effect needs a player choice before continuing.
-    NeedsChoice(PlayerId),
-    /// An Aura entered via a non-spell effect and needs an enchant-host choice.
-    NeedsAuraAttachmentChoice,
-}
-
-pub(crate) enum ZoneDeliveryResult {
-    Done,
-    NeedsChoice(PlayerId),
-}
+// PLAN §7 Phase A: the zone-change pipeline (result enums, delivery tail,
+// `execute_zone_move`, `deliver_replaced_zone_change`) now lives in
+// `crate::game::zone_pipeline`. These shims keep every existing
+// `change_zone::{...}` caller compiling unchanged with zero behavior change.
+pub(crate) use crate::game::zone_pipeline::{
+    apply_zone_delivery_tail, deliver_replaced_zone_change, execute_zone_move, ZoneDeliveryResult,
+    ZoneMoveResult,
+};
 
 fn append_effect_resolved_after_counter_pause(
     state: &mut GameState,
@@ -167,634 +117,6 @@ fn append_effect_resolved_after_counter_pause(
         state,
         vec![PendingCounterPostAction::EmitEffectResolved { kind, source_id }],
     );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_zone_delivery_tail_after_counter_pause(
-    state: &mut GameState,
-    object_id: ObjectId,
-    from: Zone,
-    to: Zone,
-    cause: Option<ObjectId>,
-    source_id: Option<ObjectId>,
-    duration: Option<&Duration>,
-    exile_tracking: ZoneDeliveryExileTracking,
-    clear_pending_etb_counters: Option<ObjectId>,
-) -> ZoneDeliveryResult {
-    let mut actions = Vec::new();
-    if let Some(object_id) = clear_pending_etb_counters {
-        actions.push(PendingCounterPostAction::ClearPendingEtbCounters { object_id });
-    }
-    actions.push(PendingCounterPostAction::ContinueZoneDeliveryTail {
-        object_id,
-        from,
-        to,
-        cause,
-        source_id,
-        duration: duration.cloned(),
-        exile_tracking,
-    });
-    super::counters::append_pending_counter_post_actions(state, actions);
-    replacement_pause_delivery_result(state)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_zone_delivery_tail(
-    state: &mut GameState,
-    object_id: ObjectId,
-    from: Zone,
-    to: Zone,
-    cause: Option<ObjectId>,
-    source_id: Option<ObjectId>,
-    duration: Option<&Duration>,
-    exile_tracking: ZoneDeliveryExileTracking,
-    events: &mut Vec<GameEvent>,
-) -> ZoneDeliveryResult {
-    // CR 701.24a: To shuffle a library, randomize the cards within it so that
-    // no player knows their order.
-    if to == Zone::Library {
-        let owner = state.objects.get(&object_id).map(|o| o.owner);
-        if let Some(owner) = owner {
-            shuffle_library(state, owner, events);
-        }
-    }
-    // Track cards exiled by the source. Some linked exiles return when the
-    // source leaves; others are just remembered as "exiled with" the source.
-    if to == Zone::Exile {
-        if let Some(source_id) = cause.or(source_id) {
-            let kind = match duration {
-                Some(Duration::UntilHostLeavesPlay) => {
-                    ExileLinkKind::UntilSourceLeaves { return_zone: from }
-                }
-                _ if matches!(exile_tracking, ZoneDeliveryExileTracking::TrackBySource) => {
-                    ExileLinkKind::TrackedBySource
-                }
-                _ => return ZoneDeliveryResult::Done,
-            };
-            state.exile_links.push(ExileLink {
-                exiled_id: object_id,
-                source_id,
-                kind,
-            });
-        }
-    }
-    // CR 614.12a: Drain mandatory replacement post-effects after the zone
-    // change completes. This shared delivery path covers effect-driven moves
-    // (`ChangeZone`) in the same way stack resolution and land play already
-    // do, so as-enters work such as "enters prepared" or persisted choices
-    // applies before triggers and priority.
-    //
-    // CR 614.12a: A Devour as-enters sacrifice surfaces its own interactive
-    // `EffectZoneChoice` here. Surface that pause to the caller via
-    // `NeedsChoice` so the mass/single zone-change loop stashes the remaining
-    // co-entering members and resumes after the choice (instead of dropping
-    // them, issue #535 class).
-    if state.post_replacement_continuation.is_some() {
-        let waiting_for = crate::game::engine_replacement::apply_pending_post_replacement_effect(
-            state,
-            Some(object_id),
-            None,
-            Some(crate::types::replacements::ReplacementEvent::Moved),
-            events,
-        );
-        if matches!(waiting_for, Some(WaitingFor::EffectZoneChoice { .. })) {
-            return replacement_pause_delivery_result(state);
-        }
-    }
-    ZoneDeliveryResult::Done
-}
-
-fn aura_enchant_filter(state: &GameState, object_id: ObjectId) -> Option<TargetFilter> {
-    let obj = state.objects.get(&object_id)?;
-    if !obj.card_types.subtypes.iter().any(|s| s == "Aura") {
-        return None;
-    }
-    // CR 303.4d: An Aura that's also a creature can't enchant anything.
-    if obj
-        .card_types
-        .core_types
-        .contains(&crate::types::card_type::CoreType::Creature)
-    {
-        return None;
-    }
-    let filters: Vec<TargetFilter> = obj
-        .keywords
-        .iter()
-        .filter_map(|keyword| match keyword {
-            Keyword::Enchant(filter) => Some(filter.clone()),
-            _ => None,
-        })
-        .collect();
-    match filters.as_slice() {
-        [] => None,
-        [filter] => Some(filter.clone()),
-        _ => Some(TargetFilter::And { filters }),
-    }
-}
-
-fn legal_aura_attachment_targets(
-    state: &GameState,
-    aura_id: ObjectId,
-    controller: PlayerId,
-    enchant_filter: &TargetFilter,
-) -> Vec<TargetRef> {
-    let ctx = crate::game::filter::FilterContext::from_source_with_controller(aura_id, controller);
-    let mut targets: Vec<TargetRef> = state
-        .battlefield
-        .iter()
-        .copied()
-        .filter(|id| *id != aura_id)
-        .filter(|id| crate::game::filter::matches_target_filter(state, *id, enchant_filter, &ctx))
-        .filter(|id| crate::game::effects::attach::can_attach_to_object(state, aura_id, *id))
-        .map(TargetRef::Object)
-        .collect();
-
-    targets.extend(state.players.iter().filter_map(|player| {
-        if player.is_eliminated || player.is_phased_out() {
-            return None;
-        }
-        if crate::game::filter::player_matches_target_filter_in_state(
-            state,
-            enchant_filter,
-            player.id,
-            Some(controller),
-        ) {
-            Some(TargetRef::Player(player.id))
-        } else {
-            None
-        }
-    }));
-
-    targets
-}
-
-/// Deliver a zone-change event that has already passed through replacement.
-pub(crate) fn deliver_replaced_zone_change(
-    state: &mut GameState,
-    event: ProposedEvent,
-    source_id: Option<ObjectId>,
-    duration: Option<&Duration>,
-    track_exiled_by_source: bool,
-    events: &mut Vec<GameEvent>,
-) -> ZoneDeliveryResult {
-    if let ProposedEvent::ZoneChange {
-        object_id,
-        from,
-        to,
-        cause,
-        attach_to,
-        enter_transformed: should_transform,
-        enter_tapped: should_tap,
-        enter_with_counters,
-        controller_override: ctrl_override,
-        face_down_profile,
-        ..
-    } = event
-    {
-        let exile_tracking = if track_exiled_by_source {
-            ZoneDeliveryExileTracking::TrackBySource
-        } else {
-            ZoneDeliveryExileTracking::None
-        };
-
-        // CR 614.1c: Static replacement effects that modify how an object enters
-        // must already be functioning before that object enters. Snapshot the
-        // definitions before `move_to_zone` so a newly-entered permanent cannot
-        // retroactively supply its own replacement effect.
-        let enters_with_additional_counter_statics: Vec<_> = if to == Zone::Battlefield {
-            crate::game::functioning_abilities::game_active_statics(state)
-                .filter(|(_, def)| {
-                    matches!(
-                        def.mode,
-                        crate::types::statics::StaticMode::EntersWithAdditionalCounters { .. }
-                    )
-                })
-                .map(|(source_obj, def)| (source_obj.id, def.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // CR 614.12a + CR 614.13a: snapshot the pre-entry eligible pool the instant
-        // before the FIRST co-entering devourer enters; persisted (is_none gate) so all
-        // co-entering devourers share it. Excludes self + every co-arriver.
-        if to == Zone::Battlefield
-            && state.devour_eligible_snapshot.is_none()
-            && crate::game::engine_replacement::object_has_devour_replacement(state, object_id)
-        {
-            state.devour_eligible_snapshot = Some(state.battlefield.iter().copied().collect());
-        }
-
-        zones::move_to_zone(state, object_id, to, events);
-        if to == Zone::Battlefield || from == Zone::Battlefield {
-            crate::game::layers::mark_layers_full(state);
-        }
-        // CR 708.3: An object put onto the battlefield face down is turned face
-        // down BEFORE it enters, so its ETB abilities don't trigger and its
-        // characteristics are the face-down profile (CR 708.2a), not the real
-        // card's. Mirror `manifest_card`'s sequence: snapshot the real face into
-        // `back_face`, overwrite with the face-down 2/2 (+ any specified extra
-        // types/subtypes), then store the snapshot so the original is restorable.
-        // Done before the controller-override and ETB-counter/trigger blocks
-        // below so triggers (if any later applied) see the face-down state.
-        if to == Zone::Battlefield {
-            if let Some(profile) = &face_down_profile {
-                if let Some(obj) = state.objects.get_mut(&object_id) {
-                    let original = crate::game::printed_cards::snapshot_object_face(obj);
-                    crate::game::morph::apply_face_down_creature_characteristics(obj, profile);
-                    obj.back_face = Some(original);
-                }
-            }
-        }
-        // CR 712.14a: Apply transformation if entering the battlefield transformed.
-        if should_transform && to == Zone::Battlefield {
-            if let Some(obj) = state.objects.get(&object_id) {
-                if obj.back_face.is_some() && !obj.transformed {
-                    let _ = crate::game::transform::transform_permanent(state, object_id, events);
-                }
-            }
-        }
-        // CR 614.1: Apply enter-tapped if the effect or replacement set it.
-        if should_tap.resolve(false) && to == Zone::Battlefield {
-            if let Some(obj) = state.objects.get_mut(&object_id) {
-                obj.tapped = true;
-            }
-        }
-        // CR 603.6a + CR 400.7: Record which ability placed this permanent so
-        // anti-recursion intervening-ifs ("if it wasn't put onto the battlefield
-        // with this ability") can exclude permanents this very ability placed.
-        // `move_to_zone` already ran `reset_for_battlefield_entry` (clearing the
-        // field to None); set it only for ability-effect-driven entries. This is
-        // synchronous and lands before `process_triggers`, so the field is
-        // visible at ETB trigger fire-time (CR 603.4).
-        if to == Zone::Battlefield {
-            if let Some(src) = source_id {
-                if let Some(obj) = state.objects.get_mut(&object_id) {
-                    obj.entered_via_ability_source = Some(src);
-                }
-            }
-        }
-        // CR 110.2a: Apply controller override if the effect specifies
-        // "under your control" — set before triggers fire.
-        if let Some(new_controller) = ctrl_override {
-            if to == Zone::Battlefield {
-                zones::apply_battlefield_entry_controller_override(
-                    state,
-                    events,
-                    object_id,
-                    new_controller,
-                );
-            }
-        }
-        // CR 303.4f + CR 701.3a: A non-spell Aura entry carries its chosen
-        // enchant host through the ZoneChange event so it is attached before
-        // the effect finishes resolving.
-        if to == Zone::Battlefield {
-            if let Some(target) = attach_to {
-                match target {
-                    crate::game::game_object::AttachTarget::Object(target_id) => {
-                        let _ =
-                            crate::game::effects::attach::attach_to(state, object_id, target_id);
-                    }
-                    crate::game::game_object::AttachTarget::Player(player_id) => {
-                        let _ = crate::game::effects::attach::attach_to_player(
-                            state, object_id, player_id,
-                        );
-                    }
-                }
-            }
-        }
-        // CR 614.1c: Apply counters from replacement pipeline (e.g., saga lore counters,
-        // planeswalker intrinsic loyalty, battle intrinsic defense).
-        if to == Zone::Battlefield {
-            let mut counters_to_apply = enter_with_counters;
-            // CR 614.1c + CR 122.1: Apply additional counters from continuous
-            // "[scope] creatures you control enter with an additional [counter]
-            // counter on them" statics (Kalain, Bard Class, Gorma the Gullet,
-            // Master Chef). These are replacement effects whose affected filter
-            // matches the entering object; folded through the shared resolver so
-            // counter-doubling replacements (Doubling Season, Hardened Scales)
-            // see them too.
-            let additional = enters_with_additional_counters_for_entry(
-                state,
-                object_id,
-                &enters_with_additional_counter_statics,
-            );
-            counters_to_apply.extend(additional);
-            // CR 614.1c: Apply pending ETB counters from delayed triggers
-            // (e.g., "that creature enters with an additional +1/+1 counter").
-            let pending: Vec<_> = state
-                .pending_etb_counters
-                .iter()
-                .filter(|(oid, _, _)| *oid == object_id)
-                .map(|(_, ct, n)| (ct.clone(), *n))
-                .collect();
-            let pending_etb_cleanup = if pending.is_empty() {
-                None
-            } else {
-                Some(object_id)
-            };
-            counters_to_apply.extend(pending);
-            if !counters_to_apply.is_empty()
-                && !crate::game::engine_replacement::apply_etb_counters(
-                    state,
-                    object_id,
-                    &counters_to_apply,
-                    events,
-                )
-            {
-                return append_zone_delivery_tail_after_counter_pause(
-                    state,
-                    object_id,
-                    from,
-                    to,
-                    cause,
-                    source_id,
-                    duration,
-                    exile_tracking,
-                    pending_etb_cleanup,
-                );
-            }
-            if pending_etb_cleanup.is_some() {
-                state
-                    .pending_etb_counters
-                    .retain(|(oid, _, _)| *oid != object_id);
-            }
-        } else if !enter_with_counters.is_empty() {
-            // CR 122.1: Effect-driven counters for non-battlefield
-            // destinations — e.g., "exile it with three egg counters
-            // on it" (Darigaaz Reincarnated). Apply directly via the
-            // shared single-authority resolver so counter-doubling
-            // replacements (Doubling Season, Hardened Scales) and
-            // event emission stay consistent.
-            if !crate::game::engine_replacement::apply_etb_counters(
-                state,
-                object_id,
-                &enter_with_counters,
-                events,
-            ) {
-                return append_zone_delivery_tail_after_counter_pause(
-                    state,
-                    object_id,
-                    from,
-                    to,
-                    cause,
-                    source_id,
-                    duration,
-                    exile_tracking,
-                    None,
-                );
-            }
-        }
-        return apply_zone_delivery_tail(
-            state,
-            object_id,
-            from,
-            to,
-            cause,
-            source_id,
-            duration,
-            exile_tracking,
-            events,
-        );
-    }
-    ZoneDeliveryResult::Done
-}
-
-fn replacement_pause_delivery_result(state: &GameState) -> ZoneDeliveryResult {
-    match &state.waiting_for {
-        WaitingFor::ReplacementChoice { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
-        // CR 614.12a: a Devour as-enters sacrifice surfaced its own
-        // `EffectZoneChoice`; carry its chooser so the caller's `park_waiting_for`
-        // doesn't clobber the already-surfaced prompt.
-        WaitingFor::EffectZoneChoice { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
-        _ => ZoneDeliveryResult::NeedsChoice(state.active_player),
-    }
-}
-
-/// Execute a single object zone-change through the full pipeline:
-/// ProposedEvent → replacement → move → ExileLink → shuffle → layers_dirty.
-///
-/// Shared by both `resolve()` (targeted) and `resolve_all()` (mass) to ensure
-/// identical behavior for replacement effects, exile tracking, and auto-shuffle.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_zone_move(
-    state: &mut GameState,
-    obj_id: ObjectId,
-    from_zone: Zone,
-    dest_zone: Zone,
-    source_id: ObjectId,
-    duration: Option<&Duration>,
-    enter_transformed: bool,
-    effect_enter_tapped: bool,
-    controller_override: Option<PlayerId>,
-    effect_enter_with_counters: &[(CounterType, u32)],
-    face_down_profile: Option<&crate::types::ability::FaceDownProfile>,
-    track_exiled_by_source: bool,
-    events: &mut Vec<GameEvent>,
-) -> ZoneMoveResult {
-    let mut proposed = ProposedEvent::zone_change(obj_id, from_zone, dest_zone, Some(source_id));
-
-    // CR 712.14a: Set enter_transformed on the proposed event so replacement effects
-    // preserve it through the pipeline.
-    if enter_transformed {
-        if let ProposedEvent::ZoneChange {
-            enter_transformed: ref mut et,
-            ..
-        } = proposed
-        {
-            *et = true;
-        }
-    }
-
-    // CR 614.1: Set enter_tapped on the proposed event so replacement effects preserve it.
-    if effect_enter_tapped {
-        if let ProposedEvent::ZoneChange {
-            enter_tapped: ref mut et,
-            ..
-        } = proposed
-        {
-            *et = crate::types::proposed_event::EtbTapState::Tapped;
-        }
-    }
-
-    // CR 110.2a: Set controller_override on the proposed event so replacement effects
-    // see the correct controller through the pipeline.
-    if let Some(ctrl) = controller_override {
-        if let ProposedEvent::ZoneChange {
-            controller_override: ref mut co,
-            ..
-        } = proposed
-        {
-            *co = Some(ctrl);
-        }
-    }
-
-    // CR 708.2a + CR 708.3: Carry the face-down profile on the proposed event so
-    // the object is turned face down before it enters the battlefield (after the
-    // replacement pipeline runs, in `deliver_replaced_zone_change`).
-    if let Some(profile) = face_down_profile {
-        if let ProposedEvent::ZoneChange {
-            face_down_profile: ref mut fdp,
-            ..
-        } = proposed
-        {
-            *fdp = Some(Box::new(profile.clone()));
-        }
-    }
-
-    // CR 306.5b + CR 310.4b + CR 614.1c: Seed the intrinsic "enters with N
-    // counters" replacement when a planeswalker or battle enters the
-    // battlefield from any source (effect-driven entry — bounce-return,
-    // reanimate, blink, etc.). Spell-cast entry is handled in stack.rs.
-    if dest_zone == Zone::Battlefield {
-        if let Some(obj) = state.objects.get(&obj_id) {
-            // CR 712.14a + CR 712.18: A permanent entering transformed (e.g. a
-            // double-faced card exiled and returned with its back face up, like
-            // a creature-front // planeswalker-back DFC) will have its back
-            // face's characteristics on the battlefield. The physical face swap
-            // happens later in `deliver_replaced_zone_change`, so `obj` still
-            // shows its front face here — read the back face's printed
-            // loyalty/defense directly so CR 306.5b/310.4b seeds the counter map
-            // (the source of truth per CR 306.5c). Without this a transforming
-            // planeswalker enters with 0 loyalty counters and dies immediately
-            // to CR 704.5i. Ravenous (front-face cast-time) does not apply to an
-            // effect-driven transformed entry, so only face counters are seeded.
-            let intrinsic = match (enter_transformed, obj.back_face.as_ref()) {
-                (true, Some(back)) => {
-                    crate::game::printed_cards::intrinsic_face_counters(back.loyalty, back.defense)
-                }
-                _ => crate::game::printed_cards::intrinsic_etb_counters(obj),
-            };
-            if !intrinsic.is_empty() {
-                if let ProposedEvent::ZoneChange {
-                    enter_with_counters,
-                    ..
-                } = &mut proposed
-                {
-                    enter_with_counters.extend(intrinsic);
-                }
-            }
-        }
-        // CR 122.1 + CR 614.1c: Seed effect-driven enter-with-counters from
-        // `Effect::ChangeZone.enter_with_counters` (Darkness Crystal class:
-        // "put target creature card ... onto the battlefield with two
-        // additional +1/+1 counters on it"). Only applied for battlefield
-        // entries — other destinations (Exile, etc.) carry the counters
-        // through to drive `apply_etb_counters` downstream when the object
-        // arrives at a counter-bearing zone.
-        if !effect_enter_with_counters.is_empty() {
-            if let ProposedEvent::ZoneChange {
-                enter_with_counters,
-                ..
-            } = &mut proposed
-            {
-                enter_with_counters.extend(effect_enter_with_counters.iter().cloned());
-            }
-        }
-    } else if !effect_enter_with_counters.is_empty() {
-        // CR 122.1 + CR 614.1c: For non-battlefield destinations (e.g., Exile
-        // for "exile it with three egg counters on it"), counters are applied
-        // post-move via `apply_etb_counters` directly on the object. The
-        // ProposedEvent slot is reserved for battlefield entries that flow
-        // through the replacement pipeline.
-        if let ProposedEvent::ZoneChange {
-            enter_with_counters,
-            ..
-        } = &mut proposed
-        {
-            enter_with_counters.extend(effect_enter_with_counters.iter().cloned());
-        }
-    }
-
-    match replacement::replace_event(state, proposed, events) {
-        ReplacementResult::Execute(mut event) => {
-            let mut pending_aura_choice: Option<(PlayerId, ObjectId, Vec<TargetRef>)> = None;
-            if let ProposedEvent::ZoneChange {
-                object_id,
-                to: Zone::Battlefield,
-                attach_to,
-                controller_override,
-                ..
-            } = &mut event
-            {
-                if attach_to.is_none() {
-                    if let Some(enchant_filter) = aura_enchant_filter(state, *object_id) {
-                        let controller = (*controller_override)
-                            .or_else(|| state.objects.get(object_id).map(|obj| obj.controller))
-                            .unwrap_or(PlayerId(0));
-                        let legal_targets = legal_aura_attachment_targets(
-                            state,
-                            *object_id,
-                            controller,
-                            &enchant_filter,
-                        );
-                        match legal_targets.as_slice() {
-                            [] => return ZoneMoveResult::Done,
-                            [TargetRef::Object(id)] => {
-                                *attach_to =
-                                    Some(crate::game::game_object::AttachTarget::Object(*id));
-                            }
-                            [TargetRef::Player(id)] => {
-                                *attach_to =
-                                    Some(crate::game::game_object::AttachTarget::Player(*id));
-                            }
-                            _ => {
-                                pending_aura_choice = Some((controller, *object_id, legal_targets))
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some((controller, aura_id, legal_targets)) = pending_aura_choice {
-                match deliver_replaced_zone_change(
-                    state,
-                    event,
-                    Some(source_id),
-                    duration,
-                    track_exiled_by_source,
-                    events,
-                ) {
-                    ZoneDeliveryResult::Done => {}
-                    ZoneDeliveryResult::NeedsChoice(player) => {
-                        return ZoneMoveResult::NeedsChoice(player);
-                    }
-                }
-                state.waiting_for = WaitingFor::ReturnAsAuraTarget {
-                    player: controller,
-                    source_id,
-                    returned_id: aura_id,
-                    legal_targets,
-                    pending_effect: Box::new(ResolvedAbility::new(
-                        Effect::Attach {
-                            attachment: TargetFilter::SelfRef,
-                            target: TargetFilter::Any,
-                        },
-                        Vec::new(),
-                        source_id,
-                        controller,
-                    )),
-                };
-                return ZoneMoveResult::NeedsAuraAttachmentChoice;
-            }
-            match deliver_replaced_zone_change(
-                state,
-                event,
-                Some(source_id),
-                duration,
-                track_exiled_by_source,
-                events,
-            ) {
-                ZoneDeliveryResult::Done => {}
-                ZoneDeliveryResult::NeedsChoice(player) => {
-                    return ZoneMoveResult::NeedsChoice(player);
-                }
-            }
-            ZoneMoveResult::Done
-        }
-        ReplacementResult::Prevented => ZoneMoveResult::Done,
-        ReplacementResult::NeedsChoice(player) => ZoneMoveResult::NeedsChoice(player),
-    }
 }
 
 /// Move target objects between zones.
@@ -876,7 +198,7 @@ pub fn resolve(
     // for "from among the milled cards" / "X cards revealed this way"
     // continuations to the most recent non-empty tracked set. Done up front so
     // every downstream path (interactive scan, `matches_target_filter`,
-    // `tracked_set_member_zone`) sees the bound id — `matches_target_filter`
+    // `tracked_set_member_zones`) sees the bound id — `matches_target_filter`
     // looks the set up by exact id and would otherwise miss the sentinel.
     let target_filter: TargetFilter = match &ability.effect {
         Effect::ChangeZone { target, .. } => {
@@ -967,17 +289,18 @@ pub fn resolve(
             return Ok(());
         }
 
-        // CR 701.17c + CR 603.7: A tracked-set filter ("from among the milled
-        // cards" / "X cards revealed this way") scopes the selection to a set
-        // of objects that may live in any zone (milled cards land in the
-        // graveyard, revealed cards in the library/hand). The tracked-set
-        // membership IS the scope — there is no fixed `InZone` constraint to
-        // extract — so derive the scan zone from the members' actual zone
-        // rather than defaulting to the battlefield (which would scan the
-        // wrong zone and silently offer nothing).
+        // CR 608.2c: A tracked-set filter ("from among the milled cards" / "X
+        // cards revealed this way") scopes the selection to a set of objects
+        // that may live in any zone. The tracked-set membership is the scope —
+        // there is no fixed `InZone` constraint to extract — so derive the scan
+        // zone from the members' actual zone rather than defaulting to the
+        // battlefield.
         let scan_zone = origin
             .or_else(|| target_filter.extract_in_zone())
-            .or_else(|| tracked_set_member_zone(state, target_filter))
+            .or_else(|| {
+                tracked_set_member_zones(state, target_filter)
+                    .and_then(|zones| zones.into_iter().next())
+            })
             .unwrap_or(Zone::Battlefield);
         // Filter-controller override is primary here: when a filter like
         // "creature you control" needs "you" to resolve to the *target* player
@@ -1418,8 +741,8 @@ pub fn resolve_all(
                 extracted
             } else if let Some(origin) = origin {
                 vec![*origin]
-            } else if let Some(zone) = tracked_set_member_zone(state, target) {
-                vec![zone]
+            } else if let Some(zones) = tracked_set_member_zones(state, target) {
+                zones
             } else {
                 vec![Zone::Battlefield]
             };
@@ -1472,6 +795,22 @@ pub fn resolve_all(
     // correct set.
     let effective_filter =
         crate::game::targeting::resolve_tracked_set_sentinel(state, effective_filter);
+
+    // CR 608.2c: Re-derive scan zones after the tracked-set sentinel binds —
+    // the initial `origin`/`target` snapshot may have defaulted to the
+    // battlefield before `chain_tracked_set_id` was populated (Zimone's
+    // Experiment: kept cards live in the library until routed by type).
+    let origin_zones = if matches!(&ability.effect, Effect::ChangeZoneAll { origin: None, .. }) {
+        if let Some(zones) = tracked_set_member_zones(state, &effective_filter) {
+            zones
+        } else if let Some(zones) = tracked_set_member_zones(state, &target_filter) {
+            zones
+        } else {
+            origin_zones
+        }
+    } else {
+        origin_zones
+    };
 
     let track_exiled_by_source =
         crate::game::exile_links::should_track_exiled_by_source(state, ability.source_id, ability);
@@ -1776,7 +1115,7 @@ mod tests {
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
-    use crate::types::game_state::{StackEntry, StackEntryKind, ZoneChangeRecord};
+    use crate::types::game_state::{ExileLinkKind, StackEntry, StackEntryKind, ZoneChangeRecord};
     use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
     use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
@@ -5663,6 +5002,148 @@ mod tests {
         );
     }
 
+    /// Zimone's Experiment: tracked-set routing must scan the members' actual zone
+    /// (library) when `origin` is None (issue #2368).
+    #[test]
+    fn issue_2368_tracked_set_filtered_scans_library_when_origin_none() {
+        let mut state = GameState::new_two_player(42);
+        let land = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Forest".to_string(),
+            Zone::Library,
+        );
+        state.objects.get_mut(&land).unwrap().card_types.core_types = vec![CoreType::Land];
+        let creature = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+
+        let set_id = TrackedSetId(state.next_tracked_set_id);
+        state.next_tracked_set_id += 1;
+        state
+            .tracked_object_sets
+            .insert(set_id, vec![land, creature]);
+        state.chain_tracked_set_id = Some(set_id);
+
+        let land_filter = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Land],
+            controller: None,
+            properties: vec![],
+        });
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: None,
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSetFiltered {
+                    id: TrackedSetId(0),
+                    filter: Box::new(land_filter),
+                },
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Tapped,
+                face_down_profile: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve_all(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.objects[&land].zone, Zone::Battlefield);
+        assert!(state.objects[&land].tapped);
+        assert_eq!(state.objects[&creature].zone, Zone::Library);
+    }
+
+    #[test]
+    fn tracked_set_filtered_with_origin_none_scans_all_member_zones() {
+        let mut state = GameState::new_two_player(42);
+        let library_land = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Library Land".to_string(),
+            Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&library_land)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Land];
+        let graveyard_land = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Graveyard Land".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&graveyard_land)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Land];
+        let exiled_creature = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Exiled Creature".to_string(),
+            Zone::Exile,
+        );
+        state
+            .objects
+            .get_mut(&exiled_creature)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+
+        let set_id = TrackedSetId(state.next_tracked_set_id);
+        state.next_tracked_set_id += 1;
+        state
+            .tracked_object_sets
+            .insert(set_id, vec![library_land, graveyard_land, exiled_creature]);
+        state.chain_tracked_set_id = Some(set_id);
+
+        let land_filter = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Land],
+            controller: None,
+            properties: vec![],
+        });
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: None,
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSetFiltered {
+                    id: TrackedSetId(0),
+                    filter: Box::new(land_filter),
+                },
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                face_down_profile: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve_all(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.objects[&library_land].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&graveyard_land].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&exiled_creature].zone, Zone::Exile);
+    }
+
     /// CR 708.2a + CR 708.3 + CR 110.2a: Cyber-Controller's mass put-step — "Put
     /// all creature cards milled this way onto the battlefield face down under
     /// your control. They're 2/2 Cyberman artifact creatures." The
@@ -6579,6 +6060,108 @@ mod tests {
             *destination,
             Some(Zone::Hand),
             "the chosen milled card moves to hand"
+        );
+    }
+
+    /// Regression test for issue #2382: a DFC that enters the battlefield
+    /// transformed (front face = non-PW, back face = PW with loyalty 3) must
+    /// enter with the correct loyalty counters so the layer system derives
+    /// the right loyalty and the planeswalker survives its own -1 activation.
+    #[test]
+    fn enter_transformed_seeds_back_face_loyalty_counters() {
+        use crate::game::game_object::BackFaceData;
+        use crate::types::ability::TargetRef;
+        use crate::types::card_type::{CardType, CoreType};
+        use crate::types::mana::ManaCost;
+
+        let mut state = GameState::new_two_player(42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Sorin of House Markov".to_string(),
+            Zone::Exile,
+        );
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            // Front face: Vampire, no loyalty
+            obj.card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Vampire".to_string()],
+            };
+            obj.loyalty = None;
+            obj.base_characteristics_initialized = true;
+            // Back face: Sorin, Ravenous Neonate — planeswalker with loyalty 3
+            obj.back_face = Some(BackFaceData {
+                name: "Sorin, Ravenous Neonate".to_string(),
+                power: None,
+                toughness: None,
+                loyalty: Some(3),
+                defense: None,
+                card_types: CardType {
+                    supertypes: vec![],
+                    core_types: vec![CoreType::Planeswalker],
+                    subtypes: vec!["Sorin".to_string()],
+                },
+                mana_cost: ManaCost::default(),
+                keywords: vec![],
+                abilities: vec![],
+                trigger_definitions: Default::default(),
+                replacement_definitions: Default::default(),
+                static_definitions: Default::default(),
+                color: vec![],
+                printed_ref: None,
+                modal: None,
+                additional_cost: None,
+                strive_cost: None,
+                casting_restrictions: vec![],
+                casting_options: vec![],
+                layout_kind: None,
+            });
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Exile),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Any,
+                owner_library: false,
+                enter_transformed: true,
+                enters_under: None,
+                enter_tapped: EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+            },
+            vec![TargetRef::Object(obj_id)],
+            obj_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).ok();
+        crate::game::layers::flush_layers(&mut state);
+
+        let obj = state.objects.get(&obj_id).expect("object on battlefield");
+        assert_eq!(
+            obj.zone,
+            Zone::Battlefield,
+            "Sorin must be on the battlefield"
+        );
+        assert!(obj.transformed, "Sorin must show back face");
+        assert_eq!(
+            obj.counters
+                .get(&CounterType::Loyalty)
+                .copied()
+                .unwrap_or(0),
+            3,
+            "back-face loyalty counters must be seeded (issue #2382)"
+        );
+        assert_eq!(
+            obj.loyalty,
+            Some(3),
+            "layer-derived loyalty must equal the seeded loyalty counters"
         );
     }
 }

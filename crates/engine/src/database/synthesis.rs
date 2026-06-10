@@ -16,10 +16,10 @@ use crate::types::ability::{
     DamageModification, DelayedTriggerCondition, Duration, Effect, FilterProp, KickerVariant,
     ManaContribution, ManaProduction, ModalSelectionCondition, ModalSelectionConstraint,
     NinjutsuVariant, ObjectScope, ParsedCondition, PaymentCost, PlayerFilter, PlayerScope, PtStat,
-    PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition,
-    RuntimeHandler, SearchSelectionConstraint, StaticCondition, StaticDefinition,
-    TargetChoiceTiming, TargetFilter, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
-    UnlessPayModifier,
+    PtValue, PtValueScope, QuantityExpr, QuantityRef, RenownSubject, ReplacementCondition,
+    ReplacementDefinition, RuntimeHandler, SearchSelectionConstraint, StaticCondition,
+    StaticDefinition, TargetChoiceTiming, TargetFilter, TriggerCondition, TriggerDefinition,
+    TypeFilter, TypedFilter, UnlessPayModifier,
 };
 use crate::types::card::{CardFace, CardLayout, CleaveVariant};
 use crate::types::card_type::{CardType, CoreType, Supertype};
@@ -223,6 +223,10 @@ impl KeywordTriggerInstaller {
             // instance triggers separately, so one trigger is emitted per
             // `Keyword::Afterlife(_)` on the face.
             Keyword::Afterlife(n) => vec![build_afterlife_trigger(*n)],
+            // CR 702.123a/b: Fabricate N — ETB ChooseOneOf{+1/+1 counters |
+            // Servo tokens} trigger. Per CR 702.123b each instance triggers
+            // separately, so one trigger is emitted per `Keyword::Fabricate(_)`.
+            Keyword::Fabricate(n) => vec![build_fabricate_trigger(*n)],
             // CR 702.46a: Soulshift N — dies trigger optionally returning a
             // target Spirit card with mana value N or less from your graveyard
             // to your hand. Per CR 702.46b each instance triggers separately, so
@@ -345,6 +349,9 @@ impl KeywordTriggerInstaller {
                 is_dies_return_with_counter_trigger(trigger, &CounterType::Minus1Minus1)
             }
             Keyword::Afterlife(n) => is_afterlife_trigger_for_count(trigger, *n),
+            // CR 702.123b + CR 604.1: symmetric removal — the count is
+            // load-bearing so distinct Fabricate instances do not dedupe.
+            Keyword::Fabricate(n) => is_fabricate_trigger_for_count(trigger, *n),
             // CR 702.46b: the mana-value threshold is load-bearing so multiple
             // Soulshift instances with differing N do not dedupe each other.
             Keyword::Soulshift(n) => is_soulshift_trigger_for_value(trigger, *n),
@@ -553,8 +560,13 @@ pub fn synthesize_reconfigure(face: &mut CardFace) {
                 AbilityKind::Activated,
                 Effect::Attach {
                     attachment: TargetFilter::SelfRef,
+                    // CR 702.151a: "another target creature you control" —
+                    // FilterProp::Another excludes the source (a reconfigure
+                    // Equipment is itself a creature while unattached).
                     target: TargetFilter::Typed(
-                        TypedFilter::creature().controller(ControllerRef::You),
+                        TypedFilter::creature()
+                            .controller(ControllerRef::You)
+                            .properties(vec![FilterProp::Another]),
                     ),
                 },
             )
@@ -581,6 +593,41 @@ pub fn synthesize_reconfigure(face: &mut CardFace) {
         );
     }
     face.abilities.extend(abilities);
+
+    // CR 702.151b + CR 613.1d: while a reconfigure Equipment is attached to a
+    // creature, it stops being a creature (Layer 4 type removal). Synthesized as a
+    // self-scoped continuous static gated on `SourceAttachedToCreature`, mirroring
+    // `synthesize_impending`. Gated on keyword presence (the `for kw` loop above has
+    // no early return) and pushed once via an `already_has_static` idempotency guard.
+    if face
+        .keywords
+        .iter()
+        .any(|k| matches!(k, Keyword::Reconfigure(_)))
+    {
+        let static_condition = StaticCondition::SourceAttachedToCreature;
+        let already_has_static = face.static_abilities.iter().any(|static_def| {
+            static_def.affected == Some(TargetFilter::SelfRef)
+                && static_def.condition == Some(static_condition.clone())
+                && static_def
+                    .modifications
+                    .contains(&ContinuousModification::RemoveType {
+                        core_type: CoreType::Creature,
+                    })
+        });
+        if !already_has_static {
+            face.static_abilities.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SelfRef)
+                    .condition(static_condition)
+                    .modifications(vec![ContinuousModification::RemoveType {
+                        core_type: CoreType::Creature,
+                    }])
+                    .description(
+                        "CR 702.151b + CR 613.1d: a reconfigure Equipment stops being a creature while attached to a creature (Layer 4 type removal).".to_string(),
+                    ),
+            );
+        }
+    }
 }
 
 /// CR 702.167a/b: Craft is an activated ability "[Cost], Exile this permanent,
@@ -762,6 +809,22 @@ pub fn synthesize_mobilize(face: &mut CardFace) {
 /// per `Keyword::Mentor` copy.
 pub fn synthesize_mentor(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Mentor));
+}
+
+/// CR 702.149a: Install the printed Training trigger ("Whenever this creature and
+/// at least one other creature with greater power attack, put a +1/+1 counter on
+/// this creature"). `install_matching` dedupes and emits one trigger per
+/// instance (CR 702.149b: each instance triggers separately), mirroring
+/// `synthesize_mentor`.
+pub fn synthesize_training(face: &mut CardFace) {
+    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Training));
+}
+
+/// CR 702.130a: Synthesize the Afflict trigger ("Whenever this creature becomes blocked,
+/// defending player loses N life"). Each instance triggers separately (CR 702.130b), so one
+/// trigger is synthesized per `Keyword::Afflict` instance.
+pub fn synthesize_afflict(face: &mut CardFace) {
+    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Afflict(_)));
 }
 
 /// CR 603.6a + CR 205.3 + CR 105.2: Synthesize a "keyword ETB → create
@@ -1931,53 +1994,77 @@ fn transmute_same_mana_value_filter() -> TargetFilter {
 /// target for "this card's power" in the graveyard reminder text. No new quantity
 /// ref is needed; `SelfPower` is already the right abstraction.
 pub fn synthesize_scavenge(face: &mut CardFace) {
-    use crate::types::ability::QuantityRef;
-
     let scavenge_abilities: Vec<AbilityDefinition> = face
         .keywords
         .iter()
-        .filter_map(|kw| {
-            let Keyword::Scavenge(cost) = kw else {
-                return None;
-            };
-            // CR 118.3: Composite cost — pay mana, then exile this card from graveyard.
-            let composite_cost = AbilityCost::Composite {
-                costs: vec![
-                    AbilityCost::Mana { cost: cost.clone() },
-                    // CR 702.97a: "Exile this card from your graveyard" — SelfRef + Graveyard
-                    // is auto-paid by pay_ability_cost (no player choice needed).
-                    AbilityCost::Exile {
-                        count: 1,
-                        zone: Some(Zone::Graveyard),
-                        filter: Some(TargetFilter::SelfRef),
-                    },
-                ],
-            };
-            // CR 702.97a: "Put a number of +1/+1 counters equal to this card's power on
-            // target creature." SelfPower is resolved via LKI at resolution time so the
-            // power read is the card's last known power before it was exiled.
-            let effect = Effect::PutCounter {
-                counter_type: CounterType::Plus1Plus1,
-                count: QuantityExpr::Ref {
-                    qty: QuantityRef::Power {
-                        scope: crate::types::ability::ObjectScope::Source,
-                    },
-                },
-                target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
-            };
-            let mut def = AbilityDefinition::new(AbilityKind::Activated, effect)
-                .cost(composite_cost)
-                // CR 702.97a: "Activate only as a sorcery." The `.sorcery_speed()`
-                // builder sets both the display flag and pushes
-                // `ActivationRestriction::AsSorcery` for runtime enforcement.
-                .sorcery_speed();
-            // CR 702.97a: "functions only while the card with scavenge is in a graveyard."
-            def.activation_zone = Some(Zone::Graveyard);
-            Some(def)
-        })
+        .filter_map(scavenge_ability_for_keyword)
         .collect();
 
     face.abilities.extend(scavenge_abilities);
+}
+
+/// CR 702.97a + CR 604.1: Standalone keyword→ability builder so the Scavenge
+/// activated ability can be synthesized both at card-build time
+/// (`synthesize_scavenge`) and on the fly for runtime-granted Scavenge (the
+/// graveyard activated-ability gather in `casting.rs`). Mirrors the
+/// `cycling_ability_for_keyword` precedent. Returns `None` for non-Scavenge
+/// keywords.
+pub(crate) fn scavenge_ability_for_keyword(keyword: &Keyword) -> Option<AbilityDefinition> {
+    use crate::types::ability::QuantityRef;
+
+    let Keyword::Scavenge(cost) = keyword else {
+        return None;
+    };
+    // CR 118.3: Composite cost — pay mana, then exile this card from graveyard.
+    let composite_cost = AbilityCost::Composite {
+        costs: vec![
+            AbilityCost::Mana { cost: cost.clone() },
+            // CR 702.97a: "Exile this card from your graveyard" — SelfRef + Graveyard
+            // is auto-paid by pay_ability_cost (no player choice needed).
+            AbilityCost::Exile {
+                count: 1,
+                zone: Some(Zone::Graveyard),
+                filter: Some(TargetFilter::SelfRef),
+            },
+        ],
+    };
+    // CR 702.97a: "Put a number of +1/+1 counters equal to this card's power on
+    // target creature." SelfPower is resolved via LKI at resolution time so the
+    // power read is the card's last known power before it was exiled.
+    let effect = Effect::PutCounter {
+        counter_type: CounterType::Plus1Plus1,
+        count: QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: crate::types::ability::ObjectScope::Source,
+            },
+        },
+        target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+    };
+    let mut def = AbilityDefinition::new(AbilityKind::Activated, effect)
+        .cost(composite_cost)
+        // CR 702.97a: "Activate only as a sorcery." The `.sorcery_speed()`
+        // builder sets both the display flag and pushes
+        // `ActivationRestriction::AsSorcery` for runtime enforcement.
+        .sorcery_speed();
+    // CR 702.97a: "functions only while the card with scavenge is in a graveyard."
+    def.activation_zone = Some(Zone::Graveyard);
+    Some(def)
+}
+
+/// CR 604.1: General "granted graveyard activated keyword → ability" builder
+/// (seam 4: activated-ability-on-grant). The runtime activated-ability gather
+/// (`activated_ability_definitions` in `casting.rs`) calls this for each keyword
+/// in a graveyard card's *effective* keyword set so a keyword granted by a
+/// static (e.g. Encore/Scavenge granted to a graveyard card) surfaces its
+/// activatable ability — the `AddKeyword` layer seam installs only the keyword
+/// and triggers, never activated abilities. Returns `None` for keywords whose
+/// behavior is not a graveyard activated ability. Extend this match as new
+/// graveyard activated keywords gain runtime-grant support.
+pub(crate) fn graveyard_activated_ability_for_keyword(
+    keyword: &Keyword,
+) -> Option<AbilityDefinition> {
+    crate::database::encore::encore_ability_for_keyword(keyword)
+        .or_else(|| scavenge_ability_for_keyword(keyword))
 }
 
 /// CR 702.107a: Synthesize the Outlast activated ability from a `Keyword::Outlast(cost)`.
@@ -3181,71 +3268,122 @@ pub fn synthesize_fabricate(face: &mut CardFace) {
         return;
     }
 
+    // CR 702.123b: each Fabricate instance triggers separately — one trigger
+    // per `Keyword::Fabricate(_)` on the face.
     for n in fabricate_values {
-        let count_expr = QuantityExpr::Fixed { value: n as i32 };
-        let counter_word = if n == 1 { "counter" } else { "counters" };
-        let token_word = if n == 1 { "token" } else { "tokens" };
+        face.triggers.push(build_fabricate_trigger(n));
+    }
+}
 
-        let counters_branch = AbilityDefinition::new(
-            AbilityKind::Spell,
+/// CR 702.123a: Fabricate N — "When this permanent enters, you may put N +1/+1
+/// counters on it. If you don't, create N 1/1 colorless Servo artifact creature
+/// tokens." Modeled as an ETB `ChooseOneOf{ PutCounter | Token }` trigger.
+///
+/// Shared building block called by both `synthesize_fabricate` (build-time) and
+/// `KeywordTriggerInstaller::triggers_for` (runtime grant via `AddKeyword`),
+/// mirroring the `build_afterlife_trigger` precedent.
+fn build_fabricate_trigger(n: u32) -> TriggerDefinition {
+    let count_expr = QuantityExpr::Fixed { value: n as i32 };
+    let counter_word = if n == 1 { "counter" } else { "counters" };
+    let token_word = if n == 1 { "token" } else { "tokens" };
+
+    let counters_branch = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: count_expr.clone(),
+            target: TargetFilter::SelfRef,
+        },
+    )
+    .description(format!("Put {n} +1/+1 {counter_word} on it"));
+
+    // CR 111.1 + CR 111.4: Token is a 1/1 colorless Servo artifact
+    // creature token. `types` carries both core types ("Artifact",
+    // "Creature") and the creature subtype ("Servo") — mirrors the
+    // Treasure pattern (`["Artifact", "Treasure"]`) and Mobilize Warrior
+    // pattern (`["Creature", "Warrior"]`). Colorless is represented as
+    // an empty `colors` vec.
+    let servos_branch = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Token {
+            name: "Servo".to_string(),
+            power: PtValue::Fixed(1),
+            toughness: PtValue::Fixed(1),
+            types: vec![
+                "Artifact".to_string(),
+                "Creature".to_string(),
+                "Servo".to_string(),
+            ],
+            colors: vec![],
+            keywords: vec![],
+            tapped: false,
+            count: count_expr,
+            owner: TargetFilter::Controller,
+            attach_to: None,
+            enters_attacking: false,
+            supertypes: vec![],
+            static_abilities: vec![],
+            enter_with_counters: vec![],
+        },
+    )
+    .description(format!(
+        "Create {n} 1/1 colorless Servo artifact creature {token_word}"
+    ));
+
+    let choose = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChooseOneOf {
+            chooser: crate::types::ability::PlayerFilter::Controller,
+            branches: vec![counters_branch, servos_branch],
+        },
+    );
+
+    TriggerDefinition::new(TriggerMode::ChangesZone)
+        .destination(Zone::Battlefield)
+        .valid_card(TargetFilter::SelfRef)
+        .execute(choose)
+        .description(format!(
+            "CR 702.123a: Fabricate {n} — when this permanent enters, put {n} +1/+1 {counter_word} on it or create {n} 1/1 colorless Servo artifact creature {token_word}."
+        ))
+}
+
+/// Idempotency / strip-symmetry predicate for `build_fabricate_trigger`-shaped
+/// triggers. Discriminates on the full CR 702.123a Servo-token branch so a
+/// granted-then-removed Fabricate strips exactly its own trigger and never
+/// collides with another self-ref ETB `ChooseOneOf` trigger. The `n` is
+/// load-bearing (CR 702.123b: distinct instances must not dedupe each other).
+fn is_fabricate_trigger_for_count(t: &TriggerDefinition, n: u32) -> bool {
+    if !matches!(t.mode, TriggerMode::ChangesZone)
+        || t.destination != Some(Zone::Battlefield)
+        || !matches!(t.valid_card, Some(TargetFilter::SelfRef))
+    {
+        return false;
+    }
+    let Some(execute) = t.execute.as_deref() else {
+        return false;
+    };
+    let Effect::ChooseOneOf { branches, .. } = &*execute.effect else {
+        return false;
+    };
+    let count = QuantityExpr::Fixed { value: n as i32 };
+    let counters_ok = branches.iter().any(|b| {
+        matches!(
+            &*b.effect,
             Effect::PutCounter {
                 counter_type: CounterType::Plus1Plus1,
-                count: count_expr.clone(),
+                count: c,
                 target: TargetFilter::SelfRef,
-            },
+            } if *c == count
         )
-        .description(format!("Put {n} +1/+1 {counter_word} on it"));
-
-        // CR 111.1 + CR 111.4: Token is a 1/1 colorless Servo artifact
-        // creature token. `types` carries both core types ("Artifact",
-        // "Creature") and the creature subtype ("Servo") — mirrors the
-        // Treasure pattern (`["Artifact", "Treasure"]`) and Mobilize Warrior
-        // pattern (`["Creature", "Warrior"]`). Colorless is represented as
-        // an empty `colors` vec.
-        let servos_branch = AbilityDefinition::new(
-            AbilityKind::Spell,
-            Effect::Token {
-                name: "Servo".to_string(),
-                power: PtValue::Fixed(1),
-                toughness: PtValue::Fixed(1),
-                types: vec![
-                    "Artifact".to_string(),
-                    "Creature".to_string(),
-                    "Servo".to_string(),
-                ],
-                colors: vec![],
-                keywords: vec![],
-                tapped: false,
-                count: count_expr,
-                owner: TargetFilter::Controller,
-                attach_to: None,
-                enters_attacking: false,
-                supertypes: vec![],
-                static_abilities: vec![],
-                enter_with_counters: vec![],
-            },
+    });
+    let servos_ok = branches.iter().any(|b| {
+        matches!(
+            &*b.effect,
+            Effect::Token { name, count: c, .. }
+                if name == "Servo" && *c == count
         )
-        .description(format!(
-            "Create {n} 1/1 colorless Servo artifact creature {token_word}"
-        ));
-
-        let choose = AbilityDefinition::new(
-            AbilityKind::Spell,
-            Effect::ChooseOneOf {
-                chooser: crate::types::ability::PlayerFilter::Controller,
-                branches: vec![counters_branch, servos_branch],
-            },
-        );
-
-        let trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
-            .destination(Zone::Battlefield)
-            .valid_card(TargetFilter::SelfRef)
-            .execute(choose)
-            .description(format!(
-                "CR 702.123a: Fabricate {n} — when this permanent enters, put {n} +1/+1 {counter_word} on it or create {n} 1/1 colorless Servo artifact creature {token_word}."
-            ));
-        face.triggers.push(trigger);
-    }
+    });
+    counters_ok && servos_ok
 }
 
 /// CR 702.136a: Riot — "You may have this permanent enter with an additional
@@ -3272,6 +3410,54 @@ pub fn synthesize_riot(face: &mut CardFace) {
     for filter in static_grants {
         add_riot_replacements(face, filter, 1);
     }
+}
+
+/// General "keyword → as-enters replacement" mapping (seam 3: replacement-on-grant).
+///
+/// CR 614.12: an as-enters replacement that affects "a general subset of
+/// permanents that includes" the entering object comes from the granting source,
+/// scoped to the static's `affected` filter — NOT `SelfRef` on the recipient.
+/// Callers therefore thread the granting static's `affected` filter through.
+///
+/// Returns `None` for keywords whose behavior is not an as-enters replacement.
+/// Extend this match as new as-enters replacement keywords (e.g. Ravenous's
+/// "enters with X +1/+1 counters", CR 702.156a) gain runtime-grant support.
+pub(crate) fn keyword_entry_replacement(
+    keyword: &Keyword,
+    affected: TargetFilter,
+) -> Option<ReplacementDefinition> {
+    match keyword {
+        // CR 702.136a: Riot — optional "enter with a +1/+1 counter, else gain haste".
+        Keyword::Riot => Some(build_riot_replacement(affected)),
+        _ => None,
+    }
+}
+
+/// Runtime mirror of `synthesize_riot`'s static-grant half (seam 3).
+///
+/// CR 604.1: a runtime-added Continuous static that grants `AddKeyword{Riot}` (or
+/// another as-enters replacement keyword) must contribute the corresponding
+/// as-enters replacement on its source permanent, scoped to the static's
+/// `affected` filter (CR 614.12). Build-time `synthesize_riot` does this once on
+/// `face.replacements`; at runtime the per-pass layer reset discards persistent
+/// installs, so the layer system re-derives the replacement each pass by calling
+/// this for every active Continuous static and pushing the result onto the
+/// source's live `replacement_definitions`.
+///
+/// Returns `None` if the static is not a Continuous as-enters-replacement grant.
+pub(crate) fn entry_replacement_for_grant_static(
+    static_def: &StaticDefinition,
+) -> Option<ReplacementDefinition> {
+    if static_def.mode != StaticMode::Continuous {
+        return None;
+    }
+    let affected = static_def.affected.clone().unwrap_or(TargetFilter::Any);
+    static_def.modifications.iter().find_map(|modification| {
+        let ContinuousModification::AddKeyword { keyword } = modification else {
+            return None;
+        };
+        keyword_entry_replacement(keyword, affected.clone())
+    })
 }
 
 /// CR 702.64a: Absorb N — "If a source would deal damage to this creature,
@@ -5829,7 +6015,7 @@ fn is_renown_trigger(t: &TriggerDefinition) -> bool {
             t.condition,
             Some(TriggerCondition::Not {
                 condition: ref inner,
-            }) if matches!(**inner, TriggerCondition::SourceIsRenowned)
+            }) if matches!(**inner, TriggerCondition::IsRenowned { subject: RenownSubject::Source })
         )
         && matches!(
             t.execute.as_deref().map(|a| &*a.effect),
@@ -5857,7 +6043,9 @@ fn build_renown_trigger(n: u32) -> TriggerDefinition {
         .valid_target(TargetFilter::Player)
         .damage_kind(DamageKindFilter::CombatOnly)
         .condition(TriggerCondition::Not {
-            condition: Box::new(TriggerCondition::SourceIsRenowned),
+            condition: Box::new(TriggerCondition::IsRenowned {
+                subject: RenownSubject::Source,
+            }),
         })
         .execute(execute)
         .description(format!(
@@ -7077,7 +7265,7 @@ pub fn synthesize_backup(face: &mut CardFace) {
         ));
 
         // Chain ability granting if needed, gated on "if that's another creature"
-        let counter_ability = if let Some(grant_effect) = grant_effect.clone() {
+        let mut counter_ability = if let Some(grant_effect) = grant_effect.clone() {
             let grant_sub = AbilityDefinition::new(AbilityKind::Spell, grant_effect)
                 .condition(AbilityCondition::Not {
                     condition: Box::new(AbilityCondition::TargetMatchesFilter {
@@ -7093,6 +7281,12 @@ pub fn synthesize_backup(face: &mut CardFace) {
         } else {
             counter_ability
         };
+
+        // CR 702.165a: mark the synthesized backup ability so "becomes the target
+        // of a backup ability" triggers can identify it on the stack. Stamped on
+        // the final body that reaches `.execute(...)` so the tag survives the
+        // chained sub-ability rebuild above.
+        counter_ability.ability_tag = Some(AbilityTag::Backup);
 
         // Build the ETB trigger
         // CR 702.165a: "when this creature enters"
@@ -8420,6 +8614,9 @@ pub fn synthesize_all(face: &mut CardFace) {
     // CR 702.134a: Mentor — attack trigger placing a +1/+1 counter on a
     // lesser-power attacking creature.
     synthesize_mentor(face);
+    // CR 702.149a: Training — attack trigger placing a +1/+1 counter when a
+    // greater-power creature also attacks.
+    synthesize_training(face);
     synthesize_job_select(face);
     // CR 702.92a: Living weapon — Equipment ETB trigger creating a 0/0
     // black Phyrexian Germ creature token, then attaching this Equipment
@@ -8555,6 +8752,9 @@ pub fn synthesize_all(face: &mut CardFace) {
     // cost to return this card from your graveyard to your hand; otherwise
     // exile it.
     synthesize_recover(face);
+    // CR 702.130a: Afflict — becomes-blocked trigger that causes the defending
+    // player to lose N life. CR 702.130b: each instance triggers separately.
+    synthesize_afflict(face);
     // CR 702.115a: Ingest — combat-damage-to-player trigger that exiles the top
     // card of the damaged player's library.
     synthesize_ingest(face);
@@ -10938,6 +11138,72 @@ mod fabricate_runtime_tests {
         }
     }
 
+    /// CR 702.123a + CR 608.2a/608.2b: Fabricate is a non-targeted trigger with
+    /// NO intervening-if, so when the source leaves the battlefield before the
+    /// ETB trigger resolves, the trigger is NOT removed (608.2a needs a false
+    /// intervening-if; 608.2b needs all-illegal targets — neither applies). The
+    /// controller keeps the free branch choice; the servo branch creates tokens
+    /// independent of the source. (Auto-defaulting to servos would violate
+    /// CR 702.123a — it is a genuine free choice.)
+    #[test]
+    fn fabricate_e2e_source_gone_servo_branch_still_creates_tokens() {
+        let face = fabricate_creature_face("Cultivator of Blades", 2);
+        let (mut state, obj_id) = cast_and_resolve_fabricate_to_choice(&face, PlayerId(0));
+
+        // Bounce the source out of the battlefield while the choice is pending.
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, obj_id, Zone::Hand, &mut events);
+        assert_eq!(
+            state.objects.get(&obj_id).unwrap().zone,
+            Zone::Hand,
+            "source must have left the battlefield"
+        );
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ChooseOneOfBranch { .. }),
+            "the trigger must NOT abort when the source leaves; the choice is still pending"
+        );
+
+        // Servo branch resolves with the source gone — tokens still created.
+        crate::game::engine::apply_as_current(&mut state, GameAction::ChooseBranch { index: 1 })
+            .expect("servo branch must resolve with the source gone");
+
+        let servos = state
+            .objects
+            .values()
+            .filter(|obj| obj.name == "Servo" && obj.is_token)
+            .count();
+        assert_eq!(
+            servos, 2,
+            "Fabricate 2 servo branch must create 2 Servos even with the source gone"
+        );
+    }
+
+    /// CR 702.123a: with the source gone, choosing the +1/+1 counter branch
+    /// resolves gracefully (no fizzle, no panic) — the trigger is not aborted
+    /// and the choice is honored. (The counter branch targets the source via
+    /// SelfRef; whether counters land is governed by CR 400.7 zone identity and
+    /// is not asserted here — the point is the trigger resolves, not fizzles.)
+    #[test]
+    fn fabricate_e2e_source_gone_counter_branch_resolves_gracefully() {
+        let face = fabricate_creature_face("Cultivator of Blades", 2);
+        let (mut state, obj_id) = cast_and_resolve_fabricate_to_choice(&face, PlayerId(0));
+
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, obj_id, Zone::Hand, &mut events);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ChooseOneOfBranch { .. }
+        ));
+
+        // Counter branch must resolve without error when the source is gone.
+        crate::game::engine::apply_as_current(&mut state, GameAction::ChooseBranch { index: 0 })
+            .expect("counter branch must resolve gracefully with the source gone");
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::ChooseOneOfBranch { .. }),
+            "the choice must be consumed; the trigger must not be stuck"
+        );
+    }
+
     /// CR 702.123a with Fabricate 1 — Ambitious Aetherborn shape — exercises
     /// the same flow with N=1 to guard against off-by-one collapse of the
     /// branch construction.
@@ -11139,7 +11405,9 @@ mod undying_persist_synthesis_tests {
         };
         assert!(matches!(
             condition.as_ref(),
-            TriggerCondition::SourceIsRenowned
+            TriggerCondition::IsRenowned {
+                subject: crate::types::ability::RenownSubject::Source
+            }
         ));
 
         let execute = trigger.execute.as_deref().expect("execute body required");
@@ -11444,6 +11712,50 @@ mod undying_persist_synthesis_tests {
             &triggers[0],
             &Keyword::Undying
         ));
+    }
+
+    /// CR 604.1 + CR 702.123a/b runtime-grant path: `triggers_for` produces the
+    /// Fabricate ETB trigger and `trigger_matches_keyword_kind` recognizes it,
+    /// and `build_fabricate_trigger` is structurally identical to what the
+    /// build-time `synthesize_fabricate` installs (building-block equivalence).
+    #[test]
+    fn fabricate_triggers_for_and_matcher_roundtrip() {
+        let triggers = KeywordTriggerInstaller::triggers_for(&Keyword::Fabricate(2));
+        assert_eq!(triggers.len(), 1, "fabricate yields exactly one trigger");
+        assert!(
+            KeywordTriggerInstaller::trigger_matches_keyword_kind(
+                &triggers[0],
+                &Keyword::Fabricate(2)
+            ),
+            "matcher must recognize the synthesized fabricate trigger"
+        );
+        // The count is load-bearing (CR 702.123b: distinct instances must not
+        // dedupe each other).
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &triggers[0],
+            &Keyword::Fabricate(1)
+        ));
+        // It must NOT be recognized as some other keyword's trigger.
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &triggers[0],
+            &Keyword::Afterlife(2)
+        ));
+
+        // Build-block equivalence: synthesize_fabricate must install the exact
+        // same trigger shape the grant path installs.
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Fabricate(2));
+        synthesize_fabricate(&mut face);
+        let synthesized: Vec<_> = face
+            .triggers
+            .iter()
+            .filter(|t| is_fabricate_trigger_for_count(t, 2))
+            .collect();
+        assert_eq!(
+            synthesized.len(),
+            1,
+            "synthesize_fabricate installs the same builder-produced trigger"
+        );
     }
 
     /// Runtime-grant removal uses `trigger_matches_keyword_kind`, so the matcher
@@ -13017,6 +13329,56 @@ mod mentor_synthesis_tests {
             &Keyword::Mentor
         ));
     }
+
+    /// CR 702.149a: a printed Training creature must get its trigger INSTALLED
+    /// onto the face by `synthesize_all` — asserting `triggers_for()` (the
+    /// lookup) can never catch a missing install, so this drives the install.
+    #[test]
+    fn synthesize_training_installs_attack_trigger() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Training);
+        synthesize_training(&mut face);
+
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|t| is_training_trigger(t))
+                .count(),
+            1,
+            "a printed Training keyword must install exactly one training trigger"
+        );
+        // Confirm it is installed by `synthesize_all` too (the real card-build path).
+        let mut full = CardFace::default();
+        full.keywords.push(Keyword::Training);
+        synthesize_all(&mut full);
+        assert!(full.triggers.iter().any(is_training_trigger));
+    }
+
+    #[test]
+    fn synthesize_training_preserves_duplicate_instances_and_is_idempotent() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Training);
+        face.keywords.push(Keyword::Training);
+
+        synthesize_training(&mut face);
+        synthesize_training(&mut face);
+
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|t| is_training_trigger(t))
+                .count(),
+            2,
+            "CR 702.149b requires one trigger per Training instance, while repeated synthesis stays idempotent"
+        );
+    }
+
+    #[test]
+    fn synthesize_training_is_noop_without_keyword() {
+        let mut face = CardFace::default();
+        synthesize_training(&mut face);
+        assert!(face.triggers.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -13988,6 +14350,46 @@ mod riot_synthesis_tests {
             "static Riot grant should add ETB replacement for affected filter, got {:?}",
             face.replacements
         );
+    }
+
+    /// CR 614.12 + CR 604.1: the runtime seam-3 builder must derive the SAME
+    /// affected-filter Riot replacement build-time `synthesize_riot` produces from
+    /// a Continuous `AddKeyword{Riot}` static — scoped to the static's `affected`
+    /// filter, NOT SelfRef. This is the building block the layer pass calls each
+    /// recompute to re-install the replacement on the granting permanent.
+    #[test]
+    fn entry_replacement_for_grant_static_mirrors_synthesize_riot() {
+        let affected = TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+        let static_def = StaticDefinition::continuous()
+            .affected(affected.clone())
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Riot,
+            }]);
+
+        let derived = entry_replacement_for_grant_static(&static_def)
+            .expect("Riot-granting Continuous static must derive an entry replacement");
+        assert!(
+            is_riot_replacement(&derived, &affected),
+            "derived replacement must be the affected-filter Riot replacement, got {derived:?}"
+        );
+        // Build-block parity: identical to what build-time synthesis installs.
+        assert_eq!(derived, build_riot_replacement(affected));
+
+        // A non-as-enters-replacement keyword grant derives nothing.
+        let flying_static = StaticDefinition::continuous().modifications(vec![
+            ContinuousModification::AddKeyword {
+                keyword: Keyword::Flying,
+            },
+        ]);
+        assert!(entry_replacement_for_grant_static(&flying_static).is_none());
+
+        // A non-Continuous static derives nothing.
+        let noncontinuous = StaticDefinition::new(StaticMode::CantBlock).modifications(vec![
+            ContinuousModification::AddKeyword {
+                keyword: Keyword::Riot,
+            },
+        ]);
+        assert!(entry_replacement_for_grant_static(&noncontinuous).is_none());
     }
 
     #[test]
@@ -16703,6 +17105,7 @@ mod idempotency_tests {
                 zone: ZoneRef::Graveyard,
                 card_types: vec![TypeFilter::Creature],
                 scope: CountScope::Controller,
+                filter: None,
             },
         };
         let mut face = CardFace::default();
@@ -16930,6 +17333,62 @@ mod sorcery_speed_invariant_tests {
                 )),
             "unattach mode is legal only while attached to a creature (CR 702.151a)"
         );
+
+        // CR 702.151a: "another target creature you control" — the attach
+        // target filter must carry `FilterProp::Another` so a reconfigure
+        // Equipment (itself a creature while unattached) can't self-target.
+        match &*face.abilities[0].effect {
+            Effect::Attach { target, .. } => match target {
+                TargetFilter::Typed(tf) => assert!(
+                    tf.properties.contains(&FilterProp::Another),
+                    "reconfigure attach target excludes the source (CR 702.151a)"
+                ),
+                other => panic!("expected Typed attach target, got {other:?}"),
+            },
+            other => panic!("expected Effect::Attach, got {other:?}"),
+        }
+    }
+
+    /// CR 702.151b + CR 613.1d: reconfigure synthesizes a self-scoped continuous
+    /// Layer-4 type-removal static (RemoveType Creature) gated on
+    /// `SourceAttachedToCreature`, and re-synthesis must not duplicate it.
+    #[test]
+    fn synthesize_reconfigure_adds_type_removal_static_and_is_idempotent() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Reconfigure(ManaCost::Cost {
+            shards: vec![],
+            generic: 2,
+        }));
+        synthesize_reconfigure(&mut face);
+
+        let matching = |face: &CardFace| {
+            face.static_abilities
+                .iter()
+                .filter(|sd| {
+                    sd.affected == Some(TargetFilter::SelfRef)
+                        && sd.condition == Some(StaticCondition::SourceAttachedToCreature)
+                        && sd
+                            .modifications
+                            .contains(&ContinuousModification::RemoveType {
+                                core_type: CoreType::Creature,
+                            })
+                })
+                .count()
+        };
+        assert_eq!(
+            matching(&face),
+            1,
+            "reconfigure adds the type-removal static (CR 702.151b)"
+        );
+
+        let static_count = face.static_abilities.len();
+        synthesize_reconfigure(&mut face);
+        assert_eq!(
+            face.static_abilities.len(),
+            static_count,
+            "re-synthesis does not duplicate the type-removal static"
+        );
+        assert_eq!(matching(&face), 1, "still exactly one type-removal static");
     }
 
     /// CR 702.167a/b: Parsing the Oracle line "craft with creature {4}{b}" must
@@ -22696,6 +23155,53 @@ mod afflict_training_poisonous_synthesis_tests {
             &triggers[0],
             &Keyword::Flanking
         ));
+    }
+
+    #[test]
+    fn synthesize_afflict_installs_becomes_blocked_trigger() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Afflict(3));
+        synthesize_afflict(&mut face);
+
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|t| is_afflict_trigger(t, 3))
+                .count(),
+            1,
+            "a printed Afflict keyword must install exactly one afflict trigger"
+        );
+        // Confirm it is installed by `synthesize_all` too (the real card-build path).
+        let mut full = CardFace::default();
+        full.keywords.push(Keyword::Afflict(3));
+        synthesize_all(&mut full);
+        assert!(full.triggers.iter().any(|t| is_afflict_trigger(t, 3)));
+    }
+
+    #[test]
+    fn synthesize_afflict_preserves_duplicate_instances_and_is_idempotent() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Afflict(2));
+        face.keywords.push(Keyword::Afflict(2));
+
+        synthesize_afflict(&mut face);
+        synthesize_afflict(&mut face);
+
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|t| is_afflict_trigger(t, 2))
+                .count(),
+            2,
+            "CR 702.130b requires one trigger per Afflict instance, while repeated synthesis stays idempotent"
+        );
+    }
+
+    #[test]
+    fn synthesize_afflict_is_noop_without_keyword() {
+        let mut face = CardFace::default();
+        synthesize_afflict(&mut face);
+        assert!(face.triggers.is_empty());
     }
 
     // ---- Training (CR 702.149a) ----
