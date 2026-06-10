@@ -20,7 +20,7 @@
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::triggers::drain_order_triggers_with_identity;
 use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{WaitingFor, ZoneManipulationKind};
 use engine::types::phase::Phase;
 
 /// CR 603.3b + CR 701.22a: With two "whenever you scry" triggers on the
@@ -72,11 +72,16 @@ fn scry_with_two_watchers_still_prompts_and_fires_triggers() {
 
     // The spell left the hand on cast; after it resolves the engine MUST be
     // paused on the scry choice, not on a trigger-ordering / target prompt.
-    let WaitingFor::ScryChoice { player, cards } = runner.state().waiting_for.clone() else {
-        panic!(
-            "scry must pause at ScryChoice even with two scry-watchers, got {}",
+    let (player, cards) = match runner.state().waiting_for.clone() {
+        WaitingFor::ZoneManipulation {
+            player,
+            kind: ZoneManipulationKind::Scry { cards },
+        }
+        | WaitingFor::ScryChoice { player, cards } => (player, cards),
+        other => panic!(
+            "scry must pause at scry prompt even with two scry-watchers, got {other:?} ({})",
             runner.waiting_for_kind()
-        );
+        ),
     };
     assert_eq!(player, P0);
     assert_eq!(cards.len(), 2, "Scry 2 looks at the top two cards");

@@ -16924,11 +16924,15 @@ Echo—Discard a card. (At the beginning of your upkeep, if this came under your
 
         let result =
             apply_as_current(&mut state, GameAction::PayUnlessCost { pay: false }).unwrap();
-        let WaitingFor::ScryChoice { player, cards } = result.waiting_for.clone() else {
-            panic!(
-                "unless branch must preserve ScryChoice before watcher triggers, got {:?}",
-                result.waiting_for
-            );
+        let (player, cards) = match result.waiting_for.clone() {
+            WaitingFor::ZoneManipulation {
+                player,
+                kind: crate::types::game_state::ZoneManipulationKind::Scry { cards },
+            }
+            | WaitingFor::ScryChoice { player, cards } => (player, cards),
+            other => panic!(
+                "unless branch must preserve scry prompt before watcher triggers, got {other:?}"
+            ),
         };
         assert_eq!(player, PlayerId(0));
         assert_eq!(cards.len(), 2);
