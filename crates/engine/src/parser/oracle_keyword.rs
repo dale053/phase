@@ -3553,6 +3553,63 @@ mod tests {
         );
     }
 
+    /// CR 702.103a + CR 118.9 + CR 701.59a: Detective's Phoenix class —
+    /// "bestow—{r}, collect evidence 6" must parse to
+    /// `Bestow(BestowCost::NonMana(Composite[Mana{R}, CollectEvidence(6)]))`.
+    /// Discriminating test: the comma separates the mana sub-cost from the
+    /// Collect evidence residual; `extract_keyword_line` rejects the line
+    /// (Part 2 fails keyword validation) and Priority 13 intercepts via
+    /// `is_keyword_cost_line`. The full lowercased line is passed to
+    /// `parse_keyword_from_oracle`, which delegates through the em-dash
+    /// dispatcher and `parse_bestow_cost` → `parse_oracle_cost` to compose
+    /// both sub-costs into `AbilityCost::Composite`. Regression guard for
+    /// stale card-data.json issues where Bestow is absent for this card class.
+    #[test]
+    fn parse_keyword_from_oracle_bestow_compound_collect_evidence() {
+        use crate::types::mana::ManaCostShard;
+        // Lowercased Oracle text passed through `parse_keyword_from_oracle` after
+        // reminder text is stripped by the upstream pipeline.
+        let kw = parse_keyword_from_oracle("bestow\u{2014}{r}, collect evidence 6").unwrap();
+        let Keyword::Bestow(crate::types::keywords::BestowCost::NonMana(AbilityCost::Composite {
+            costs,
+        })) = kw
+        else {
+            panic!("expected Bestow(NonMana(Composite)), got {:?}", kw);
+        };
+        assert_eq!(costs.len(), 2, "mana sub-cost + collect-evidence residual");
+        let AbilityCost::Mana { cost: mana } = &costs[0] else {
+            panic!("expected Mana sub-cost, got {:?}", costs[0]);
+        };
+        assert_eq!(
+            mana,
+            &ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::Red],
+            }
+        );
+        assert_eq!(
+            costs[1],
+            AbilityCost::CollectEvidence { amount: 6 },
+            "Collect evidence residual must survive the comma split"
+        );
+    }
+
+    /// CR 702.103a: When the full oracle-text line (with trailing period) is
+    /// passed, the trailing "." must be stripped before cost parsing so it
+    /// doesn't corrupt the `collect evidence N` number parse.
+    #[test]
+    fn parse_keyword_from_oracle_bestow_compound_trailing_period() {
+        let kw = parse_keyword_from_oracle("bestow\u{2014}{r}, collect evidence 6.").unwrap();
+        assert!(
+            matches!(
+                kw,
+                Keyword::Bestow(crate::types::keywords::BestowCost::NonMana(_))
+            ),
+            "trailing period must not corrupt compound bestow parse: {:?}",
+            kw
+        );
+    }
+
     /// CR 702.129a + CR 602.1a: Champion of Wits family —
     /// "eternalize—{3}{U}{U}, discard a card" must parse to
     /// `Eternalize(EternalizeCost::NonMana(Composite[Mana{3UU}, Discard]))`,

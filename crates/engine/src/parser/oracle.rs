@@ -22336,4 +22336,73 @@ mod pipeline_snapshot_tests {
             } if properties.iter().any(|prop| matches!(prop, FilterProp::Another))
         ), "reflex must deal damage equal to source's +1/+1 counters to any other target, got {:?}", reflex.effect);
     }
+
+    /// CR 702.103a + CR 118.9 + CR 701.59a: Detective's Phoenix class —
+    /// oracle text starting with "Bestow—{R}, Collect evidence 6." must extract
+    /// `Keyword::Bestow(BestowCost::NonMana(Composite[Mana{R}, CollectEvidence(6)]))`.
+    ///
+    /// This exercises the Priority 13 intercept path (`is_keyword_cost_line`):
+    /// `extract_keyword_line` (Priority 1b) rejects the line because the comma-
+    /// split yields "Collect evidence 6." which is not a standalone keyword.
+    /// Priority 13 passes the full lowercased line to `parse_keyword_from_oracle`,
+    /// which assembles the compound cost via `parse_bestow_cost` +
+    /// `parse_oracle_cost`. Discriminating guard for the card-data generation
+    /// pipeline: if this path is broken, card-data.json won't emit its Bestow keyword
+    /// for this card class and graveyard / hand bestow offers are never shown.
+    #[test]
+    fn detectives_phoenix_oracle_text_extracts_compound_bestow_keyword() {
+        use crate::types::ability::AbilityCost;
+        use crate::types::keywords::{BestowCost, Keyword};
+
+        let oracle = "Bestow\u{2014}{R}, Collect evidence 6. \
+            (To pay this bestow cost, pay {R} and exile cards with total mana value \
+            6 or greater from your graveyard.)\n\
+            Flying, haste\n\
+            Enchanted creature gets +2/+2 and has flying and haste.\n\
+            Whenever you investigate, if this card is in your graveyard, \
+            return it to the battlefield.";
+
+        let result = parse_oracle_text(
+            oracle,
+            "Detective's Phoenix",
+            &["Flying".into(), "Haste".into()],
+            &["Creature".into()],
+            &["Phoenix".into()],
+        );
+
+        let bestow_kw = result
+            .extracted_keywords
+            .iter()
+            .find(|k| matches!(k, Keyword::Bestow(_)));
+
+        assert!(
+            bestow_kw.is_some(),
+            "compound bestow line must produce Keyword::Bestow in extracted_keywords; \
+             got: {:?}",
+            result.extracted_keywords
+        );
+
+        let Keyword::Bestow(BestowCost::NonMana(AbilityCost::Composite { costs })) =
+            bestow_kw.unwrap()
+        else {
+            panic!(
+                "expected Bestow(NonMana(Composite)), got {:?}",
+                bestow_kw.unwrap()
+            );
+        };
+        assert_eq!(
+            costs.len(),
+            2,
+            "mana sub-cost ({{R}}) + Collect evidence residual"
+        );
+        assert!(
+            matches!(&costs[0], AbilityCost::Mana { .. }),
+            "first sub-cost must be mana"
+        );
+        assert_eq!(
+            costs[1],
+            AbilityCost::CollectEvidence { amount: 6 },
+            "collect evidence 6 residual must not be dropped by comma-split"
+        );
+    }
 }

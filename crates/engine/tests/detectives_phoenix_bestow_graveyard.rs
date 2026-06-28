@@ -24,11 +24,12 @@
 //! CARD TEXT below is Detective's Phoenix's actual Oracle text as carried by the
 //! engine's authoritative card data (verified in card-data.json per the issue).
 
+use engine::game::casting::spell_objects_available_to_cast;
 use engine::game::scenario::{GameRunner, GameScenario};
 use engine::game::zones::create_object;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::keywords::{BestowCost, Keyword};
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
@@ -264,5 +265,236 @@ fn detectives_phoenix_graveyard_permission_does_not_allow_normal_creature_cast()
     assert!(
         result.is_err(),
         "graveyard permission says using bestow; without a legal Aura target it must not fall back to a normal creature cast"
+    );
+}
+
+// ── Hand-bestow tests (follow-up: #2365 comment — hand cast in certain board states) ──────
+
+fn add_enchantment_type(runner: &mut GameRunner, id: ObjectId) {
+    let obj = runner.state_mut().objects.get_mut(&id).unwrap();
+    if !obj.card_types.core_types.contains(&CoreType::Enchantment) {
+        obj.card_types.core_types.push(CoreType::Enchantment);
+    }
+    if !obj
+        .base_card_types
+        .core_types
+        .contains(&CoreType::Enchantment)
+    {
+        obj.base_card_types.core_types.push(CoreType::Enchantment);
+    }
+}
+
+/// CR 702.103a — bestow from hand when only bestow cost is affordable:
+/// auto-route to bestow (no AlternativeCastChoice prompt needed).
+///
+/// Board: Phoenix in hand, {R} in pool, GY MV ≥ 6, one creature to enchant.
+/// Expected: CollectEvidenceChoice (the non-mana residual) reaches the surface,
+/// proving the engine entered the bestow path.
+#[test]
+fn detectives_phoenix_hand_bestow_auto_routes_when_normal_unaffordable() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    // Phoenix in hand — mana cost {3}{R}{R} (MV 5), compound bestow cost.
+    let phoenix = scenario
+        .add_creature_to_hand(P0, "Detective's Phoenix", 2, 2)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red, ManaCostShard::Red],
+            generic: 3,
+        })
+        .with_subtypes(vec!["Phoenix"])
+        .from_oracle_text_with_keywords(&["Flying", "Haste"], PHOENIX_ORACLE)
+        .id();
+
+    // A legal creature target.
+    let _host = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+
+    // GY fodder: two MV-3 cards (total MV 6, satisfies Collect evidence 6).
+    let fodder_a = scenario
+        .add_creature_to_graveyard(P0, "Dead Card A", 1, 1)
+        .with_mana_cost(ManaCost::generic(3))
+        .id();
+    let fodder_b = scenario
+        .add_creature_to_graveyard(P0, "Dead Card B", 1, 1)
+        .with_mana_cost(ManaCost::generic(3))
+        .id();
+
+    let mut runner = scenario.build();
+    // CR 702.103b: real card is Enchantment Creature; add Enchantment after build.
+    add_enchantment_type(&mut runner, phoenix);
+
+    // Only {R} in pool — enough for bestow mana part but NOT normal {3}{R}{R}.
+    add_mana(&mut runner, ManaType::Red, 1);
+
+    let card_id = runner.state().objects[&phoenix].card_id;
+    let result = runner.act(GameAction::CastSpell {
+        object_id: phoenix,
+        card_id,
+        targets: vec![],
+        payment_mode: CastPaymentMode::Auto,
+    });
+
+    assert!(
+        result.is_ok(),
+        "hand-bestow must succeed when only bestow cost is affordable; got {result:?}"
+    );
+
+    // The engine should surface the CollectEvidenceChoice (non-mana residual)
+    // or proceed to mana payment — either way, it entered the bestow lane.
+    let wf = runner.state().waiting_for.clone();
+    assert!(
+        matches!(
+            wf,
+            WaitingFor::CollectEvidenceChoice { .. }
+                | WaitingFor::ManaPayment { .. }
+                | WaitingFor::TargetSelection { .. }
+        ),
+        "after hand-bestow, engine must be in CollectEvidenceChoice / ManaPayment / TargetSelection; got {wf:?}"
+    );
+
+    // The fodder cards were not prematurely exiled before payment.
+    assert_eq!(
+        runner.state().objects[&fodder_a].zone,
+        Zone::Graveyard,
+        "GY fodder A must still be in graveyard before collect-evidence payment"
+    );
+    assert_eq!(
+        runner.state().objects[&fodder_b].zone,
+        Zone::Graveyard,
+        "GY fodder B must still be in graveyard before collect-evidence payment"
+    );
+}
+
+/// CR 702.103a — when both the printed creature cost AND the bestow cost are
+/// affordable from hand, the engine must present an AlternativeCastChoice.
+///
+/// Board: Phoenix in hand, {3}{R}{R} (5 mana) + {R} in pool (both paths), GY MV ≥ 6.
+#[test]
+fn detectives_phoenix_hand_bestow_shows_choice_when_both_costs_affordable() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let phoenix = scenario
+        .add_creature_to_hand(P0, "Detective's Phoenix", 2, 2)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red, ManaCostShard::Red],
+            generic: 3,
+        })
+        .with_subtypes(vec!["Phoenix"])
+        .from_oracle_text_with_keywords(&["Flying", "Haste"], PHOENIX_ORACLE)
+        .id();
+
+    let _host = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+
+    // GY fodder: total MV ≥ 6.
+    scenario
+        .add_creature_to_graveyard(P0, "Dead Card A", 1, 1)
+        .with_mana_cost(ManaCost::generic(3));
+    scenario
+        .add_creature_to_graveyard(P0, "Dead Card B", 1, 1)
+        .with_mana_cost(ManaCost::generic(3));
+
+    let mut runner = scenario.build();
+    add_enchantment_type(&mut runner, phoenix);
+
+    // 3 colorless + 2 red = enough for {3}{R}{R}.
+    add_mana(&mut runner, ManaType::Colorless, 3);
+    add_mana(&mut runner, ManaType::Red, 2);
+
+    let card_id = runner.state().objects[&phoenix].card_id;
+    let result = runner.act(GameAction::CastSpell {
+        object_id: phoenix,
+        card_id,
+        targets: vec![],
+        payment_mode: CastPaymentMode::Auto,
+    });
+
+    assert!(
+        result.is_ok(),
+        "casting must succeed when both paths are affordable; got {result:?}"
+    );
+
+    let wf = runner.state().waiting_for.clone();
+    assert!(
+        matches!(wf, WaitingFor::AlternativeCastChoice { .. }),
+        "engine must present AlternativeCastChoice when both normal and bestow are affordable; got {wf:?}"
+    );
+}
+
+/// CR 702.103a — from hand with no legal creature target, bestow is unavailable
+/// and the Phoenix must still be castable as a normal creature.
+#[test]
+fn detectives_phoenix_hand_normal_cast_when_no_bestow_target() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let phoenix = scenario
+        .add_creature_to_hand(P0, "Detective's Phoenix", 2, 2)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red, ManaCostShard::Red],
+            generic: 3,
+        })
+        .with_subtypes(vec!["Phoenix"])
+        .from_oracle_text_with_keywords(&["Flying", "Haste"], PHOENIX_ORACLE)
+        .id();
+
+    // No creatures on board — no legal Aura target.
+    // GY fodder doesn't matter since bestow is gated on target legality first.
+    scenario
+        .add_creature_to_graveyard(P0, "Dead Card A", 1, 1)
+        .with_mana_cost(ManaCost::generic(3));
+    scenario
+        .add_creature_to_graveyard(P0, "Dead Card B", 1, 1)
+        .with_mana_cost(ManaCost::generic(3));
+
+    let mut runner = scenario.build();
+    // Enough for normal {3}{R}{R}.
+    add_mana(&mut runner, ManaType::Colorless, 3);
+    add_mana(&mut runner, ManaType::Red, 2);
+
+    let card_id = runner.state().objects[&phoenix].card_id;
+    let result = runner.act(GameAction::CastSpell {
+        object_id: phoenix,
+        card_id,
+        targets: vec![],
+        payment_mode: CastPaymentMode::Auto,
+    });
+
+    assert!(
+        result.is_ok(),
+        "normal hand cast must succeed when there are no Aura targets; got {result:?}"
+    );
+    // Should proceed to mana payment (normal creature cast), not bestow lane.
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::AlternativeCastChoice { .. } | WaitingFor::CollectEvidenceChoice { .. }
+        ),
+        "with no legal Aura target, no bestow choice must appear; got {:?}",
+        runner.state().waiting_for
+    );
+}
+
+/// CR 702.103a — Phoenix must appear in spell_objects_available_to_cast for its
+/// controller when it is in hand (normal + optional bestow, depending on state).
+#[test]
+fn detectives_phoenix_appears_castable_from_hand() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let phoenix = scenario
+        .add_creature_to_hand(P0, "Detective's Phoenix", 2, 2)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red, ManaCostShard::Red],
+            generic: 3,
+        })
+        .with_subtypes(vec!["Phoenix"])
+        .from_oracle_text_with_keywords(&["Flying", "Haste"], PHOENIX_ORACLE)
+        .id();
+
+    let runner = scenario.build();
+    assert!(
+        spell_objects_available_to_cast(runner.state(), P0).contains(&phoenix),
+        "Detective's Phoenix in hand must appear in spell_objects_available_to_cast"
     );
 }
