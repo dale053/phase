@@ -879,6 +879,16 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                         .is_some();
                         let bare_becomes_continuation =
                             bare_becomes_remainder && !antecedent_is_become;
+                        // CR 205.2a + CR 205.3a + CR 608.2c: "exile all A, all B,
+                        // and all C" — a bare "and" before a "[all|each] <type>"
+                        // union leg is a union delimiter, not a clause boundary
+                        // (Everything Comes to Dust; covers the non-"except" union
+                        // form too). The legs span both card types (205.2a:
+                        // creature/artifact/enchantment) and subtypes (205.3a).
+                        let mass_exile_union_continuation = continues_mass_exile_union(
+                            &before_lower,
+                            &remainder_trimmed.to_ascii_lowercase(),
+                        );
                         let suppress = (nom_primitives::scan_contains(&before_lower, "from among")
                         && !sacrifice_rest_remainder)
                         || is_inside_temporal_prefix(&before_lower)
@@ -895,6 +905,7 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                         || continuous_modifier_conjunct
                         || roll_die_modifier_continuation
                         || bare_becomes_continuation
+                        || mass_exile_union_continuation
                         || inside_prefix_comma_and_continuation;
                         if !suppress && starts_bare_and_clause(remainder_trimmed) {
                             push_clause_chunk(&mut chunks, before_and, Some(ClauseBoundary::Comma));
@@ -1008,6 +1019,38 @@ fn parse_search_exile_name_suffix(input: &str) -> Result<(&str, ()), nom::Err<Or
     Ok((rest, ()))
 }
 
+/// CR 205.2a + CR 205.3a + CR 608.2c: true when the clause-so-far is an "exile
+/// all/each …" mass effect and `next_lower` (the text right after a comma or a
+/// bare "and") is another "[all|each] <type>" union leg — where `<type>` spans
+/// both card types (205.2a) and subtypes (205.3a). Such a separator is a within-effect
+/// union delimiter — not a clause boundary — so the whole multi-type union
+/// reaches `parse_exile_ast` (→ `parse_mass_type_union`) as one chunk rather than
+/// fragmenting "all artifacts" / "all enchantments" into verb-less sub_abilities
+/// (Everything Comes to Dust). Combinator-only; no string-method dispatch.
+fn continues_mass_exile_union(current_lower: &str, next_lower: &str) -> bool {
+    type E<'a> = OracleError<'a>;
+    if alt((tag::<_, _, E>("exile all "), tag("exile each ")))
+        .parse(current_lower.trim_start())
+        .is_err()
+    {
+        return false;
+    }
+    // The comma path leaves a leading conjunction ("and …" / "or …") on `next`.
+    let seg = alt((
+        tag::<_, _, E>("and/or "),
+        tag::<_, _, E>("and "),
+        tag::<_, _, E>("or "),
+    ))
+    .parse(next_lower.trim_start())
+    .map(|(rest, _)| rest)
+    .unwrap_or_else(|_| next_lower.trim_start())
+    .trim_start();
+    match alt((tag::<_, _, E>("all "), tag::<_, _, E>("each "))).parse(seg) {
+        Ok((rest, _)) => crate::parser::oracle_target::starts_with_type_word(rest.trim_start()),
+        Err(_) => false,
+    }
+}
+
 fn split_comma_clause_boundary(current: &str, remainder: &str) -> Option<(ClauseBoundary, usize)> {
     let current_lower = current.trim().to_ascii_lowercase();
     let trimmed = remainder.trim_start();
@@ -1015,6 +1058,14 @@ fn split_comma_clause_boundary(current: &str, remainder: &str) -> Option<(Clause
     let trimmed_lower = trimmed.to_ascii_lowercase();
 
     if starts_prefix_clause(&current_lower) {
+        return None;
+    }
+
+    // CR 205.2a + CR 205.3a + CR 608.2c: keep an "exile all/each A, all B, and
+    // all C" union intact — a comma before a "[all|each] <type>" continuation is
+    // a union delimiter, not a clause boundary (Everything Comes to Dust). Legs
+    // span card types (205.2a) and subtypes (205.3a).
+    if continues_mass_exile_union(&current_lower, &trimmed_lower) {
         return None;
     }
 
@@ -1576,6 +1627,8 @@ fn is_inside_temporal_prefix(lower: &str) -> bool {
 /// - "that player each" — the player-axis form (Council's-dilemma "for each
 ///   player who chose <choice>" body).
 /// - "target opponent each" / "target player each" — targeted player-axis forms.
+///   The parser binds their exact player scope after the splitter preserves the
+///   full clause.
 /// - "that creature each" — the object-axis form (CR 115.1 parent-target
 ///   binding; e.g. Gogo, Mysterious Mime's "~ and that creature each get
 ///   +2/+0 and gain haste ... and attack this turn if able").
@@ -4054,6 +4107,11 @@ pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<Contin
             .parse(after_put)
             {
                 PutCount::AnyNumber
+            } else if all_consuming(alt((tag::<_, _, OracleError<'_>>("all"), tag("each"))))
+                .parse(after_put)
+                .is_ok()
+            {
+                PutCount::All
             } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("up to ").parse(after_put) {
                 nom_primitives::parse_number
                     .parse(rest)
@@ -4334,6 +4392,30 @@ pub(super) fn parse_its_face_down_profile(lower: &str) -> Option<FaceDownProfile
     let mut subtypes: Vec<String> = Vec::new();
     loop {
         rest = rest.trim_start();
+        // Non-terminal extra core type word (e.g. "artifact creature"). A
+        // core-type word followed by a space is a *modifier*, not the clause's
+        // terminating noun, so it must be tried BEFORE the bare-noun terminator
+        // below. Otherwise "artifact creature" matches the terminal
+        // `tag("artifact")`, leaves a non-empty " creature" tail, and rejects
+        // the whole clause (the latent bug behind Missy / Cyber Conversion's
+        // "It's a 2/2 Cyberman artifact creature.").
+        if let Ok((after, ct)) = alt((
+            value(
+                CoreType::Artifact,
+                tag::<_, _, OracleError<'_>>("artifact "),
+            ),
+            value(CoreType::Enchantment, tag("enchantment ")),
+            value(CoreType::Land, tag("land ")),
+            value(CoreType::Planeswalker, tag("planeswalker ")),
+        ))
+        .parse(rest)
+        {
+            if !extra_core_types.contains(&ct) {
+                extra_core_types.push(ct);
+            }
+            rest = after;
+            continue;
+        }
         // Terminator: a core-type noun then optional ".". The terminal noun maps
         // directly to its `CoreType` — Creature is the only one that yields a
         // creature body; every other core type ("land", "artifact", ...)
@@ -4387,24 +4469,6 @@ pub(super) fn parse_its_face_down_profile(lower: &str) -> Option<FaceDownProfile
                     })
                 }
             };
-        }
-        // Non-terminal extra core type word (e.g. "artifact creature").
-        if let Ok((after, ct)) = alt((
-            value(
-                CoreType::Artifact,
-                tag::<_, _, OracleError<'_>>("artifact "),
-            ),
-            value(CoreType::Enchantment, tag("enchantment ")),
-            value(CoreType::Land, tag("land ")),
-            value(CoreType::Planeswalker, tag("planeswalker ")),
-        ))
-        .parse(rest)
-        {
-            if !extra_core_types.contains(&ct) {
-                extra_core_types.push(ct);
-            }
-            rest = after;
-            continue;
         }
         // Subtype (land type "Forest", creature type "Spirit", ...).
         if let Some((canonical, consumed)) = crate::parser::oracle_util::parse_subtype(rest) {
@@ -4581,6 +4645,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::ExileResolvingSpellInsteadOfGraveyard
         | Effect::PreventDamage { .. }
         | Effect::CreateDamageReplacement { .. }
+        | Effect::CreateDrawReplacement { .. }
         | Effect::LoseTheGame { .. }
         | Effect::WinTheGame { .. }
         | Effect::RollDie { .. }
@@ -5296,6 +5361,10 @@ pub(super) fn parse_followup_continuation_ast(
                 | "exile that card face down"
                 | "exile the card"
                 | "exile the card face down"
+                | "exile them"
+                | "exile them face down"
+                | "exile those cards"
+                | "exile those cards face down"
         ) =>
         {
             Some(ContinuationAst::SearchResultClauseHandled)
@@ -5786,6 +5855,16 @@ fn parse_keyword_list(input: &str) -> nom::IResult<&str, Vec<Keyword>, OracleErr
     Ok((rest, keywords))
 }
 
+/// Parse a trailing evergreen keyword grant list (e.g. "deathtouch and lifelink").
+/// The input must start at the first keyword; returns unconsumed tail.
+pub(super) fn parse_keyword_grant_list(input: &str) -> Option<(Vec<Keyword>, &str)> {
+    let (rest, keywords) = parse_keyword_list(input).ok()?;
+    if keywords.is_empty() {
+        return None;
+    }
+    Some((keywords, rest))
+}
+
 /// CR 702: Parse "The same is true for <keyword list>." — Odric, Lunarch
 /// Marshal's follow-up sentence that extends the antecedent keyword grant to
 /// each additional listed keyword.
@@ -6024,6 +6103,82 @@ mod tests {
             "search its controller's graveyard, hand, and library for any number of cards with the same name as that land and exile them",
         );
         assert_eq!(chunks.len(), 1, "unexpected split: {chunks:?}");
+    }
+
+    #[test]
+    fn search_exile_them_followup_is_absorbed_after_library_exile_destination() {
+        let previous = Effect::ChangeZone {
+            origin: Some(Zone::Library),
+            destination: Zone::Exile,
+            target: TargetFilter::Any,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![],
+            face_down_profile: None,
+        };
+        let result =
+            parse_followup_continuation_ast("exile them", &previous, &mut ParseContext::default());
+        assert_eq!(result, Some(ContinuationAst::SearchResultClauseHandled));
+    }
+
+    /// CR 701.23a + CR 701.18a (cluster 35 / Mana Severance): comma-split
+    /// "search …, exile them, then shuffle" must lower to one SearchLibrary
+    /// compound with a single library→exile destination and shuffle — not a
+    /// duplicate ChangeZone from the redundant "exile them" restatement.
+    #[test]
+    fn mana_severance_search_any_number_lands_exile_then_shuffle() {
+        use super::super::parse_effect_chain;
+
+        let def = parse_effect_chain(
+            "Search your library for any number of land cards, exile them, then shuffle.",
+            AbilityKind::Spell,
+        );
+
+        let mut searches = 0usize;
+        let mut library_exiles = 0usize;
+        let mut shuffles = 0usize;
+        let mut node = Some(&def);
+        while let Some(d) = node {
+            match &*d.effect {
+                Effect::SearchLibrary { filter, count, .. } => {
+                    searches += 1;
+                    assert!(
+                        matches!(count, QuantityExpr::UpTo { .. }),
+                        "any-number search must be up-to bounded, got {count:?}"
+                    );
+                    assert!(
+                        matches!(
+                            filter,
+                            TargetFilter::Typed(typed) if typed.type_filters.contains(&TypeFilter::Land)
+                        ),
+                        "expected land filter, got {filter:?}"
+                    );
+                }
+                Effect::ChangeZone {
+                    origin: Some(Zone::Library),
+                    destination: Zone::Exile,
+                    ..
+                } => {
+                    library_exiles += 1;
+                }
+                Effect::Shuffle { .. } => {
+                    shuffles += 1;
+                }
+                _ => {}
+            }
+            node = d.sub_ability.as_deref();
+        }
+
+        assert_eq!(searches, 1, "expected exactly one SearchLibrary");
+        assert_eq!(
+            library_exiles, 1,
+            "expected exactly one library→exile destination"
+        );
+        assert_eq!(shuffles, 1, "expected exactly one Shuffle");
     }
 
     #[test]
@@ -7139,6 +7294,33 @@ mod tests {
     }
 
     #[test]
+    fn put_mass_of_them_into_hand_is_all() {
+        for text in [
+            "Put all of them into your hand.",
+            "Put each of them into your hand.",
+            "Put all of those cards into your hand.",
+            "Put each of those cards into your hand.",
+        ] {
+            let dig = make_dig_effect();
+            let result = parse_followup_continuation_ast(text, &dig, &mut ParseContext::default());
+            assert_eq!(
+                result,
+                Some(ContinuationAst::DigFromAmong {
+                    quantity: PutCount::All,
+                    filter: TargetFilter::Any,
+                    destination: Some(Zone::Hand),
+                    rest_destination: None,
+                    enters_under: None,
+                    face_down_profile: None,
+                    enter_tapped: false,
+                    reveal_verb: false,
+                }),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn put_all_milled_cards_onto_battlefield_tapped_patches_enter_tapped() {
         let mill = Effect::Mill {
             count: QuantityExpr::Fixed { value: 3 },
@@ -7737,6 +7919,27 @@ mod tests {
         assert_eq!(creature.body, FaceDownBody::Creature);
         assert_eq!(creature.power, Some(3));
         assert_eq!(creature.toughness, Some(3));
+
+        // CR 205.1a: a creature body with an EXTRA core type before "creature"
+        // ("It's a 2/2 Cyberman artifact creature." — Missy / Cyber Conversion).
+        // The non-terminal "artifact " modifier must be consumed before the
+        // terminal "creature" noun; the subtype "Cyberman" is retained.
+        let cyberman =
+            parse_its_face_down_profile("it's a 2/2 cyberman artifact creature").unwrap();
+        assert_eq!(cyberman.body, FaceDownBody::Creature);
+        assert_eq!(cyberman.power, Some(2));
+        assert_eq!(cyberman.toughness, Some(2));
+        assert_eq!(cyberman.extra_core_types, vec![CoreType::Artifact]);
+        assert_eq!(cyberman.subtypes, vec!["Cyberman".to_string()]);
+
+        // Sibling without an extra core type proves the reorder did not regress
+        // the plain "<subtype> creature" form.
+        let zombie = parse_its_face_down_profile("it's a 1/1 zombie creature").unwrap();
+        assert_eq!(zombie.body, FaceDownBody::Creature);
+        assert_eq!(zombie.power, Some(1));
+        assert_eq!(zombie.toughness, Some(1));
+        assert!(zombie.extra_core_types.is_empty());
+        assert_eq!(zombie.subtypes, vec!["Zombie".to_string()]);
 
         // A non-creature body must reject a stray P/T ("It's a 2/2 land." is not
         // a valid characteristic line — lands have no power/toughness).

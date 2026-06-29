@@ -7,8 +7,8 @@ use crate::types::ability::{
     additional_cost_instance_payment_count, additional_cost_instance_payment_count_for_ordinal,
     AbilityDefinition, AdditionalCost, AdditionalCostInstancePayment, AdditionalCostOrigin,
     BasicLandType, CastTimingPermission, CastVariantPaid, CastingPermission, CastingRestriction,
-    ChosenAttribute, ChosenSubtypeKind, ModalChoice, ReplacementDefinition, SolveCondition,
-    SpellCastingOption, StaticDefinition, TriggerDefinition,
+    ChosenAttribute, ChosenSubtypeKind, CostPaidObjectSnapshot, ModalChoice, ReplacementDefinition,
+    SolveCondition, SpellCastingOption, StaticDefinition, TriggerDefinition,
 };
 use crate::types::card::{LayoutKind, PrintedCardRef, TokenImageRef};
 use crate::types::card_type::{CardType, CoreType};
@@ -574,6 +574,17 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_variant_paid: Option<(CastVariantPaid, u32)>,
 
+    /// CR 400.7d: an ability of a permanent may reference what costs were paid to
+    /// cast the spell that became it. This snapshots the object paid as a cost to
+    /// cast that spell (e.g. the creature sacrificed to Emerge), copied from the
+    /// resolving spell's `ResolvedAbility.cost_paid_object` at cast resolution and
+    /// propagated into source-bound triggered abilities so an ETB trigger can
+    /// reference "the sacrificed creature's toughness" via
+    /// `ObjectScope::CostPaidObject`. Cleared on battlefield entry (CR 400.7) and
+    /// restored across the entry reset via `CastLinkSnapshot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_cost_paid_object: Option<CostPaidObjectSnapshot>,
+
     /// CR 603.6a + CR 400.7: When this permanent was put onto the battlefield as
     /// part of resolving an ability's effect, this is the `ObjectId` of that
     /// ability's source permanent. Set by `deliver_replaced_zone_change` on
@@ -1036,6 +1047,36 @@ impl GameObject {
                 self.base_power = Some(*power);
                 self.base_toughness = Some(*toughness);
             }
+            PerpetualModification::ModifyPowerToughness {
+                power_delta,
+                toughness_delta,
+            } => {
+                let base_power = self
+                    .base_power
+                    .or(self.power)
+                    .unwrap_or(0)
+                    .saturating_add(*power_delta);
+                let base_toughness = self
+                    .base_toughness
+                    .or(self.toughness)
+                    .unwrap_or(0)
+                    .saturating_add(*toughness_delta);
+                self.base_power = Some(base_power);
+                self.base_toughness = Some(base_toughness);
+            }
+            PerpetualModification::GrantKeywords { keywords } => {
+                for keyword in keywords {
+                    if !self.keywords.contains(keyword) {
+                        self.keywords.push(keyword.clone());
+                    }
+                    // CR 613.1: perpetual keyword grants must survive the layer
+                    // pass's `keywords = base_keywords.clone()` reset — mirror
+                    // base_* P/T edits and the crew-keyword test seeding pattern.
+                    if !self.base_keywords.contains(keyword) {
+                        self.base_keywords.push(keyword.clone());
+                    }
+                }
+            }
         }
         self.perpetual_mods.push(modification.clone());
     }
@@ -1249,6 +1290,7 @@ impl GameObject {
             summoning_sick: false,
             echo_due: false,
             cast_variant_paid: None,
+            cast_cost_paid_object: None,
             entered_via_ability_source: None,
             cast_timing_permission: None,
             cost_x_paid: None,
@@ -1338,6 +1380,10 @@ impl GameObject {
             colors: self.color.clone(),
             chosen_attributes: self.chosen_attributes.clone(),
             counters: self.counters.clone(),
+            // CR 110.5: Capture live tap status. This snapshot is taken while the
+            // object is still in its public zone (mana-spent / attack-declaration
+            // captures), so `self.tapped` is authoritative.
+            tapped: self.tapped,
         }
     }
 
@@ -1405,6 +1451,11 @@ impl GameObject {
         self.pair_controller = None;
         self.chosen_attributes.clear();
         self.cast_variant_paid = None;
+        // CR 400.7d: the cast-cost-paid object (e.g. the emerge-sacrificed
+        // creature) is bound to the casting event that produced this object. A
+        // re-entering permanent has no memory of it — clear here and let the
+        // cast resolution path restore it via `CastLinkSnapshot`.
+        self.cast_cost_paid_object = None;
         // CR 400.7 + CR 603.6a: Ability-placement provenance is per-entry. Clear
         // it here so the set-block in `deliver_replaced_zone_change` repopulates
         // it only for ability-effect-driven entries (Kodama anti-recursion guard).

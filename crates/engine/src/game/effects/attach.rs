@@ -34,7 +34,10 @@ pub fn resolve(
     // `ability.targets` here would steal the ParentTarget bearer (Zack Fair).
     // `Any`/`Any` pairs share one iterator so [equipment, host] slots stay ordered.
     let mut target_slots = ability.targets.iter();
-    let attachment_id = if attachment_filter_uses_explicit_target_slot(attachment_filter) {
+    let attachment_id = if matches!(attachment_filter, TargetFilter::ParentTarget) {
+        resolve_parent_target_attachment_from_trigger(state)
+            .or_else(|| resolve_object_filter(state, ability, attachment_filter, &mut target_slots))
+    } else if attachment_filter_uses_explicit_target_slot(attachment_filter) {
         resolve_object_filter(state, ability, attachment_filter, &mut target_slots)
     } else {
         resolve_object_filter(state, ability, attachment_filter, &mut std::iter::empty())
@@ -136,6 +139,26 @@ fn current_attachment_target(state: &GameState, attachment_id: ObjectId) -> Opti
         .map(target_ref_from_attach_target)
 }
 
+fn attachment_tree_contains(state: &GameState, root_id: ObjectId, candidate_id: ObjectId) -> bool {
+    let mut remaining = vec![root_id];
+    let mut visited = Vec::new();
+
+    while let Some(id) = remaining.pop() {
+        if visited.contains(&id) {
+            continue;
+        }
+        if id == candidate_id {
+            return true;
+        }
+        visited.push(id);
+        if let Some(object) = state.objects.get(&id) {
+            remaining.extend(object.attachments.iter().copied());
+        }
+    }
+
+    false
+}
+
 /// CR 608.2d + CR 601.2c: Optional or activation-deferred attach sub-instructions
 /// (Nahiri, the Lithomancer +2) choose the Equipment only after the controller
 /// accepts at resolution. When multiple Equipment match, prompt instead of
@@ -227,6 +250,34 @@ fn explicit_attachment_target_chosen(
             target,
             TargetRef::Object(id) if matches_target_filter(state, *id, &effective, &ctx)
         )
+    })
+}
+
+/// CR 603.6a + CR 608.2c + CR 301.5b: In "When this/that Equipment enters,
+/// attach it/that Equipment to target creature" triggers, the attachment operand
+/// is the object that caused the ETB trigger, while the creature is the chosen
+/// target. Resolve only real attachment subtypes from the trigger event so
+/// general ParentTarget target inheritance remains unchanged.
+fn resolve_parent_target_attachment_from_trigger(state: &GameState) -> Option<ObjectId> {
+    let object_id = match state.current_trigger_event.as_ref()? {
+        GameEvent::ZoneChanged {
+            object_id,
+            to: Zone::Battlefield,
+            ..
+        } => *object_id,
+        _ => return None,
+    };
+    state.objects.get(&object_id).and_then(|obj| {
+        if obj
+            .card_types
+            .subtypes
+            .iter()
+            .any(|subtype| matches!(subtype.as_str(), "Aura" | "Equipment" | "Fortification"))
+        {
+            Some(object_id)
+        } else {
+            None
+        }
     })
 }
 
@@ -443,6 +494,13 @@ pub(crate) fn attachment_illegality(
     // attached to itself.) Single-authority self-attach guard protecting both
     // `can_attach_to_object` and `attach_to`.
     if attachment_id == host_id {
+        return Some(AttachIllegality::Prohibited);
+    }
+    // CR 701.3b + CR 301.5c + CR 303.4d: an illegal attachment attempt does
+    // nothing. A host already attached, directly or indirectly, to the proposed
+    // attachment would make the attachment graph cyclic, the same invalid shape
+    // as self-attach.
+    if attachment_tree_contains(state, attachment_id, host_id) {
         return Some(AttachIllegality::Prohibited);
     }
     // CR 701.3a: `CantBeAttached` blocks any attachment from being attached to
@@ -1623,6 +1681,38 @@ mod tests {
             state.objects.get(&equip).unwrap().attachments.is_empty(),
             "self-attach adds nothing to attachments"
         );
+    }
+
+    #[test]
+    fn attachment_cycle_is_prohibited_and_no_op() {
+        let mut state = setup();
+        let creature = spawn_creature(&mut state, "Bearer");
+        let equipment = spawn_equipment(&mut state, "Assassin Gauntlet", 10);
+
+        attach_to(&mut state, equipment, creature);
+
+        assert_eq!(
+            attachment_illegality(&state, creature, equipment),
+            Some(AttachIllegality::Prohibited),
+            "attaching a host to its own attachment would create a cycle"
+        );
+        assert!(!can_attach_to_object(&state, creature, equipment));
+        assert_eq!(attach_to(&mut state, creature, equipment), None);
+        assert_eq!(state.objects.get(&creature).unwrap().attached_to, None);
+        assert_eq!(
+            state.objects.get(&equipment).unwrap().attached_to,
+            Some(AttachTarget::Object(creature))
+        );
+        assert_eq!(
+            state.objects.get(&creature).unwrap().attachments,
+            vec![equipment]
+        );
+        assert!(state
+            .objects
+            .get(&equipment)
+            .unwrap()
+            .attachments
+            .is_empty());
     }
 
     #[test]

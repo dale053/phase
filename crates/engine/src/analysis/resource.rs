@@ -94,7 +94,7 @@ pub enum CounterClass {
 
 impl CounterClass {
     /// Map an engine [`CounterType`] to its analysis classification.
-    fn from_counter_type(ct: &CounterType) -> CounterClass {
+    pub(crate) fn from_counter_type(ct: &CounterType) -> CounterClass {
         match ct {
             CounterType::Plus1Plus1 => CounterClass::Plus1Plus1,
             CounterType::Minus1Minus1 => CounterClass::Minus1Minus1,
@@ -465,6 +465,59 @@ impl ResourceVector {
         }
         out
     }
+
+    /// CR 732.2a: **controller-scoped** net-progress — the single authority shared
+    /// by Engine A ([`crate::analysis::detect_loop`]) and Engine B
+    /// ([`crate::analysis::candidate_cycles`]). Returns true iff the cycle makes
+    /// unbounded progress on ≥1 axis without leaving the loop's controller with an
+    /// unsustainable net deficit on a *consumed* axis (their own life or mana).
+    ///
+    /// Distinct from [`Self::is_net_progress`] (PR-0) only in *who* the
+    /// consumed-axis constraint applies to: the controller's life going negative
+    /// is unsustainable (false), but an *opponent's* life/library going negative
+    /// is the drain/mill win (progress). Engine B layers an `unbounded_production`
+    /// override on top of this base check for dynamic production (HIGH-1).
+    pub(crate) fn net_progress_for(&self, controller: PlayerId) -> bool {
+        // CR 106.1: a loop that net-spends mana across the whole pool is not
+        // sustainable. Mana is not attributed per player in the summed `mana`
+        // array, so any net-negative color is a controller-side deficit.
+        if self.mana.iter().any(|&n| n < 0) {
+            return false;
+        }
+        // CR 119: the controller losing life across the cycle is unsustainable.
+        for (pid, &n) in &self.life {
+            if *pid == controller && n < 0 {
+                return false;
+            }
+        }
+        !self.unbounded_axes_for(controller).is_empty()
+    }
+
+    /// CR 732.2a + CR 704.5a: the unbounded axes of this delta with the
+    /// opponent-vs-controller sign rules a win classifier needs. Builds on
+    /// [`Self::unbounded_components`] (every strictly-positive axis plus any
+    /// nonzero library) and additionally surfaces an **opponent's life loss**
+    /// (negative life on a non-controller) as the drain win axis —
+    /// `unbounded_components` only reports positive life (lifegain), so a pure
+    /// drain loop would otherwise name no axis. Single authority shared by Engine
+    /// A and Engine B.
+    pub(crate) fn unbounded_axes_for(&self, controller: PlayerId) -> Vec<ResourceAxis> {
+        let mut out: Vec<ResourceAxis> = self
+            .unbounded_components()
+            .into_iter()
+            .map(|(axis, _)| axis)
+            .collect();
+        // CR 704.5a: an opponent's life driven *down* each cycle is the drain win.
+        for (pid, &n) in &self.life {
+            if n < 0 && *pid != controller {
+                let axis = ResourceAxis::Life(*pid);
+                if !out.contains(&axis) {
+                    out.push(axis);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Whether a resource axis is *consumed* (spendable inside a loop) or purely
@@ -718,6 +771,38 @@ fn project_out_resources(state: &GameState) -> GameState {
     // CR 506 / CR 500.8: combat/phase tallies an extra-combat loop pumps.
     s.combat_phases_started_this_turn = 0;
     s.end_steps_started_this_turn = 0;
+
+    // CR 104.4b / CR 732.2a — MODULO LAYER ONLY. The strict `loop_states_equal` /
+    // `normalize_for_loop` are deliberately NOT changed; they never call this fn
+    // (`project_out_resources` is reached only via `loop_states_equal_modulo_resources`).
+    //
+    // A triggered/activated ability placed on the stack takes a FRESH
+    // `entry_id = ObjectId(next_object_id++)` every time it goes on the stack, and
+    // `StackEntry`/`GameState` `PartialEq` compare that id. A MANDATORY trigger
+    // cascade (e.g. Marauding Blight-Priest + Bloodthirsty Conqueror) holds one
+    // in-loop trigger on the stack at every priority window (the stack never empties
+    // between resolutions), so two same-phase cycle points differ ONLY in this
+    // volatile id and never compare modulo-equal — the loop is invisible to the
+    // modulo scan. Canonicalize the id to its stack POSITION (the modulo analogue of
+    // `normalize_for_loop` zeroing `next_object_id`) while PRESERVING
+    // source_id/controller/kind, so different triggers/spells from different sources
+    // at the same depth still compare UNEQUAL.
+    //
+    // What is STILL compared element-wise inside `kind` (and is therefore the real
+    // discriminator, left intentionally untouched): for a `TriggeredAbility` the
+    // `trigger_event` (`GameEvent::LifeChanged { player_id, amount }` for the drain
+    // class — no volatile id, constant amount per cycle), `subject_match_count`, and
+    // `die_result`, plus the boxed `ability` and `condition`. These are CONTENT, not
+    // bookkeeping: a residual difference in any of them only makes the two states
+    // compare UNEQUAL, which SUPPRESSES a match — fail-safe (never a false win). The
+    // same fail-safe direction holds for any state field that still references a raw
+    // stack id (`stack_paid_facts`, `pending_trigger_entry`, a `WaitingFor` carrying
+    // a stack-entry id): left AS-IS, a residual mismatch can only suppress a match.
+    // Canonicalizing the position id can therefore never MANUFACTURE a false positive
+    // (a wrongful win); it can only make a genuine repeat visible.
+    for (pos, entry) in s.stack.iter_mut().enumerate() {
+        entry.id = ObjectId(pos as u64);
+    }
 
     s
 }
@@ -1347,5 +1432,71 @@ mod tests {
             &state,
             &(ObjectId(9999), 0)
         ));
+    }
+
+    /// Build a `TriggeredAbility` stack entry from `source`/`controller` with the
+    /// given volatile `entry_id` (fresh each cycle in the live reducer).
+    fn trigger_entry(
+        entry_id: u64,
+        source: u64,
+        controller: u8,
+    ) -> crate::types::game_state::StackEntry {
+        use crate::types::ability::{Effect, QuantityExpr, ResolvedAbility, TargetFilter};
+        use crate::types::game_state::{StackEntry, StackEntryKind};
+        let src = ObjectId(source);
+        StackEntry {
+            id: ObjectId(entry_id),
+            source_id: src,
+            controller: PlayerId(controller),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: src,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                    vec![],
+                    src,
+                    PlayerId(controller),
+                )),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+            },
+        }
+    }
+
+    /// U-stack ([BLOCKER 0]): the modulo comparator must treat two cascade cycle
+    /// points whose stacks hold the SAME triggered ability from the SAME source but
+    /// a DIFFERENT (fresh) entry id as equal — otherwise a mandatory trigger cascade
+    /// is invisible to the modulo scan and PR-3 is dead code. The control pair (a
+    /// DIFFERENT source) must still compare UNEQUAL (the canon zeroes only the
+    /// bookkeeping id, never the content).
+    ///
+    /// Revert proof: removing the `entry.id = ObjectId(pos)` loop in
+    /// `project_out_resources` flips the first assertion to `false`.
+    #[test]
+    fn modulo_equal_ignores_volatile_stack_entry_id() {
+        let mut a = GameState::new_two_player(7);
+        a.stack.push_back(trigger_entry(10, 500, 0));
+        let mut b = a.clone();
+        b.stack.clear();
+        b.stack.push_back(trigger_entry(11, 500, 0)); // same source, fresh id
+        assert!(
+            loop_states_equal_modulo_resources(&a, &b),
+            "same triggered ability from the same source must compare equal modulo its fresh id"
+        );
+
+        // CONTROL: a different source_id is a genuinely different stack point.
+        let mut c = a.clone();
+        c.stack.clear();
+        c.stack.push_back(trigger_entry(10, 501, 0));
+        assert!(
+            !loop_states_equal_modulo_resources(&a, &c),
+            "a trigger from a DIFFERENT source must NOT be equated (content is preserved)"
+        );
     }
 }

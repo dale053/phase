@@ -20,7 +20,7 @@ use engine::ai_support::{
 };
 use engine::database::CardDatabase;
 use engine::game::derived_views::derive_views;
-use engine::game::validate_name_deck_for_format;
+use engine::game::validate_name_deck_for_format_full;
 use engine::types::events::GameEvent;
 use engine::types::game_state::GameState;
 use engine::types::player::PlayerId;
@@ -55,7 +55,7 @@ use server_core::lobby::RegisterGameRequest;
 use server_core::lobby_subscriber_wire_guard::guard_lobby_subscriber_capacity;
 use server_core::protocol::{
     build_commit, ClientMessage, RankedPlayerResult, ServerMessage, ServerMode,
-    MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
+    LOBBY_MIN_SUPPORTED_PROTOCOL, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
 };
 use server_core::resolve_deck;
 use server_core::seat_mutation_wire_guard::guard_seat_mutation;
@@ -601,6 +601,13 @@ fn classify_hello_gate(
     }
 }
 
+fn supported_protocol_range(mode: ServerMode) -> std::ops::RangeInclusive<u32> {
+    match mode {
+        ServerMode::Full => MIN_SUPPORTED_PROTOCOL..=PROTOCOL_VERSION,
+        ServerMode::LobbyOnly => LOBBY_MIN_SUPPORTED_PROTOCOL..=PROTOCOL_VERSION,
+    }
+}
+
 /// Returns `Some(error_message)` when `msg` is disabled under the current
 /// server `mode`. Called at the top of dispatch so each handler below can
 /// assume the message reached it legitimately.
@@ -672,6 +679,9 @@ fn guard_full_create_game_settings_inbound(
 ) -> Result<u8, String> {
     let pc = fields.player_count.clamp(2, MAX_FULL_GAME_PLAYER_COUNT);
     lobby_broker::validate_create_game_settings_inbound_fields(&fields)?;
+    if let Some(format_config) = fields.format_config {
+        format_config.validate_for_player_count(pc)?;
+    }
     guard_create_ai_seats(ai_seats, pc)?;
     lobby_broker::validate_deck_payload("deck", fields.deck)?;
     Ok(pc)
@@ -2436,6 +2446,8 @@ impl DeckResolver for ServerDeckResolver<'_> {
             main_deck: deck.main_deck,
             sideboard: deck.sideboard,
             commander: deck.commander,
+            planar_deck: deck.planar_deck,
+            scheme_deck: deck.scheme_deck,
             attraction_deck: deck.attraction_deck,
             contraption_deck: deck.contraption_deck,
             sticker_sheets: deck.sticker_sheets,
@@ -2662,7 +2674,7 @@ async fn handle_client_message(
     match classify_hello_gate(
         identity.client_hello.is_some(),
         &client_msg,
-        MIN_SUPPORTED_PROTOCOL..=PROTOCOL_VERSION,
+        supported_protocol_range(mode),
     ) {
         HelloGateOutcome::Accept(info) => {
             info!(
@@ -3519,6 +3531,7 @@ async fn handle_client_message(
                     password: password.as_deref(),
                     timer_seconds,
                     player_count: requested_player_count,
+                    format_config: format_config.as_ref(),
                     room_name: room_name.as_deref(),
                     host_peer_id: host_peer_id.as_deref(),
                     draft_metadata: draft_metadata.as_ref(),
@@ -3565,13 +3578,28 @@ async fn handle_client_message(
 
             // Validate player deck against the selected format
             if let Some(ref fc) = format_config {
-                if let Err(reasons) = validate_name_deck_for_format(
+                if fc.format == engine::types::format::GameFormat::Planechase
+                    && !ai_seats.is_empty()
+                {
+                    let msg = ServerMessage::Error {
+                        message: "Planechase does not support AI seats yet".to_string(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = socket.send(Message::text(json)).await;
+                    }
+                    return;
+                }
+                if let Err(reasons) = validate_name_deck_for_format_full(
                     db,
                     &deck.main_deck,
                     &deck.sideboard,
                     &deck.commander,
+                    &deck.planar_deck,
+                    &deck.scheme_deck,
+                    &deck.signature_spell,
                     fc.format,
                     Some(match_config.match_type),
+                    usize::from(pc),
                 ) {
                     let msg = ServerMessage::Error {
                         message: format!(
@@ -3613,13 +3641,17 @@ async fn handle_client_message(
                     },
                 };
                 if let Some(ref fc) = format_config {
-                    if let Err(reasons) = validate_name_deck_for_format(
+                    if let Err(reasons) = validate_name_deck_for_format_full(
                         db,
                         &ai_deck_data.main_deck,
                         &ai_deck_data.sideboard,
                         &ai_deck_data.commander,
+                        &ai_deck_data.planar_deck,
+                        &ai_deck_data.scheme_deck,
+                        &ai_deck_data.signature_spell,
                         fc.format,
                         Some(match_config.match_type),
+                        usize::from(pc),
                     ) {
                         let msg = ServerMessage::Error {
                             message: format!(
@@ -3729,6 +3761,7 @@ async fn handle_client_message(
                     );
                     info!(game = %game_code, host = %display_name, players = pc, "game created via lobby");
 
+                    let mut initial_player_count = 1;
                     if let Some(session) = mgr.sessions.get_mut(&game_code) {
                         session.start_when_full = start_when_full;
                         session.ranked = ranked;
@@ -3758,6 +3791,8 @@ async fn handle_client_message(
 
                     // Store lobby metadata on the session and persist to SQLite.
                     if let Some(session) = mgr.sessions.get_mut(&game_code) {
+
+                        initial_player_count = session.current_player_count();
                         session.lobby_meta = Some(server_core::PersistedLobbyMeta {
                             host_name: display_name.clone(),
                             public,
@@ -3775,6 +3810,10 @@ async fn handle_client_message(
                 identity.set_session(game_code.clone(), PlayerId(0), player_token.clone());
 
                 // Phase 2 ── register the host connection; released before broadcast.
+                };
+
+                identity.set_session(game_code.clone(), PlayerId(0), player_token.clone());
+
                 {
                     let mut conns = connections.lock().await;
                     conns
@@ -3786,6 +3825,12 @@ async fn handle_client_message(
                 // Phase 3 ── register with lobby broker and snapshot the
                 // public-game entry while the lobby lock is held; released
                 // before the subsequent .await calls.
+                }
+
+                // Pull the client's advertised build identity from the
+                // stored ClientHello. `client_hello` is guaranteed Some here
+                // because the handshake gate at the top of this function
+                // rejects any non-hello frame when it's None.
                 let (host_version, host_build_commit) = identity
                     .client_hello
                     .as_ref()
@@ -3802,6 +3847,10 @@ async fn handle_client_message(
                         &game_code,
                         RegisterGameRequest {
                             host_name: display_name.clone(),
+                    lob.register_game(
+                        &game_code,
+                        RegisterGameRequest {
+                            host_name: display_name,
                             public,
                             password,
                             timer_seconds,
@@ -3848,6 +3897,8 @@ async fn handle_client_message(
                         None
                     }
                 }; // lobby lock released here
+                    lob.public_game(&game_code)
+                };
 
                 // Phase 4 ── all locks are free; send replies and broadcast.
                 // `broadcast_player_slots` re-acquires state + connections —
@@ -5993,6 +6044,7 @@ mod full_create_guard_tests {
             password: None,
             timer_seconds: None,
             player_count: 2,
+            format_config: None,
             room_name: None,
             host_peer_id,
             draft_metadata,
@@ -6045,6 +6097,19 @@ mod full_create_guard_tests {
     }
 
     #[test]
+    fn full_create_guard_rejects_archenemy_seat_outside_player_count() {
+        let deck = deck();
+        let mut fields = fields(&deck, None, None);
+        let mut format_config = engine::types::format::FormatConfig::archenemy();
+        format_config.archenemy_player = Some(engine::types::player::PlayerId(2));
+        fields.format_config = Some(&format_config);
+
+        let err = guard_full_create_game_settings_inbound(fields, &[]).unwrap_err();
+
+        assert!(err.contains("archenemy_player"));
+    }
+
+    #[test]
     fn full_create_guard_rejects_ai_seats_before_deck_payload() {
         let mut deck = deck();
         deck.main_deck =
@@ -6060,6 +6125,143 @@ mod full_create_guard_tests {
             .unwrap_err();
 
         assert!(err.contains("ai_seats[0].seat_index"));
+    }
+}
+
+#[cfg(test)]
+mod issue_4548_full_create_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use server_core::protocol::{ClientMessage, DeckData, ServerMessage};
+    use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::WebSocketStream;
+
+    fn empty_deck() -> DeckData {
+        DeckData::default()
+    }
+
+    async fn spawn_full_mode_server() -> (String, tokio::task::JoinHandle<()>, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let game_db = Arc::new(
+            persistence::GameDb::open(&temp_dir.path().join("games.db")).expect("game db"),
+        );
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(AppState {
+                sessions: Arc::new(Mutex::new(SessionManager::new())),
+                draft_sessions: Arc::new(Mutex::new(DraftSessionManager::new())),
+                draft_pools: Arc::new(draft_pools::DraftPools::default()),
+                connections: Arc::new(Mutex::new(HashMap::new())),
+                db: Arc::new(CardDatabase::default()),
+                lobby: Arc::new(Mutex::new(Broker::new())),
+                lobby_subscribers: Arc::new(Mutex::new(Vec::new())),
+                player_count: Arc::new(AtomicU32::new(0)),
+                game_db,
+                draft_spectators: Arc::new(Mutex::new(HashMap::new())),
+                game_spectators: Arc::new(Mutex::new(HashMap::new())),
+                mode: ServerMode::Full,
+                public_url: None,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+
+        (format!("ws://{addr}/ws"), handle, temp_dir)
+    }
+
+    async fn recv_server_message<S>(socket: &mut WebSocketStream<S>) -> ServerMessage
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let msg = socket
+            .next()
+            .await
+            .expect("websocket message")
+            .expect("websocket frame");
+        match msg {
+            WsMessage::Text(text) => serde_json::from_str(&text).expect("server message"),
+            other => panic!("expected text server message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_mode_create_sends_slots_after_game_created() {
+        let (url, server, _temp_dir) = spawn_full_mode_server().await;
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut socket, _) = tokio_tungstenite::connect_async(url)
+                .await
+                .expect("connect");
+
+            assert!(matches!(
+                recv_server_message(&mut socket).await,
+                ServerMessage::ServerHello { .. }
+            ));
+
+            let hello = ClientMessage::ClientHello {
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                build_commit: build_commit().to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            };
+            socket
+                .send(WsMessage::Text(
+                    serde_json::to_string(&hello).expect("hello json").into(),
+                ))
+                .await
+                .expect("send hello");
+
+            let create = ClientMessage::CreateGameWithSettings {
+                deck: empty_deck(),
+                display_name: "Alice".to_string(),
+                public: true,
+                password: None,
+                timer_seconds: None,
+                player_count: 2,
+                match_config: Default::default(),
+                ai_seats: Vec::new(),
+                format_config: None,
+                room_name: None,
+                host_peer_id: None,
+                draft_metadata: None,
+                start_when_full: true,
+                ranked: false,
+            };
+            socket
+                .send(WsMessage::Text(
+                    serde_json::to_string(&create).expect("create json").into(),
+                ))
+                .await
+                .expect("send create");
+
+            let mut game_code = None;
+            let mut saw_slots = false;
+            while game_code.is_none() || !saw_slots {
+                match recv_server_message(&mut socket).await {
+                    ServerMessage::GameCreated {
+                        game_code: code, ..
+                    } => game_code = Some(code),
+                    ServerMessage::PlayerSlotsUpdate { slots } => {
+                        assert_eq!(slots.len(), 2);
+                        assert_eq!(slots[0].name, "Alice");
+                        saw_slots = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            game_code.expect("created game code")
+        })
+        .await;
+        server.abort();
+
+        assert!(
+            result.is_ok(),
+            "full-mode create deadlocked before slot broadcast"
+        );
     }
 }
 
@@ -6271,30 +6473,44 @@ mod handshake_tests {
     }
 
     #[test]
-    fn accepts_min_supported_protocol_below_current() {
-        // Range hello gate: a client one version behind (e.g., release after
-        // the server has rolled forward to preview) must still be admitted to
-        // the lobby. Cross-version game interop is gated separately at join
-        // boundaries (per-game protocol-version filtering, follow-up work).
-        // `MIN_SUPPORTED_PROTOCOL < PROTOCOL_VERSION` is true by construction
-        // (MIN derives from PROTOCOL_VERSION.saturating_sub(1)) whenever
-        // PROTOCOL_VERSION > 0; no runtime assert needed.
+    fn rejects_previous_protocol_for_breaking_planechase_release() {
+        let previous = PROTOCOL_VERSION.saturating_sub(1);
         let outcome = classify_hello_gate(
             false,
             &ClientMessage::ClientHello {
                 client_version: "0.1.10".into(),
                 build_commit: "old1234".into(),
-                protocol_version: MIN_SUPPORTED_PROTOCOL,
+                protocol_version: previous,
             },
             MIN_SUPPORTED_PROTOCOL..=PROTOCOL_VERSION,
+        );
+        assert_eq!(
+            outcome,
+            HelloGateOutcome::RejectProtocol {
+                client: previous,
+                server: PROTOCOL_VERSION,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_previous_protocol_for_lobby_only_range() {
+        let previous = PROTOCOL_VERSION.saturating_sub(1);
+        let outcome = classify_hello_gate(
+            false,
+            &ClientMessage::ClientHello {
+                client_version: "0.1.10".into(),
+                build_commit: "old1234".into(),
+                protocol_version: previous,
+            },
+            LOBBY_MIN_SUPPORTED_PROTOCOL..=PROTOCOL_VERSION,
         );
         assert!(matches!(outcome, HelloGateOutcome::Accept(_)));
     }
 
     #[test]
     fn rejects_client_hello_below_min_supported() {
-        // Two versions behind is outside the supported window; reject.
-        let too_old = MIN_SUPPORTED_PROTOCOL.saturating_sub(1);
+        let too_old = PROTOCOL_VERSION.saturating_sub(1);
         let outcome = classify_hello_gate(
             false,
             &ClientMessage::ClientHello {

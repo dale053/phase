@@ -370,6 +370,7 @@ fn snapshot_parent_dependent_quantities(
                 ManaProduction::Colorless { count }
                 | ManaProduction::AnyOneColor { count, .. }
                 | ManaProduction::AnyCombination { count, .. }
+                | ManaProduction::AnyCombinationOfObjectColors { count, .. }
                 | ManaProduction::ChosenColor { count, .. },
             ..
         } => {
@@ -1915,6 +1916,7 @@ mod tests {
                 colors: vec![],
                 chosen_attributes: Vec::new(),
                 counters: lki_counters,
+                tapped: false,
             },
         );
 

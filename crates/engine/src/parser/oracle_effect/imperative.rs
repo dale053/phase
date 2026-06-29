@@ -44,8 +44,8 @@ use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
 
 use super::super::oracle_target::{
-    parse_target, parse_target_with_ctx, parse_target_with_syntax, parse_type_phrase,
-    resolve_pronoun_target, TargetSyntax,
+    parse_mass_type_union, parse_target, parse_target_with_ctx, parse_target_with_syntax,
+    parse_type_phrase, resolve_pronoun_target, TargetSyntax,
 };
 use super::super::oracle_util::{
     contains_possessive, contains_self_or_object_pronoun, parse_count_expr, parse_mana_symbols,
@@ -653,6 +653,28 @@ pub(super) fn parse_numeric_imperative_ast(
         let rest_lower = rest.to_ascii_lowercase();
         if let Some(count) = parse_dynamic_count_phrase(rest_lower.as_str()) {
             return Some(NumericImperativeAst::Draw { count, up_to });
+        }
+        // CR 121.1: Bare plural "draw cards" / "draw card" with no quantifier is
+        // only produced as an aggregate/for-each head after the dynamic count tail
+        // ("... equal to the number of <X> votes" / "... for each <X> vote") has
+        // already been stripped by the vote parser. With the dynamic tail removed
+        // the residue carries no quantity, so a Fixed{1} placeholder cannot hide a
+        // dynamic-quantity gap (the coverage concern guarded just below): the vote
+        // aggregate binder immediately rebinds this slot to QuantityRef::VoteCount.
+        // "draw a card" / "draw N cards" are unaffected — they reach
+        // parse_count_expr with a parseable count; only a bare "card" / "cards"
+        // remainder (nothing else) trips this arm.
+        if all_consuming(value(
+            (),
+            alt((tag::<_, _, OracleError<'_>>("cards"), tag("card"))),
+        ))
+        .parse(rest.trim().trim_end_matches('.'))
+        .is_ok()
+        {
+            return Some(NumericImperativeAst::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                up_to,
+            });
         }
         // CR 121.1: When the verb committed but the quantity phrase
         // can't be classified, return None so the line surfaces as
@@ -1356,11 +1378,22 @@ pub(super) fn parse_targeted_action_ast(
             min_count: 0,
         });
     }
-    // Simple targeted verbs: tap, untap — parse target after verb prefix
-    if let Some((verb, rest)) = nom_on_lower(text, lower, |input| {
-        alt((value("tap", tag("tap ")), value("untap", tag("untap ")))).parse(input)
+    // Simple targeted verbs: tap, untap — parse target after verb prefix.
+    // CR 701.26a/b: dispatch on the typed `TapStateChange` marker produced by the
+    // combinator (not a stringly-typed verb), so the AST split is exhaustive.
+    if let Some((state, rest)) = nom_on_lower(text, lower, |input| {
+        alt((
+            value(TapStateChange::Tap, tag("tap ")),
+            value(TapStateChange::Untap, tag("untap ")),
+        ))
+        .parse(input)
     }) {
-        let (target_text, _) = super::strip_optional_target_prefix(strip_article(rest));
+        // CR 115.1d + CR 701.26a: Preserve the "up to N target" count instead of
+        // discarding it — "tap up to that many target creatures" (Nyssa of Traken)
+        // carries a dynamic `EventContextAmount` count that the lowering threads
+        // onto `ParsedEffectClause.multi_target` so the right number of optional
+        // target slots is surfaced.
+        let (target_text, multi_target) = super::strip_optional_target_prefix(strip_article(rest));
         // CR 608.2k: A bare object pronoun ("untaps it") in a subject-bearing
         // clause is an anaphor, not a parent-target chain. Route it through
         // `resolve_it_pronoun` — identical to the sacrifice/counter clauses in
@@ -1379,11 +1412,16 @@ pub(super) fn parse_targeted_action_ast(
             assert_no_compound_remainder(_rem, text);
             target
         };
-        return match verb {
-            "tap" => Some(TargetedImperativeAst::Tap { target }),
-            "untap" => Some(TargetedImperativeAst::Untap { target }),
-            _ => unreachable!(),
-        };
+        return Some(match state {
+            TapStateChange::Tap => TargetedImperativeAst::Tap {
+                target,
+                multi_target,
+            },
+            TapStateChange::Untap => TargetedImperativeAst::Untap {
+                target,
+                multi_target,
+            },
+        });
     }
     if let Some((_, rest)) = nom_on_lower(text, lower, |input| value((), tag("goad ")).parse(input))
     {
@@ -1850,12 +1888,15 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
     match ast {
         // CR 701.26a/b: map the parser AST tap/untap variants onto the
         // parameterized `Effect::SetTapState` (scope = Single/All, state = Tap/Untap).
-        TargetedImperativeAst::Tap { target } => Effect::SetTapState {
+        // CR 701.26a: The variable target count (`multi_target`) is carried on the
+        // CLAUSE, not the Effect, so it is threaded in `lower_imperative_family_ast`
+        // (the bare-Effect path here cannot hold it).
+        TargetedImperativeAst::Tap { target, .. } => Effect::SetTapState {
             target,
             scope: EffectScope::Single,
             state: TapStateChange::Tap,
         },
-        TargetedImperativeAst::Untap { target } => Effect::SetTapState {
+        TargetedImperativeAst::Untap { target, .. } => Effect::SetTapState {
             target,
             scope: EffectScope::Single,
             state: TapStateChange::Untap,
@@ -2975,6 +3016,13 @@ pub(super) fn parse_choose_ast(
     {
         let rest_lower = &lower[lower.len() - rest.len()..];
 
+        // CR 609.7a: "choose a source you control" — damage-source selection,
+        // not permanent targeting. Must precede `is_choose_as_targeting`, which
+        // would misroute this shape to `TargetOnly { Any }`.
+        if let Some(ast) = try_parse_choose_damage_source(rest) {
+            return Some(ast);
+        }
+
         // CR 101.4 + CR 701.21a: "choose from among ... an artifact, a creature, ..."
         // or "choose an artifact, a creature, ... from among ..."
         // Must be checked before is_choose_as_targeting since these are NOT targeting.
@@ -3053,6 +3101,13 @@ pub(super) fn parse_choose_ast(
     }
 
     None
+}
+
+/// CR 609.7a: "choose a source [you control|...]" lowers to `ChooseDamageSource`.
+fn try_parse_choose_damage_source(rest: &str) -> Option<ChooseImperativeAst> {
+    let source_filter =
+        crate::parser::oracle_replacement::parse_choose_damage_source_candidate(rest)?;
+    Some(ChooseImperativeAst::DamageSource { source_filter })
 }
 
 /// CR 108.3 + CR 701.38d: Detect "a <type> owned by the voter" and emit
@@ -3876,6 +3931,9 @@ fn parse_core_type_name(input: &str) -> Option<(&str, CoreType)> {
 
 pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
     match ast {
+        ChooseImperativeAst::DamageSource { source_filter } => {
+            Effect::ChooseDamageSource { source_filter }
+        }
         ChooseImperativeAst::TargetOnly { target } => Effect::TargetOnly { target },
         ChooseImperativeAst::Reparse { text } => super::parse_effect(&text),
         ChooseImperativeAst::NamedChoice {
@@ -4526,7 +4584,8 @@ fn parse_prevent_effect(text: &str) -> Effect {
         TargetFilter::Any
     };
 
-    let damage_source_filter = parse_prevent_damage_source_filter(text, &lower);
+    let damage_source_filter = parse_prevent_damage_source_filter(text, &lower)
+        .or_else(|| parse_prevent_that_would_deal_source_filter(text, &lower));
 
     // CR 615.11 + CR 107.3i: `amount_dynamic` (the "prevent X … where X is
     // <quantity>" override) is populated at chunk level by
@@ -4541,6 +4600,27 @@ fn parse_prevent_effect(text: &str) -> Effect {
         scope,
         damage_source_filter,
         prevention_duration,
+    }
+}
+
+/// CR 615.2 + CR 109.4: Source-scoped prevent phrasing without a "target"
+/// keyword — "prevent all combat damage that other creatures would deal this
+/// turn" (Haze Frog). The `<source>` descriptor sits between "that " and
+/// " would deal"; route through the shared target grammar so "other"/"another"
+/// map to `FilterProp::Another`.
+fn parse_prevent_that_would_deal_source_filter(text: &str, lower: &str) -> Option<TargetFilter> {
+    let (before_would_deal, _) = split_once_on_lower(text, lower, " would deal")?;
+    let before_lower = before_would_deal.to_lowercase();
+    let (_, source_descriptor) = split_once_on_lower(before_would_deal, &before_lower, "that ")?;
+    let mut ctx = ParseContext::default();
+    let (filter, rem) = parse_target_with_ctx(source_descriptor.trim(), &mut ctx);
+    let rem = rem.trim().trim_end_matches('.');
+    if !rem.is_empty() {
+        return None;
+    }
+    match filter {
+        TargetFilter::Any | TargetFilter::Controller | TargetFilter::Player => None,
+        other => Some(other),
     }
 }
 
@@ -6211,6 +6291,29 @@ pub(super) fn parse_library_player_suffix<'a>(
     None
 }
 
+/// CR 112.1: A spell is a card on the stack. `scope_target_spell_phrase` lowers
+/// a "spell"/"spells" head noun to a `StackSpell` leg, so detecting a `StackSpell`
+/// (or an explicit `InZone(Stack)`) in the PARSED filter is how the "exile all
+/// spells" wipe knows to constrain its population to the stack. Recurses through
+/// `Or`/`And`/`Not`. Checks the parsed structure, never the raw text — a "spell"
+/// buried in a relative clause ("a creature that convoked this spell") must not
+/// trigger the constraint, and "cards" (also `TypeFilter::Card`, e.g. "exile all
+/// cards from target player's library", Jace) must NOT be treated as a spell.
+fn filter_targets_stack(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::StackSpell | TargetFilter::StackAbility { .. } => true,
+        TargetFilter::Typed(typed) => typed
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::InZone { zone: Zone::Stack })),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(filter_targets_stack)
+        }
+        TargetFilter::Not { filter } => filter_targets_stack(filter),
+        _ => false,
+    }
+}
+
 pub(super) fn parse_exile_ast(
     text: &str,
     lower: &str,
@@ -6314,11 +6417,21 @@ pub(super) fn parse_exile_ast(
         value((), alt((tag("exile all "), tag("exile each ")))).parse(input)
     }) {
         let rest_lower = &lower[lower.len() - rest.len()..];
-        let (parsed_target, _rem) = parse_target(rest);
+        // CR 205.2a + CR 205.3a + CR 608.2c: parse the full target as a
+        // multi-type union so "exile all A except <X>, all B, and all C" lowers to
+        // one `ChangeZoneAll { Or[…] }` instead of fragmenting the trailing
+        // "all B"/"all C" legs into verb-less sub-abilities (Everything Comes to
+        // Dust). Union legs span card types (205.2a) and subtypes (205.3a).
+        let (parsed_target, _rem) = parse_mass_type_union(rest, ctx);
         #[cfg(debug_assertions)]
         assert_no_compound_remainder(_rem, text);
-        // CR 701.5a: "exile all spells" must constrain to the stack.
-        let target = if nom_primitives::scan_contains(rest_lower, "spell") {
+        // CR 109.2b + CR 701.13a: "exile all spells" must scope to the stack, but
+        // the bare word "spell" can appear deep inside a relative clause ("a
+        // creature that convoked this spell", Everything Comes to Dust) where it
+        // must NOT force a stack constraint. The parser is the detector: only
+        // constrain when the PARSED filter actually references a stack object,
+        // never a substring scan over the raw text.
+        let target = if filter_targets_stack(&parsed_target) {
             super::constrain_filter_to_stack(parsed_target)
         } else {
             parsed_target
@@ -6458,8 +6571,27 @@ pub(super) fn parse_exile_ast(
     // Excise the consumed clause so the debug-only compound-remainder assert
     // below does not flag it.
     let rem_lower = rem.to_ascii_lowercase();
-    let (enter_with_counters, counters_offset) =
+    let (mut enter_with_counters, counters_offset) =
         super::parse_with_counters_suffix_spanned(&rem_lower);
+    // CR 122.1 + CR 702.62b: An anaphoric exile target ("that card" / "it" /
+    // "those cards") greedily absorbs the trailing counter instruction —
+    // `parse_target` returns `ParentTarget`/`SelfRef` with an EMPTY remainder —
+    // so the counters would be silently dropped (Sibylline Soothsayer: "Exile
+    // that card with three time counters on it"). When the post-target
+    // remainder yielded none AND the target is a bare anaphor (which cannot
+    // carry a "with N counters" FILTER — that reading only applies to
+    // descriptive targets like "exile each creature with a +1/+1 counter on
+    // it"), recover the enter-with-counters suffix from the full clause. The
+    // `rem` is already empty in this case, so `counters_offset` stays `None`.
+    if enter_with_counters.is_empty()
+        && matches!(
+            parsed_target,
+            TargetFilter::ParentTarget | TargetFilter::SelfRef
+        )
+    {
+        let rest_lower_full = rest_text.to_ascii_lowercase();
+        enter_with_counters = super::parse_with_counters_suffix(&rest_lower_full);
+    }
     let _rem = match counters_offset {
         Some(off) => &rem[..off],
         None => rem,
@@ -7370,6 +7502,15 @@ pub(super) fn parse_imperative_family_ast(
                         .or_else(|| parse_put_ast(text, lower, ctx).map(ImperativeFamilyAst::Put))
                 })
         };
+    }
+
+    // CR 614.11 + CR 614.6: One-shot "the next time you would draw a card this
+    // turn, [effect] instead" delayed DRAW replacement (Words of Worship/
+    // Wilding). Also begins with "the next time", so intercepted here before the
+    // first-word verb dispatch. The detector is the prefix combinator inside
+    // `parse_oneshot_draw_replacement`; on failure it returns `None`.
+    if let Some(effect) = crate::parser::oracle_replacement::parse_oneshot_draw_replacement(lower) {
+        return Some(ImperativeFamilyAst::GainKeyword(effect));
     }
 
     // NOTE: when adding verbs here, also add them to IMPERATIVE_EXTRA_VERBS
@@ -9317,6 +9458,30 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
             extra_filters,
         ),
         ImperativeFamilyAst::Shuffle(ast) => lower_shuffle_ast(ast),
+        // CR 115.1d + CR 701.26a/b: "tap/untap up to N target creatures" (Nyssa of
+        // Traken: "tap up to that many target creatures"). The bare-Effect lowering
+        // (`lower_targeted_action_ast`) cannot carry the variable target count, so
+        // a Tap/Untap AST that captured a `multi_target` is lowered here and the
+        // count is threaded onto the clause — mirroring the `Support` arm below.
+        ImperativeFamilyAst::Structured(ImperativeAst::Targeted(
+            ast @ (TargetedImperativeAst::Tap {
+                multi_target: Some(_),
+                ..
+            }
+            | TargetedImperativeAst::Untap {
+                multi_target: Some(_),
+                ..
+            }),
+        )) => {
+            let multi_target = match &ast {
+                TargetedImperativeAst::Tap { multi_target, .. }
+                | TargetedImperativeAst::Untap { multi_target, .. } => multi_target.clone(),
+                _ => None,
+            };
+            let mut clause = parsed_clause(lower_targeted_action_ast(ast));
+            clause.multi_target = multi_target;
+            clause
+        }
         // CR 701.41a: Support N → PutCounter with multi-target "up to N".
         // On permanents (is_other=true): "up to N other target creatures"
         // On instants/sorceries (is_other=false): "up to N target creatures"
@@ -11484,6 +11649,34 @@ mod tests {
             }
             other => panic!("expected Draw with a toughness count, got {other:?}"),
         }
+    }
+
+    /// CR 121.1: a bare plural "draw cards" / "draw card" with no quantifier —
+    /// the residue left after the vote parser strips a dynamic count tail
+    /// ("... equal to the number of <X> votes") — yields a Fixed(1) placeholder
+    /// the vote aggregate binder then rebinds to `QuantityRef::VoteCount`.
+    #[test]
+    fn parse_bare_draw_cards_yields_fixed_one() {
+        for text in ["draw cards", "draw card", "draw cards."] {
+            let lower = text.to_lowercase();
+            match parse_numeric_imperative_ast(text, &lower) {
+                Some(NumericImperativeAst::Draw { count, up_to }) => {
+                    assert!(!up_to, "bare draw is not 'up to' for {text:?}");
+                    assert_eq!(count, QuantityExpr::Fixed { value: 1 }, "text={text:?}");
+                }
+                other => panic!("expected bare Draw, got {other:?} for {text:?}"),
+            }
+        }
+    }
+
+    /// Negative guard: a bare-draw with an unmodeled tail must NOT collapse to
+    /// Fixed(1) — it stays `None` (→ `Effect::Unimplemented` upstream) so the
+    /// dynamic-quantity coverage gap is not silently hidden.
+    #[test]
+    fn parse_draw_cards_with_unmodeled_tail_is_none() {
+        let text = "draw cards from the top of their library";
+        let lower = text.to_lowercase();
+        assert!(parse_numeric_imperative_ast(text, &lower).is_none());
     }
 
     #[test]
@@ -14073,6 +14266,90 @@ mod tests {
         }
     }
 
+    /// CR 609.7a: Desperate Gambit's "Choose a source you control" must lower to
+    /// `ChooseDamageSource` with a controller-scoped candidate filter, not
+    /// `TargetOnly { Any }`.
+    #[test]
+    fn desperate_gambit_choose_source_you_control_lowers_to_choose_damage_source() {
+        use crate::types::ability::ControllerRef;
+
+        let text = "choose a source you control";
+        let lower = text.to_lowercase();
+        let ast = parse_choose_ast(text, &lower, &mut ParseContext::default())
+            .expect("must parse choose-a-source-you-control");
+        match ast {
+            ChooseImperativeAst::DamageSource { ref source_filter } => {
+                let tf = typed_leg(source_filter).expect("expected typed source filter");
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(
+                    tf.type_filters.is_empty(),
+                    "article 'a' must not parse as subtype A: {tf:?}"
+                );
+            }
+            other => panic!("expected DamageSource AST, got {other:?}"),
+        }
+
+        let effect = lower_choose_ast(ast);
+        match effect {
+            Effect::ChooseDamageSource { source_filter } => {
+                let tf = typed_leg(&source_filter).expect("expected typed source filter");
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(
+                    tf.type_filters.is_empty(),
+                    "article 'a' must not parse as subtype A: {tf:?}"
+                );
+            }
+            other => panic!("expected ChooseDamageSource effect, got {other:?}"),
+        }
+    }
+
+    /// CR 609.7a + CR 705: Desperate Gambit's lose branch bare "it" must thread
+    /// `ChosenDamageSource` when the chain opens with `ChooseDamageSource`.
+    #[test]
+    fn desperate_gambit_lose_branch_threads_chosen_damage_source() {
+        use crate::parser::oracle_effect::parse_effect_chain;
+
+        fn find_flip_coin(def: &AbilityDefinition) -> Option<&Effect> {
+            if matches!(&*def.effect, Effect::FlipCoin { .. }) {
+                return Some(&def.effect);
+            }
+            def.sub_ability
+                .as_deref()
+                .and_then(find_flip_coin)
+                .or_else(|| def.else_ability.as_deref().and_then(find_flip_coin))
+        }
+
+        let text = "Choose a source you control. Flip a coin. If you win the flip, \
+            the next time that source would deal damage this turn, it deals double that damage instead. \
+            If you lose the flip, the next time it would deal damage this turn, prevent that damage.";
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        let flip = find_flip_coin(&def).expect("expected FlipCoin in chain");
+        let Effect::FlipCoin {
+            win_effect,
+            lose_effect,
+            ..
+        } = flip
+        else {
+            unreachable!();
+        };
+        let win = win_effect.as_ref().expect("win branch");
+        let lose = lose_effect.as_ref().expect("lose branch");
+        assert!(matches!(
+            &*win.effect,
+            Effect::CreateDamageReplacement {
+                source_filter: Some(TargetFilter::ChosenDamageSource),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &*lose.effect,
+            Effect::PreventDamage {
+                damage_source_filter: Some(TargetFilter::ChosenDamageSource),
+                ..
+            }
+        ));
+    }
+
     /// CR 115.1c + CR 608.2c regression: "target X and put a counter on it"
     /// must NOT be split into two target slots. The "and ..." continuation
     /// is a compound action handled by `try_split_targeted_compound`, not a
@@ -15864,6 +16141,42 @@ mod tests {
         assert_eq!(
             damage_source_filter, None,
             "recipient prevent must not carry a source filter"
+        );
+    }
+
+    /// CR 615.2 + CR 109.4: Haze Frog — "prevent all combat damage that other
+    /// creatures would deal this turn" must scope the shield to non-self creature
+    /// sources via `FilterProp::Another`, not a blanket prevent-all.
+    #[test]
+    fn prevent_that_other_creatures_would_deal_scopes_source_filter() {
+        let effect = parse_prevent_effect(
+            "Prevent all combat damage that other creatures would deal this turn.",
+        );
+        let Effect::PreventDamage {
+            amount,
+            target,
+            scope,
+            damage_source_filter,
+            prevention_duration,
+            ..
+        } = effect
+        else {
+            panic!("expected PreventDamage, got {effect:?}");
+        };
+        assert_eq!(amount, PreventionAmount::All);
+        assert_eq!(target, TargetFilter::Any);
+        assert_eq!(scope, PreventionScope::CombatDamage);
+        assert_eq!(prevention_duration, Some(Duration::UntilEndOfTurn));
+        let damage_source_filter =
+            damage_source_filter.expect("expected Typed creature source filter");
+        let TargetFilter::Typed(tf) = damage_source_filter else {
+            panic!("expected Typed source filter, got {damage_source_filter:?}");
+        };
+        assert!(has_type(&tf, TypeFilter::Creature));
+        assert!(
+            tf.properties.contains(&FilterProp::Another),
+            "other creatures must carry FilterProp::Another, got {:?}",
+            tf.properties
         );
     }
 

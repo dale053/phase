@@ -1313,6 +1313,20 @@ pub enum ManaProduction {
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
     },
+    /// CR 106.1 + CR 106.5 + CR 202.2c: Produce `count` mana, each freely chosen
+    /// among the colors of an object identified by `scope` (Omnath, Locus of All:
+    /// "add three mana in any combination of its colors"). Unlike the static
+    /// `AnyCombination` (whose `color_options` are fixed at parse time), the color
+    /// set here is computed dynamically at resolution time from the scoped object's
+    /// colors (CR 202.2c). Its analog is the dynamic-color family
+    /// (`AnyOneColorAmongPermanents` / `DistinctColorsAmongPermanents`), not the
+    /// static `AnyCombination`. If the object has no colors, CR 106.5 applies and
+    /// no mana is produced.
+    AnyCombinationOfObjectColors {
+        #[serde(default = "default_quantity_one")]
+        count: QuantityExpr,
+        scope: ObjectScope,
+    },
     /// CR 106.7 + CR 106.1b: Produce N mana of any **type** (W/U/B/R/G/C) that a
     /// land matching `land_filter` could produce. Differs from
     /// `OpponentLandColors` in that the choice axis is the full type set
@@ -1463,6 +1477,11 @@ impl<'de> serde::Deserialize<'de> for ManaProduction {
                         #[serde(default = "default_quantity_one")]
                         count: QuantityExpr,
                     },
+                    AnyCombinationOfObjectColors {
+                        #[serde(default = "default_quantity_one")]
+                        count: QuantityExpr,
+                        scope: ObjectScope,
+                    },
                     AnyTypeProduceableBy {
                         #[serde(default = "default_quantity_one")]
                         count: QuantityExpr,
@@ -1538,6 +1557,9 @@ impl<'de> serde::Deserialize<'de> for ManaProduction {
                     },
                     ManaProductionHelper::OpponentLandColors { count } => {
                         ManaProduction::OpponentLandColors { count }
+                    }
+                    ManaProductionHelper::AnyCombinationOfObjectColors { count, scope } => {
+                        ManaProduction::AnyCombinationOfObjectColors { count, scope }
                     }
                     ManaProductionHelper::AnyTypeProduceableBy { count, land_filter } => {
                         ManaProduction::AnyTypeProduceableBy { count, land_filter }
@@ -2625,6 +2647,13 @@ pub enum FilterProp {
     /// of `BlockingSource`; used by "choose a creature that saddled it this turn"
     /// (Calamity, Galloping Inferno).
     SaddledSource,
+    /// CR 702.51c: Matches a creature that convoked the filter source — i.e. was
+    /// tapped to pay the source spell's convoke cost, recorded in the source
+    /// object's `convoked_creatures`. Source-relative, mirroring `SaddledSource`
+    /// / `BlockingSource`. Membership analogue of
+    /// `QuantityRef::ConvokedCreatureCount` (both read `convoked_creatures`).
+    /// Used by "a creature that convoked this spell" (Everything Comes to Dust).
+    ConvokedSource,
     /// CR 310.8a + CR 310.8e: Matches battles whose protector satisfies
     /// `controller` relative to the ability source ("each battle they protect").
     ProtectorMatches {
@@ -2814,6 +2843,19 @@ pub enum FilterProp {
     ColorCount {
         comparator: Comparator,
         count: u8,
+    },
+    /// CR 107.4 + CR 202.1: Matches objects whose count of colored mana symbols
+    /// in the printed mana cost satisfies `comparator` against `value`.
+    /// `color: Some(c)` counts symbols contributing to color `c` (hybrid /
+    /// monocolored-hybrid / Phyrexian via `ManaCostShard::contributes_to`,
+    /// CR 107.4a/107.4e/107.4f); `color: None` counts each colored symbol once.
+    /// `value` is a printed constant. Filter sibling of
+    /// `QuantityRef::ManaSymbolsInManaCost`; both delegate the pip count to the
+    /// single counting authority `ManaCost::count_colored_pips`.
+    ManaSymbolCount {
+        color: Option<ManaColor>,
+        comparator: Comparator,
+        value: i32,
     },
     /// Matches objects with a specific supertype (Basic, Legendary, Snow).
     HasSupertype {
@@ -3674,6 +3716,21 @@ pub enum TargetFilter {
     /// "that player exiles that many cards" where the affected player is the
     /// damage recipient, not the replacement source or damage source.
     PostReplacementDamageTarget,
+    /// CR 108.3 + CR 400.3 + CR 615.5: Resolves to the *owner* of the prevented
+    /// event's damage recipient. Event-driven analog of `ParentTargetOwner`
+    /// (owner-projection), exactly as `PostReplacementDamageTarget` is the
+    /// event-driven analog of `ParentTarget`. Used by "prevent that damage and
+    /// that creature's owner shuffles it into their library" (Weeping Angel),
+    /// where "their library" is the recipient's OWNER's library (CR 108.3),
+    /// routed there by CR 400.3 — NOT the shield controller's library.
+    ///
+    /// Resolves the OWNER (not controller) of the object in
+    /// `state.post_replacement_event_target` — mirrors
+    /// `PostReplacementSourceController`'s player-projection mechanism, NOT
+    /// `PostReplacementDamageTarget`'s raw object return. CR 109.4 (controller)
+    /// is the rule this variant is deliberately DISTINCT from; the same
+    /// owner-vs-controller split the sibling `ParentTargetOwner` cites.
+    PostReplacementDamageTargetOwner,
     /// CR 508.5 / CR 508.5a: Resolves to the defending player for the source
     /// attacking creature, looked up per attacker through
     /// `combat::defending_player_for_attacker`.
@@ -4110,9 +4167,16 @@ pub enum QuantityRef {
     /// `ManaCostShard::contributes_to`. `Recipient` preserves per-affected
     /// layer boosts such as "gets +1/+1 for each white mana symbol in its mana
     /// cost" by binding to the object currently receiving the effect.
+    ///
+    /// `color: Some(c)` counts symbols contributing to color `c`. `color: None`
+    /// counts each colored mana symbol once regardless of color — per
+    /// CR 107.4a/107.4e/107.4f a hybrid or Phyrexian symbol is a single colored
+    /// symbol even though it is all of its component colors, so e.g.
+    /// `{G/W}{G/W}` counts as 2. Used by "three or more colored mana symbols in
+    /// its mana cost" eligibility checks (Omnath, Locus of All).
     ManaSymbolsInManaCost {
         scope: ObjectScope,
-        color: ManaColor,
+        color: Option<ManaColor>,
     },
     /// CR 202.3: The mana value of the source object — i.e. the object passed
     /// as `source` to `resolve_quantity`. For an alt-cost cast (CR 118.9) this
@@ -4517,6 +4581,16 @@ pub enum QuantityRef {
     /// spell that became the source permanent. Reads `GameObject::convoked_creatures`;
     /// ETB replacement contexts resolve against the entering object.
     ConvokedCreatureCount,
+    /// CR 603.12a: Number of times the controller paid the repeated optional
+    /// cost during THIS ability's resolution ("you may pay {C} up to N times").
+    /// Resolution-local and transient: read from
+    /// `GameState::optional_cost_payments_this_resolution`, which is cleared at
+    /// the `depth == 0` prelude of `resolve_ability_chain` and incremented once
+    /// per successful payment. Distinct from the cast-time `CostXPaid` /
+    /// `KickerCount` / `AdditionalCostPaymentCount` tallies, which are read from
+    /// the source spell/object at announcement (CR 601.2 / 702.33 / 702.51).
+    /// Used to size a reflexive "choose up to that many" modal (CR 700.2d).
+    TimesCostPaidThisResolution,
     /// CR 106.3 + CR 601.2h: Mana spent to cast a spell, parameterized by
     /// which cast object is being measured and which spent-mana metric is
     /// needed. Covers total amount, distinct colors, and source-qualified
@@ -5705,6 +5779,13 @@ pub enum StaticCondition {
     /// Hamlet Glutton's "This spell costs {2} less to cast if it's bargained." Evaluated
     /// against the in-flight cast's `additional_cost_paid` flag (`state.pending_cast`).
     AdditionalCostPaid,
+    /// CR 702.34a + CR 601.2f: True when the spell is being cast via the named
+    /// alternative-cast variant (e.g. flashback "cast this way" cost reduction on
+    /// Visions of Ruin). Evaluated only during self-spell `ModifyCost` collection,
+    /// not in the layer pipeline.
+    CastingAsVariant {
+        variant: crate::types::game_state::CastingVariant,
+    },
     None,
 }
 
@@ -6031,6 +6112,11 @@ pub enum CastVariantPaid {
     /// "if its prowl cost was paid" intervening-if (Latchkey Faerie, Oona's
     /// Blackguard-style prowl payoffs).
     Prowl,
+    /// CR 702.119a-c: Emerge alternative cast cost was paid (a creature was
+    /// sacrificed and the reduced emerge mana cost paid). Read by the "if its
+    /// emerge cost was paid, instead …" intervening-if / instead clauses
+    /// (Adipose Offspring).
+    Emerge,
 }
 
 /// CR 601.3b + CR 702.8a: A timing permission actually used to cast a spell.
@@ -6478,6 +6564,29 @@ pub enum AbilityCost {
     CollectEvidence {
         amount: u32,
     },
+    /// CR 117.1 + CR 118.3 + CR 601.2b: Exile *any number* of cards matching
+    /// `filter` from `zone` as a cost, where the aggregate `function` of
+    /// `property` over the chosen cards must satisfy `comparator` against
+    /// `value`. Baron Helmut Zemo's Boast — "Exile any number of black cards
+    /// from your graveyard with fifteen or more black mana symbols among their
+    /// mana costs" — is `{ Sum, ManaSymbolCount(Black), GE, 15 }` over
+    /// `Typed(Card, You, [HasColor:Black, InZone:Graveyard])` from `Graveyard`.
+    ///
+    /// CR 601.2b/602.2b: "any number" is a count choice made as the ability is
+    /// activated; the chosen set is constrained only by the aggregate threshold,
+    /// not by a fixed cardinality. A standalone sibling of `CollectEvidence`
+    /// (CR 701.59a, the `Sum`/`ManaValue`/`GE` special case), NOT a
+    /// parameterization of `Exile` (which is a fixed-count exile with no
+    /// aggregate axis and ~132 call sites). CR 107.4a/107.4e/202.1: hybrid mana
+    /// symbols count for each of their colors via `ObjectProperty::ManaSymbolCount`.
+    ExileWithAggregate {
+        filter: TargetFilter,
+        function: AggregateFunction,
+        property: ObjectProperty,
+        comparator: Comparator,
+        value: i32,
+        zone: Zone,
+    },
     /// CR 601.2b: Tap creatures as an additional/activation cost. The
     /// `requirement` axis selects between a fixed count (Conspire's "tap two
     /// creatures") and an aggregate "any number with total power N or greater"
@@ -6643,6 +6752,60 @@ pub enum CostCategory {
 }
 
 impl AbilityCost {
+    /// CR 605.3a + CR 106.12 + CR 107.6: True iff every component of this cost is
+    /// conclusively decided by the non-simulating mana-ability cheap gate
+    /// (`mana_ability_ready_without_simulation`) — i.e. the cost is built solely
+    /// from the tap ({T}) and untap ({Q}) symbols. For such costs the production +
+    /// payment path in `resolve_mana_ability_with_selected_choices` is infallible,
+    /// so the legality clone in `can_activate_mana_ability_now` can be skipped.
+    ///
+    /// `Mana`/`ManaDynamic` are deliberately NOT covered: their payability is decided
+    /// by an auto-tap affordability witness with a known remove-then-tap soundness
+    /// gap (CR 601.2g), so they must still simulate. No wildcard arm — a future
+    /// variant must be classified explicitly.
+    pub fn all_components_cheap_gate_covered(&self) -> bool {
+        match self {
+            AbilityCost::Tap | AbilityCost::Untap => true,
+            AbilityCost::Composite { costs } => costs
+                .iter()
+                .all(AbilityCost::all_components_cheap_gate_covered),
+            // Every other variant is decided by a path the cheap gate does NOT
+            // conclusively settle (mana affordability witness, interactive object
+            // selection, life/resource availability, effect resolution, etc.), so
+            // it must still simulate.
+            AbilityCost::Mana { .. }
+            | AbilityCost::ManaDynamic { .. }
+            | AbilityCost::Loyalty { .. }
+            | AbilityCost::Sacrifice(_)
+            | AbilityCost::PayLife { .. }
+            | AbilityCost::Discard { .. }
+            | AbilityCost::Exile { .. }
+            | AbilityCost::ExileMaterials { .. }
+            | AbilityCost::CollectEvidence { .. }
+            // CR 117.1: `ExileWithAggregate` requires interactive object
+            // selection (the CR 601.2h cost-payment window), so the cheap gate
+            // cannot settle it — it must still simulate.
+            | AbilityCost::ExileWithAggregate { .. }
+            | AbilityCost::TapCreatures { .. }
+            | AbilityCost::RemoveCounter { .. }
+            | AbilityCost::PayEnergy { .. }
+            | AbilityCost::PaySpeed { .. }
+            | AbilityCost::ReturnToHand { .. }
+            | AbilityCost::Unattach
+            | AbilityCost::Mill { .. }
+            | AbilityCost::Exert
+            | AbilityCost::Blight { .. }
+            | AbilityCost::Reveal { .. }
+            | AbilityCost::Behold { .. }
+            | AbilityCost::OneOf { .. }
+            | AbilityCost::Waterbend { .. }
+            | AbilityCost::NinjutsuFamily { .. }
+            | AbilityCost::EffectCost { .. }
+            | AbilityCost::PerCounter { .. }
+            | AbilityCost::Unimplemented { .. } => false,
+        }
+    }
+
     /// CR 702.24a + CR 118.12: True iff this cost can be used as the base
     /// cost for a cumulative-upkeep trigger and then paid by the current
     /// unless-payment pipeline after `PerCounter` expansion.
@@ -6704,6 +6867,8 @@ impl AbilityCost {
             // CR 702.167a: Craft's materials component exiles other objects.
             AbilityCost::ExileMaterials { .. } => vec![CostCategory::ExilesCards],
             AbilityCost::CollectEvidence { .. } => vec![CostCategory::ExilesCards],
+            // CR 117.1: `ExileWithAggregate` exiles other cards from a zone.
+            AbilityCost::ExileWithAggregate { .. } => vec![CostCategory::ExilesCards],
             AbilityCost::TapCreatures { .. } => vec![CostCategory::TapsOtherCreatures],
             AbilityCost::RemoveCounter { .. } => vec![CostCategory::RemovesCounters],
             AbilityCost::PayEnergy { .. } => vec![CostCategory::PaysEnergy],
@@ -6802,6 +6967,9 @@ impl AbilityCost {
             // own exile is the separate `Exile { filter: SelfRef }` sub-cost.
             | AbilityCost::ExileMaterials { .. }
             | AbilityCost::CollectEvidence { .. }
+            // CR 117.1: `ExileWithAggregate` exiles OTHER cards (from the
+            // graveyard), never the source.
+            | AbilityCost::ExileWithAggregate { .. }
             | AbilityCost::TapCreatures { .. }
             | AbilityCost::RemoveCounter { .. }
             | AbilityCost::PayEnergy { .. }
@@ -7513,6 +7681,31 @@ impl StepSkipTarget {
     }
 }
 
+/// CR 614.10 + CR 614.10a: How long a skip effect persists.
+///
+/// CR 614.10: "Skip [something]" is a replacement effect equivalent to
+/// "instead of doing [something], do nothing." A skip can be scoped to either a
+/// single next occurrence of a step (`NextOccurrence`) or to *every* occurrence
+/// within the player's next non-skipped turn (`AllOfNextTurn`, e.g. False Peace
+/// / Empty City Ruse: "skips all combat phases of their next turn"). Per
+/// CR 614.10a, an "all of next turn" skip lands on the first turn that isn't
+/// itself skipped (it waits past skipped turns), and — unlike a finite-count
+/// skip — it suppresses *every* combat phase that turn, including extra combat
+/// phases created that turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipScope {
+    /// CR 614.10a: skip the single next occurrence of the named step; satisfied
+    /// once that occurrence is skipped. This is the only scope that interacts
+    /// with a finite `count`.
+    #[default]
+    NextOccurrence,
+    /// CR 614.10 + CR 614.10a: skip every occurrence of the named phase across
+    /// the player's entire next non-skipped turn. Turn-binding subsumes
+    /// counting, so this scope ignores any finite `count`.
+    AllOfNextTurn,
+}
+
 /// CR 115.1: Whether the `Bounce` effect selects its affected object at
 /// cast/activation time ("target", locked) or at resolution time (controller-
 /// scoped filter like "a creature you control" — Whitemane Lion).
@@ -7653,6 +7846,17 @@ pub enum PerpetualModification {
     /// the card's persistent base power and toughness (High Fae Prankster,
     /// Three Tree Battalion, Blood Age Muster).
     SetBasePowerToughness { power: i32, toughness: i32 },
+    /// "[object] perpetually gets +N/+M" — permanently modifies base power and
+    /// toughness by the given deltas (Heir to Dragonfire, Tiana's Vehicle).
+    ModifyPowerToughness {
+        power_delta: i32,
+        toughness_delta: i32,
+    },
+    /// "[object] perpetually gains [keyword] [and [keyword]]" — permanently
+    /// grants evergreen keywords (Monoist Gravliner station trigger).
+    GrantKeywords {
+        keywords: Vec<crate::types::keywords::Keyword>,
+    },
 }
 
 /// CR 701.20e + CR 608.2c: Discriminates where `Effect::Dig` reads its
@@ -8433,6 +8637,15 @@ pub enum Effect {
         /// Mizzix's Mastery and Cipher use `ManaCost::zero()`.
         #[serde(default)]
         cost: ManaCost,
+        /// CR 707.12a: Optional cap on how many of the copies the controller may
+        /// cast ("you may cast UP TO THREE of the copies"). `None` (the default,
+        /// preserving the 13 existing cards and their on-disk JSON) means every
+        /// copy may be cast; `Some(n)` caps the `WaitingFor::ChooseFromZoneChoice`
+        /// at `min(n, available)`. The choice is always `up_to` (CR 707.12a: the
+        /// player chooses individually whether to cast each copy), so this is an
+        /// upper bound, never a forced count.
+        #[serde(default)]
+        count: Option<QuantityExpr>,
     },
     /// CR 707.2 / CR 707.5: Create a token that's a copy of a permanent.
     /// Copies copiable characteristics (name, mana cost, color, types, P/T, abilities, keywords)
@@ -9441,6 +9654,14 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recipient_object_filter: Option<TargetFilter>,
     },
+    /// CR 614.1a + CR 614.6 + CR 514.2 + CR 121.1: install a one-shot, this-turn
+    /// "the next time you would draw a card this turn, [effect] instead" draw
+    /// replacement (Words of Worship/Wilding). Mirrors CreateDamageReplacement for
+    /// the Draw event class; the substitute is a heterogeneous Effect resolved via
+    /// the post-replacement continuation. RUNTIME: create_draw_replacement::resolve.
+    CreateDrawReplacement {
+        replacement_effect: Box<Effect>,
+    },
     /// CR 104.3e: An effect may state that a player loses the game.
     ///
     /// `target` names the player who loses the game when the effect resolves:
@@ -10120,6 +10341,15 @@ pub enum Effect {
         step: StepSkipTarget,
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
+        /// CR 614.10 + CR 614.10a: scope of the skip. `NextOccurrence` (default)
+        /// uses the finite `count` and consumes the per-player step counter at the
+        /// relevant turn-flow boundary. `AllOfNextTurn` binds the skip to the
+        /// player's entire next non-skipped turn via the turn-scoped combat-skip
+        /// state machine and is **mutually exclusive** with a finite `count` —
+        /// turn-binding subsumes counting, so `count` is ignored when
+        /// `scope == AllOfNextTurn`.
+        #[serde(default)]
+        scope: SkipScope,
     },
     /// CR 500.8: Add an additional step or phase after the specified anchor phase.
     /// Uses a LIFO stack on GameState.extra_phases. `followed_by` entries are pushed
@@ -10962,6 +11192,27 @@ impl TargetFilter {
         }
     }
 
+    /// CR 400.7d + CR 608.2k: True when this filter tree references the
+    /// cost-paid object (`TargetFilter::CostPaidObject`) at any structural
+    /// position — directly, or nested inside `And`/`Or`/`Not`/
+    /// `TrackedSetFiltered` composition. Mirrors `references_exiled_by_source`,
+    /// but uses `any` for `Or` because the consumer (the emerge cost-paid-object
+    /// propagation gate in `game::triggers`) needs to detect *any* reference to
+    /// the cost-paid object so the `cast_cost_paid_object` snapshot is propagated
+    /// whenever it could be read at resolution — not whether the filter as a
+    /// whole is a context-ref for target-slot purposes.
+    pub fn references_cost_paid_object(&self) -> bool {
+        match self {
+            TargetFilter::CostPaidObject => true,
+            TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
+                .iter()
+                .any(TargetFilter::references_cost_paid_object),
+            TargetFilter::Not { filter } => filter.references_cost_paid_object(),
+            TargetFilter::TrackedSetFiltered { filter, .. } => filter.references_cost_paid_object(),
+            _ => false,
+        }
+    }
+
     pub fn contains_source_attachment_host(&self) -> bool {
         match self {
             TargetFilter::Typed(TypedFilter { properties, .. }) => properties
@@ -11019,6 +11270,7 @@ impl TargetFilter {
                 | TargetFilter::SourceChosenPlayer
                 | TargetFilter::PostReplacementSourceController
                 | TargetFilter::PostReplacementDamageTarget
+                | TargetFilter::PostReplacementDamageTargetOwner
                 | TargetFilter::TrackedSet { .. }
                 | TargetFilter::TrackedSetFiltered { .. }
         )
@@ -11040,6 +11292,36 @@ impl TargetFilter {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// CR 608.2c: Rewrite the tracked-set sentinel (`TrackedSetId(0)`) inside
+    /// this filter to a CONCRETE tracked-set id. Recurses through `Or`/`And`/`Not`
+    /// composites. A non-sentinel `TrackedSet`/`TrackedSetFiltered` (already
+    /// bound to a real id) and every non-tracked-set filter are left untouched.
+    ///
+    /// Used when a *cost* publishes the "those exiled cards" set (Baron Helmut
+    /// Zemo's Boast): binding the sentinel to the concrete id at cost-payment
+    /// time makes the effect immune to the activation→resolution gap, during
+    /// which intervening instant-speed effects would otherwise clobber
+    /// `chain_tracked_set_id` and the latest-id heuristic.
+    pub fn rebind_tracked_set_sentinel(
+        &mut self,
+        concrete: crate::types::identifiers::TrackedSetId,
+    ) {
+        match self {
+            TargetFilter::TrackedSet { id } | TargetFilter::TrackedSetFiltered { id, .. }
+                if *id == crate::types::identifiers::TrackedSetId(0) =>
+            {
+                *id = concrete;
+            }
+            TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+                for f in filters {
+                    f.rebind_tracked_set_sentinel(concrete);
+                }
+            }
+            TargetFilter::Not { filter } => filter.rebind_tracked_set_sentinel(concrete),
+            _ => {}
         }
     }
 
@@ -11165,6 +11447,25 @@ impl Effect {
     ///
     /// Exhaustive match — no wildcards — so the compiler forces an update when new
     /// Effect variants are added.
+    /// CR 608.2c: Bind a tracked-set sentinel (`TrackedSetId(0)`) inside this
+    /// effect's tracked-set target slot to a CONCRETE id. Scoped to the effects
+    /// that consume a *cost-published* tracked set (the copy/cast/move family —
+    /// Baron Helmut Zemo's "Copy those exiled cards. You may cast … the copies").
+    /// Other effects carry no cost-published tracked-set target, so they are
+    /// intentionally left untouched (documented no-op arm).
+    pub fn bind_tracked_set_sentinel(&mut self, concrete: crate::types::identifiers::TrackedSetId) {
+        match self {
+            Effect::CastCopyOfCard { target, .. }
+            | Effect::CastFromZone { target, .. }
+            | Effect::CopySpell { target, .. }
+            | Effect::ChangeZone { target, .. }
+            | Effect::GrantCastingPermission { target, .. } => {
+                target.rebind_tracked_set_sentinel(concrete);
+            }
+            _ => {}
+        }
+    }
+
     pub fn target_filter(&self) -> Option<&TargetFilter> {
         match self {
             // --- Effects with a `target: TargetFilter` field ---
@@ -11314,6 +11615,18 @@ impl Effect {
             // effects use.
             | Effect::Discover { player, .. }
             | Effect::BlightEffect { player, .. } => Some(player),
+
+            // Digital-only Alchemy: `ApplyPerpetual.target` selects the modified
+            // object (`~` → Any/source fallback; "that creature"/"the duplicate"
+            // → ParentTarget event/chain anaphor). Context refs surface no
+            // target slot; Any likewise resolves to the source without one.
+            Effect::ApplyPerpetual { target, .. } => {
+                if matches!(target, TargetFilter::Any) {
+                    None
+                } else {
+                    Some(target)
+                }
+            }
 
             // CR 115.1a + CR 601.2c: "Create a [Role/Aura] token attached to
             // target creature" targets its host — surface `attach_to` as the
@@ -11526,7 +11839,6 @@ impl Effect {
             | Effect::RuntimeHandled { .. }
             | Effect::Conjure { .. }
             | Effect::Intensify { .. }
-            | Effect::ApplyPerpetual { .. }
             | Effect::DraftFromSpellbook { .. }
             | Effect::ChooseOneOf { .. }
             | Effect::Unimplemented { .. }
@@ -11550,7 +11862,10 @@ impl Effect {
             // CR 702.50a: EpicCopy carries its targets inside the snapshotted
             // spell ability, not in a top-level `target` field.
             | Effect::EpicCopy { .. }
-            | Effect::CreateDamageReplacement { .. } => None,
+            | Effect::CreateDamageReplacement { .. }
+            // CR 614.11: CreateDrawReplacement is non-targeted — "you would
+            // draw" scopes via the shield's source-player default, no slot.
+            | Effect::CreateDrawReplacement { .. } => None,
             // CR 115.1: RevealUntil with a non-context player filter ("target
             // opponent reveals...") requires a stack-time player target slot.
             Effect::RevealUntil { player, .. } => {
@@ -11744,6 +12059,7 @@ impl Effect {
             | Effect::Conjure { .. }
             | Effect::CreateDamageReplacement { .. }
             | Effect::CreateDelayedTrigger { .. }
+            | Effect::CreateDrawReplacement { .. }
             | Effect::CreateEmblem { .. }
             | Effect::Discover { .. }
             | Effect::Heist { .. }
@@ -11971,6 +12287,7 @@ impl Effect {
             | Effect::Conjure { .. }
             | Effect::CreateDamageReplacement { .. }
             | Effect::CreateDelayedTrigger { .. }
+            | Effect::CreateDrawReplacement { .. }
             | Effect::CreateEmblem { .. }
             | Effect::Discover { .. }
             | Effect::Heist { .. }
@@ -12161,6 +12478,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::ExileResolvingSpellInsteadOfGraveyard => "ExileResolvingSpellInsteadOfGraveyard",
         Effect::PreventDamage { .. } => "PreventDamage",
         Effect::CreateDamageReplacement { .. } => "CreateDamageReplacement",
+        Effect::CreateDrawReplacement { .. } => "CreateDrawReplacement",
         Effect::LoseTheGame { .. } => "LoseTheGame",
         Effect::WinTheGame { .. } => "WinTheGame",
         Effect::RollDie { .. } => "RollDie",
@@ -12385,6 +12703,7 @@ pub enum EffectKind {
     ExileResolvingSpellInsteadOfGraveyard,
     PreventDamage,
     CreateDamageReplacement,
+    CreateDrawReplacement,
     Regenerate,
     RemoveAllDamage,
     LoseTheGame,
@@ -12626,6 +12945,7 @@ impl From<&Effect> for EffectKind {
             }
             Effect::PreventDamage { .. } => EffectKind::PreventDamage,
             Effect::CreateDamageReplacement { .. } => EffectKind::CreateDamageReplacement,
+            Effect::CreateDrawReplacement { .. } => EffectKind::CreateDrawReplacement,
             Effect::LoseTheGame { .. } => EffectKind::LoseTheGame,
             Effect::WinTheGame { .. } => EffectKind::WinTheGame,
             Effect::RollDie { .. } => EffectKind::RollDie,
@@ -14041,6 +14361,20 @@ pub enum AbilityCondition {
         #[serde(default)]
         use_lki: bool,
     },
+    /// CR 601.2c + CR 608.2c + CR 115.1: True iff the parent ability actually has
+    /// at least one *object* target. Guards reflexive-target riders ("If that
+    /// creature …, …") against the optional-declined-target case: when a
+    /// variable-number-of-targets antecedent ("destroy up to one target
+    /// creature") is announced with zero targets (CR 601.2c), the anaphor "that
+    /// creature" has no antecedent (CR 608.2c — read the whole text), so the
+    /// rider must not fire. `evaluate_condition` checks the resolved ability's
+    /// declared targets (CR 115.1) for a `TargetRef::Object`, with NO
+    /// `TriggeringSource` fallback (unlike `TargetMatchesFilter`), so a declined
+    /// optional target reads false. The lowering pass conjoins this with the
+    /// reflexive sub-condition (`And{[HasObjectTarget, …]}`) only when the
+    /// antecedent's `multi_target.min_is_fixed_zero()` — a no-op for
+    /// mandatory-single-target cards (`multi_target == None`).
+    HasObjectTarget,
     /// CR 608.2c + CR 603.2: "if it targets a [filter]" on a triggered ability —
     /// gates the sub_ability on whether the triggering spell's chosen targets
     /// include at least one permanent or player matching `filter`. The pronoun
@@ -15416,6 +15750,18 @@ pub struct TriggerDefinition {
     pub secondary: bool,
     #[serde(default)]
     pub valid_target: Option<TargetFilter>,
+    /// CR 115.1: The player leaf of a becomes-target trigger's SUBJECT (e.g. the
+    /// "a player" / "you" half of Loki, God of Mischief's "a player or permanent").
+    /// Kept DISTINCT from `valid_target` because `valid_target` is overloaded as the
+    /// EFFECT-target slot: the effect-target parser sets `valid_target =
+    /// TargetFilter::Player` whenever the effect text says "target opponent/player"
+    /// (e.g. Venerated Rotpriest's "target opponent gets a poison counter"). The
+    /// `match_becomes_target` Player arm reads THIS field for the subject's player
+    /// match so a player-targeting EFFECT can never be mistaken for a player SUBJECT.
+    /// Set only by `set_trigger_subject`'s mixed-subject (`Or`) split; ignored by
+    /// every non-becomes-target trigger mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_subject_player: Option<TargetFilter>,
     #[serde(default)]
     pub valid_source: Option<TargetFilter>,
     /// CR 601.2a + CR 603.2: Cast-origin constraint for `TriggerMode::SpellCast`
@@ -15507,6 +15853,7 @@ impl TriggerDefinition {
             damage_kind: DamageKindFilter::Any,
             secondary: false,
             valid_target: None,
+            valid_subject_player: None,
             valid_source: None,
             spell_cast_origin: OriginConstraint::Any,
             description: None,
@@ -15779,8 +16126,12 @@ pub enum DamageModification {
     Double,
     /// amount * 3 (e.g. Fiery Emancipation)
     Triple,
-    /// amount + value (e.g. Torbran, +2)
-    Plus { value: u32 },
+    /// CR 614.1a + CR 120: amount + value, where the added magnitude is a
+    /// `QuantityExpr` resolved against the replacement source at application
+    /// time. `Fixed { value }` covers static offsets (Torbran +2, Artist's
+    /// Talent +2); a `Ref` carries a live game quantity ("...plus X, where X is
+    /// ~'s power" — Hawkeye, Young Avenger).
+    Plus { value: QuantityExpr },
     /// amount.saturating_sub(value) (e.g. Benevolent Unicorn, -1).
     /// CR 615.1 + CR 614.1a: Continuous prevention statics ("prevent that damage")
     /// emit `Minus { value: u32::MAX }` — saturating-subtraction yields 0 for any
@@ -16452,6 +16803,18 @@ pub enum ContinuousModification {
     /// each recipient of the host static (`FilterContext::from_source(recipient)`).
     GrantAllActivatedAbilitiesOf {
         source: TargetFilter,
+        /// CR 602.5b + CR 602.5c: An optional use-restriction injected into every
+        /// activated ability donated by this grant. `Some(OnlyOnceEachTurn)`
+        /// models Locus of Enlightenment's "You may activate each of those
+        /// abilities only once each turn" rider — the restriction travels with
+        /// each granted ability and is enforced per `(recipient, ability_index)`
+        /// by `game/restrictions.rs`. `None` (the default) leaves the donated
+        /// abilities uncapped, which is the correct, required behavior for every
+        /// other granting card (Myr Welder, Agatha's Soul Cauldron, Marvin,
+        /// Experiment Kraj, Necrotic Ooze, …). A typed `Option<ActivationRestriction>`
+        /// rather than a bool so the cap axis can grow to other use-restrictions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cap: Option<ActivationRestriction>,
     },
     /// CR 604.1: Grant a triggered ability to the affected object.
     /// Unlike GrantAbility (which pushes to obj.abilities), this pushes to
@@ -17049,6 +17412,30 @@ impl ResolvedAbility {
                 .objects
                 .get(&self.source_id)
                 .is_some_and(|obj| obj.incarnation == captured),
+        }
+    }
+
+    /// CR 608.2c: Bind a tracked-set sentinel (`TrackedSetId(0)`) to a CONCRETE
+    /// tracked-set id across this ability's effect and every sub/else branch.
+    ///
+    /// Used when a *cost* (not an effect) publishes the "those exiled cards" set:
+    /// the set must survive the activation→resolution gap, during which
+    /// intervening instant-speed effects can publish their own tracked sets and
+    /// clobber `chain_tracked_set_id` / the latest-id heuristic (and `state.
+    /// chain_tracked_set_id` is reset to `None` at depth-0 resolution anyway).
+    /// Rewriting the sentinel to the concrete id in the resolving ability at
+    /// cost-payment time — before the ability is pushed onto the stack — makes
+    /// the binding immune to that gap (Baron Helmut Zemo's Boast).
+    pub fn bind_tracked_set_sentinel_recursive(
+        &mut self,
+        concrete: crate::types::identifiers::TrackedSetId,
+    ) {
+        self.effect.bind_tracked_set_sentinel(concrete);
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.bind_tracked_set_sentinel_recursive(concrete);
+        }
+        if let Some(else_branch) = self.else_ability.as_mut() {
+            else_branch.bind_tracked_set_sentinel_recursive(concrete);
         }
     }
 
@@ -18175,6 +18562,7 @@ mod tests {
             damage_kind: DamageKindFilter::Any,
             secondary: false,
             valid_target: None,
+            valid_subject_player: None,
             valid_source: None,
             spell_cast_origin: OriginConstraint::Any,
             description: Some("When ~ dies, draw a card.".to_string()),
@@ -18819,6 +19207,61 @@ mod tests {
         let json = serde_json::to_string(&effect).unwrap();
         let deserialized: Effect = serde_json::from_str(&json).unwrap();
         assert_eq!(effect, deserialized);
+    }
+
+    /// CR 107.4 + CR 202.1: `ManaSymbolsInManaCost.color` is now
+    /// `Option<ManaColor>`. `None` (count each colored symbol once) and
+    /// `Some(color)` (per-color count) both round-trip. serde renders
+    /// `Some(White)` as the bare `"color":"White"`, identical to the pre-change
+    /// non-optional form, so legacy payloads deserialize to `Some(White)`.
+    #[test]
+    fn mana_symbols_in_mana_cost_optional_color_serde_roundtrip() {
+        let none_ref = QuantityRef::ManaSymbolsInManaCost {
+            scope: ObjectScope::Target,
+            color: None,
+        };
+        let json = serde_json::to_string(&none_ref).unwrap();
+        assert_eq!(
+            serde_json::from_str::<QuantityRef>(&json).unwrap(),
+            none_ref
+        );
+
+        let some_ref = QuantityRef::ManaSymbolsInManaCost {
+            scope: ObjectScope::Recipient,
+            color: Some(ManaColor::White),
+        };
+        let json = serde_json::to_string(&some_ref).unwrap();
+        assert!(json.contains("\"color\":\"White\""), "{json}");
+        assert_eq!(
+            serde_json::from_str::<QuantityRef>(&json).unwrap(),
+            some_ref
+        );
+    }
+
+    /// CR 106.1 + CR 202.2c: the dynamic-color `AnyCombinationOfObjectColors`
+    /// mana production round-trips through the custom `ManaProduction` (de)serializer.
+    #[test]
+    fn any_combination_of_object_colors_serde_roundtrip() {
+        let mp = ManaProduction::AnyCombinationOfObjectColors {
+            count: QuantityExpr::Fixed { value: 3 },
+            scope: ObjectScope::Target,
+        };
+        let json = serde_json::to_string(&mp).unwrap();
+        let back: ManaProduction = serde_json::from_str(&json).unwrap();
+        assert_eq!(mp, back);
+
+        // count defaults to one when omitted (default_quantity_one).
+        let defaulted: ManaProduction = serde_json::from_str(
+            r#"{"type":"AnyCombinationOfObjectColors","scope":{"type":"Target"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            defaulted,
+            ManaProduction::AnyCombinationOfObjectColors {
+                count: default_quantity_one(),
+                scope: ObjectScope::Target,
+            }
+        );
     }
 
     #[test]

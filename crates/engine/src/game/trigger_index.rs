@@ -416,6 +416,10 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
             push(TriggerEventKey::EnterBattlefield(narrow));
             push(TriggerEventKey::Attacks);
         }
+        // CR 702.55c: Haunt creature ETB half fires on entering the battlefield.
+        TriggerMode::EntersOrHauntedCreatureDies => {
+            push(TriggerEventKey::EnterBattlefield(narrow));
+        }
         TriggerMode::AttacksOrBlocks => {
             push(TriggerEventKey::Attacks);
             push(TriggerEventKey::Blocks);
@@ -808,6 +812,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::ExileResolvingSpellInsteadOfGraveyard
         | EffectKind::PreventDamage
         | EffectKind::CreateDamageReplacement
+        | EffectKind::CreateDrawReplacement
         | EffectKind::Regenerate
         | EffectKind::RemoveAllDamage
         | EffectKind::LoseTheGame
