@@ -1898,6 +1898,26 @@ fn persist_session_async(
     });
 }
 
+/// Session-configuration inputs for [`create_and_connect_multiplayer_session`].
+struct MultiplayerSessionRequest {
+    resolved: engine::game::deck_loading::PlayerDeckPayload,
+    display_name: String,
+    timer_seconds: Option<u32>,
+    pc: u8,
+    match_config: engine::types::match_config::MatchConfig,
+    format_config: Option<engine::types::format::FormatConfig>,
+    start_when_full: bool,
+    ranked: bool,
+    ai_requests: Vec<(
+        u8,
+        phase_ai::config::AiDifficulty,
+        engine::game::deck_loading::PlayerDeckPayload,
+    )>,
+    public: bool,
+    password: Option<String>,
+    host_tx: mpsc::UnboundedSender<ServerMessage>,
+}
+
 /// Phases 1–2 of the `CreateGameWithSettings` full multiplayer path.
 ///
 /// Phase 1 (state lock): creates the session, configures AI seats and lobby
@@ -1917,30 +1937,30 @@ fn persist_session_async(
 async fn create_and_connect_multiplayer_session(
     state: &SharedState,
     connections: &SharedConnections,
-    resolved: engine::game::deck_loading::PlayerDeckPayload,
-    display_name: &str,
-    timer_seconds: Option<u32>,
-    pc: u8,
-    match_config: engine::types::match_config::MatchConfig,
-    format_config: Option<engine::types::format::FormatConfig>,
-    start_when_full: bool,
-    ranked: bool,
-    ai_requests: &[(
-        u8,
-        phase_ai::config::AiDifficulty,
-        engine::game::deck_loading::PlayerDeckPayload,
-    )],
-    public: bool,
-    password: Option<String>,
     game_db: &SharedGameDb,
-    host_tx: mpsc::UnboundedSender<ServerMessage>,
+    req: MultiplayerSessionRequest,
 ) -> (String, String, u32) {
+    let MultiplayerSessionRequest {
+        resolved,
+        display_name,
+        timer_seconds,
+        pc,
+        match_config,
+        format_config,
+        start_when_full,
+        ranked,
+        ai_requests,
+        public,
+        password,
+        host_tx,
+    } = req;
+
     // Phase 1 ── state lock; released at end of block.
     let (game_code, player_token, initial_player_count) = {
         let mut mgr = state.lock().await;
         let (game_code, player_token) = mgr.create_game_n_players(
             resolved,
-            display_name.to_string(),
+            display_name.clone(),
             timer_seconds,
             pc,
             match_config,
@@ -1951,7 +1971,7 @@ async fn create_and_connect_multiplayer_session(
         if let Some(session) = mgr.sessions.get_mut(&game_code) {
             session.start_when_full = start_when_full;
             session.ranked = ranked;
-            for (seat_index, difficulty, deck) in ai_requests {
+            for (seat_index, difficulty, deck) in &ai_requests {
                 let seat = *seat_index as usize;
                 session.display_names[seat] = format!("AI ({difficulty:?})");
                 session.connected[seat] = true;
@@ -1975,7 +1995,7 @@ async fn create_and_connect_multiplayer_session(
 
         if let Some(session) = mgr.sessions.get_mut(&game_code) {
             session.lobby_meta = Some(server_core::PersistedLobbyMeta {
-                host_name: display_name.to_string(),
+                host_name: display_name.clone(),
                 public,
                 password,
                 timer_seconds,
@@ -3861,19 +3881,21 @@ async fn handle_client_message(
                     create_and_connect_multiplayer_session(
                         state,
                         connections,
-                        resolved,
-                        &display_name,
-                        timer_seconds,
-                        pc,
-                        match_config,
-                        format_config,
-                        start_when_full,
-                        ranked,
-                        &ai_requests,
-                        public,
-                        password.clone(), // original `password` still needed for Phase 3
                         game_db,
-                        tx.clone(),
+                        MultiplayerSessionRequest {
+                            resolved,
+                            display_name: display_name.clone(),
+                            timer_seconds,
+                            pc,
+                            match_config,
+                            format_config,
+                            start_when_full,
+                            ranked,
+                            ai_requests,
+                            public,
+                            password: password.clone(), // original still needed for Phase 3
+                            host_tx: tx.clone(),
+                        },
                     )
                     .await;
 
@@ -6927,19 +6949,21 @@ mod issue_4548_deadlock_tests {
         let (game_code, _token, _count) = create_and_connect_multiplayer_session(
             &state,
             &connections,
-            PlayerDeckPayload::default(),
-            "Alice",
-            None,
-            2,
-            Default::default(),
-            None,
-            false,
-            false,
-            &[],
-            false,
-            None,
             &game_db,
-            tx,
+            MultiplayerSessionRequest {
+                resolved: PlayerDeckPayload::default(),
+                display_name: "Alice".to_string(),
+                timer_seconds: None,
+                pc: 2,
+                match_config: Default::default(),
+                format_config: None,
+                start_when_full: false,
+                ranked: false,
+                ai_requests: vec![],
+                public: false,
+                password: None,
+                host_tx: tx,
+            },
         )
         .await;
 
