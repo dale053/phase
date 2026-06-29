@@ -1898,6 +1898,108 @@ fn persist_session_async(
     });
 }
 
+/// Phases 1–2 of the `CreateGameWithSettings` full multiplayer path.
+///
+/// Phase 1 (state lock): creates the session, configures AI seats and lobby
+/// metadata, and extracts the initial player count. The state guard is
+/// unconditionally dropped at the end of the inner block before this function
+/// returns.
+///
+/// Phase 2 (connections lock): registers the host's sender. The connections
+/// guard is unconditionally dropped at the end of its inner block.
+///
+/// Both locks are therefore free when this function returns, so callers may
+/// safely call `broadcast_player_slots` immediately after — that function
+/// re-acquires both. This extraction exists so that the test in
+/// `issue_4548_deadlock_tests` exercises the exact same lock-scoping code that
+/// the handler uses; a regression that holds either guard across the return
+/// boundary would deadlock the test's subsequent `broadcast_player_slots` call.
+async fn create_and_connect_multiplayer_session(
+    state: &SharedState,
+    connections: &SharedConnections,
+    resolved: engine::game::deck_loading::PlayerDeckPayload,
+    display_name: &str,
+    timer_seconds: Option<u32>,
+    pc: u8,
+    match_config: engine::types::match_config::MatchConfig,
+    format_config: Option<engine::types::format::FormatConfig>,
+    start_when_full: bool,
+    ranked: bool,
+    ai_requests: &[(
+        u8,
+        phase_ai::config::AiDifficulty,
+        engine::game::deck_loading::PlayerDeckPayload,
+    )],
+    public: bool,
+    password: Option<String>,
+    game_db: &SharedGameDb,
+    host_tx: mpsc::UnboundedSender<ServerMessage>,
+) -> (String, String, u32) {
+    // Phase 1 ── state lock; released at end of block.
+    let (game_code, player_token, initial_player_count) = {
+        let mut mgr = state.lock().await;
+        let (game_code, player_token) = mgr.create_game_n_players(
+            resolved,
+            display_name.to_string(),
+            timer_seconds,
+            pc,
+            match_config,
+            format_config,
+        );
+        info!(game = %game_code, host = %display_name, players = pc, "game created via lobby");
+
+        if let Some(session) = mgr.sessions.get_mut(&game_code) {
+            session.start_when_full = start_when_full;
+            session.ranked = ranked;
+            for (seat_index, difficulty, deck) in ai_requests {
+                let seat = *seat_index as usize;
+                session.display_names[seat] = format!("AI ({difficulty:?})");
+                session.connected[seat] = true;
+                session.decks[seat] = Some(deck.clone());
+                let pid = PlayerId(*seat_index);
+                session.ai_seats.insert(pid);
+                let config = phase_ai::config::create_config_for_players(
+                    *difficulty,
+                    phase_ai::config::Platform::Native,
+                    pc,
+                );
+                session.ai_configs.insert(pid, config);
+            }
+        }
+
+        let initial_player_count = mgr
+            .sessions
+            .get(&game_code)
+            .map(|s| s.current_player_count())
+            .unwrap_or(1);
+
+        if let Some(session) = mgr.sessions.get_mut(&game_code) {
+            session.lobby_meta = Some(server_core::PersistedLobbyMeta {
+                host_name: display_name.to_string(),
+                public,
+                password,
+                timer_seconds,
+                start_when_full,
+                ranked,
+            });
+            persist_session_async(game_db, &game_code, session);
+        }
+
+        (game_code, player_token, initial_player_count)
+    }; // state lock released here
+
+    // Phase 2 ── connections lock; released at end of block.
+    {
+        let mut conns = connections.lock().await;
+        conns
+            .entry(game_code.clone())
+            .or_default()
+            .insert(PlayerId(0), host_tx);
+    } // connections lock released here
+
+    (game_code, player_token, initial_player_count)
+}
+
 /// Broadcast `DraftSpectatorView` to all spectators watching a draft.
 /// Prunes disconnected spectators (closed sender channels).
 async fn broadcast_draft_spectator_views(
@@ -3749,71 +3851,33 @@ async fn handle_client_message(
                 // Capture the format before `format_config` is consumed so we
                 // can stamp it on the lobby entry below.
                 let format_config_for_lobby = format_config.clone();
-                let (game_code, player_token, initial_player_count) = {
-                    let mut mgr = state.lock().await;
-                    let (game_code, player_token) = mgr.create_game_n_players(
+
+                // Phases 1–2: create+configure the session (state lock) and
+                // register the host connection (connections lock).  Both locks
+                // are released inside `create_and_connect_multiplayer_session`
+                // before it returns, so `broadcast_player_slots` (Phase 4) can
+                // re-acquire them without deadlocking.
+                let (game_code, player_token, initial_player_count) =
+                    create_and_connect_multiplayer_session(
+                        state,
+                        connections,
                         resolved,
-                        display_name.clone(),
+                        &display_name,
                         timer_seconds,
                         pc,
                         match_config,
                         format_config,
-                    );
-                    info!(game = %game_code, host = %display_name, players = pc, "game created via lobby");
-
-                    if let Some(session) = mgr.sessions.get_mut(&game_code) {
-                        session.start_when_full = start_when_full;
-                        session.ranked = ranked;
-                        for (seat_index, difficulty, deck) in &ai_requests {
-                            let seat = *seat_index as usize;
-                            session.display_names[seat] = format!("AI ({difficulty:?})");
-                            session.connected[seat] = true;
-                            session.decks[seat] = Some(deck.clone());
-                            let pid = PlayerId(*seat_index);
-                            session.ai_seats.insert(pid);
-                            let config = phase_ai::config::create_config_for_players(
-                                *difficulty,
-                                phase_ai::config::Platform::Native,
-                                pc,
-                            );
-                            session.ai_configs.insert(pid, config);
-                        }
-                    }
-
-                    // Extract the player count before persisting so the
-                    // lobby registration below uses an accurate value.
-                    let initial_player_count = mgr
-                        .sessions
-                        .get(&game_code)
-                        .map(|s| s.current_player_count())
-                        .unwrap_or(1);
-
-                    // Store lobby metadata on the session and persist to SQLite.
-                    if let Some(session) = mgr.sessions.get_mut(&game_code) {
-                        session.lobby_meta = Some(server_core::PersistedLobbyMeta {
-                            host_name: display_name.clone(),
-                            public,
-                            password: password.clone(),
-                            timer_seconds,
-                            start_when_full,
-                            ranked,
-                        });
-                        persist_session_async(game_db, &game_code, session);
-                    }
-
-                    (game_code, player_token, initial_player_count)
-                }; // state lock released here — before any .await
+                        start_when_full,
+                        ranked,
+                        &ai_requests,
+                        public,
+                        password.clone(), // original `password` still needed for Phase 3
+                        game_db,
+                        tx.clone(),
+                    )
+                    .await;
 
                 identity.set_session(game_code.clone(), PlayerId(0), player_token.clone());
-
-                // Phase 2 ── register the host connection; released before broadcast.
-                {
-                    let mut conns = connections.lock().await;
-                    conns
-                        .entry(game_code.clone())
-                        .or_default()
-                        .insert(PlayerId(0), tx.clone());
-                } // connections lock released here
 
                 // Phase 3 ── register with lobby broker and snapshot the
                 // public-game entry while the lobby lock is held; released
@@ -6790,6 +6854,7 @@ mod handshake_tests {
 mod issue_4548_deadlock_tests {
     use super::*;
     use engine::game::deck_loading::PlayerDeckPayload;
+    use tempfile::NamedTempFile;
 
     #[tokio::test]
     async fn broadcast_player_slots_completes_when_no_locks_held() {
@@ -6836,5 +6901,58 @@ mod issue_4548_deadlock_tests {
         )
         .await
         .expect("broadcast_player_slots must not deadlock when lobby lock is held by caller");
+    }
+
+    /// Handler-path regression: drives `create_and_connect_multiplayer_session`,
+    /// the exact function the `CreateGameWithSettings` handler uses for Phases 1–2.
+    ///
+    /// If that function were to hold the state or connections guard past its
+    /// return boundary (the old deadlock pattern), the `broadcast_player_slots`
+    /// call below would block waiting to re-acquire the same mutex and the
+    /// two-second timeout would fire, failing this test.
+    ///
+    /// The two earlier tests above verify `broadcast_player_slots` itself; this
+    /// test verifies the handler's lock-release contract by sharing the
+    /// production code path.
+    #[tokio::test]
+    async fn create_and_connect_multiplayer_session_releases_locks_before_broadcast() {
+        let state: SharedState = Arc::new(Mutex::new(SessionManager::new()));
+        let connections: SharedConnections = Arc::new(Mutex::new(HashMap::new()));
+        let game_db = {
+            let file = NamedTempFile::new().unwrap();
+            Arc::new(persistence::GameDb::open(file.path()).unwrap())
+        };
+        let (tx, _rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+        let (game_code, _token, _count) = create_and_connect_multiplayer_session(
+            &state,
+            &connections,
+            PlayerDeckPayload::default(),
+            "Alice",
+            None,
+            2,
+            Default::default(),
+            None,
+            false,
+            false,
+            &[],
+            false,
+            None,
+            &game_db,
+            tx,
+        )
+        .await;
+
+        // Both state and connections locks must be free at this point.
+        // A regression that holds either guard across the helper's return
+        // causes this call to deadlock → timeout fires → test fails.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            broadcast_player_slots(&state, &connections, &game_code),
+        )
+        .await
+        .expect(
+            "create_and_connect_multiplayer_session must release state+connections before returning",
+        );
     }
 }
