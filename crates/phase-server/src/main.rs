@@ -3791,7 +3791,6 @@ async fn handle_client_message(
 
                     // Store lobby metadata on the session and persist to SQLite.
                     if let Some(session) = mgr.sessions.get_mut(&game_code) {
-
                         initial_player_count = session.current_player_count();
                         session.lobby_meta = Some(server_core::PersistedLobbyMeta {
                             host_name: display_name.clone(),
@@ -3810,10 +3809,6 @@ async fn handle_client_message(
                 identity.set_session(game_code.clone(), PlayerId(0), player_token.clone());
 
                 // Phase 2 ── register the host connection; released before broadcast.
-                };
-
-                identity.set_session(game_code.clone(), PlayerId(0), player_token.clone());
-
                 {
                     let mut conns = connections.lock().await;
                     conns
@@ -3825,7 +3820,6 @@ async fn handle_client_message(
                 // Phase 3 ── register with lobby broker and snapshot the
                 // public-game entry while the lobby lock is held; released
                 // before the subsequent .await calls.
-                }
 
                 // Pull the client's advertised build identity from the
                 // stored ClientHello. `client_hello` is guaranteed Some here
@@ -3839,14 +3833,6 @@ async fn handle_client_message(
                 let lobby_added_game = {
                     let mut lob_guard = lobby.lock().await;
                     let lob = lob_guard.lobby_mut();
-                    // Pull the client's advertised build identity from the
-                    // stored ClientHello. `client_hello` is guaranteed Some here
-                    // because the handshake gate at the top of this function
-                    // rejects any non-hello frame when it's None.
-                    lob.register_game(
-                        &game_code,
-                        RegisterGameRequest {
-                            host_name: display_name.clone(),
                     lob.register_game(
                         &game_code,
                         RegisterGameRequest {
@@ -3897,8 +3883,6 @@ async fn handle_client_message(
                         None
                     }
                 }; // lobby lock released here
-                    lob.public_game(&game_code)
-                };
 
                 // Phase 4 ── all locks are free; send replies and broadcast.
                 // `broadcast_player_slots` re-acquires state + connections —
