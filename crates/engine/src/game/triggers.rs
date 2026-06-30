@@ -5066,6 +5066,7 @@ fn reflexive_coin_flip_resolved_without_match(
     let DelayedTriggerCondition::WhenNextEvent {
         trigger,
         or_trigger: None,
+        ..
     } = condition
     else {
         return false;
@@ -5193,6 +5194,7 @@ fn delayed_trigger_event(
         DelayedTriggerCondition::WhenNextEvent {
             trigger,
             or_trigger,
+            ..
         } => events.iter().rev().find_map(|event| {
             for t in std::iter::once(trigger.as_ref()).chain(or_trigger.iter().map(|b| b.as_ref()))
             {
@@ -5885,6 +5887,9 @@ pub(crate) fn check_trigger_condition(
             // single-player "whose turn" semantic.
             | PlayerFilter::OpponentAttacked { .. }
             | PlayerFilter::All
+            // CR 608.2c: a set-valued "all players except an anchor" population
+            // has no single-player "whose turn" semantic. Fail-closed.
+            | PlayerFilter::AllExcept { .. }
             | PlayerFilter::HighestSpeed
             | PlayerFilter::ZoneChangedThisWay
             | PlayerFilter::PerformedActionThisWay { .. }
@@ -5906,6 +5911,9 @@ pub(crate) fn check_trigger_condition(
             // CR 506.2 + CR 508.6: a count-only attacked-opponents predicate is
             // set-valued — no single-player "whose turn" semantic. Fail-closed.
             | PlayerFilter::OpponentOfTriggeringPlayerNotAttacked
+            // CR 102.2: opponents-of-the-caster is a set-valued recipient — no
+            // single-player "whose turn" semantic. Fail-closed.
+            | PlayerFilter::OpponentOfTriggeringPlayer
             | PlayerFilter::OpponentOtherThanTriggering => false,
         },
         // CR 603.4: "if you control N or more [type]" — generalized control count.

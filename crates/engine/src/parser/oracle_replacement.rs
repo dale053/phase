@@ -6225,11 +6225,24 @@ fn normalize_additional_token_descriptor(descriptor: &str) -> Option<String> {
         let (_, article) = peek(opt(alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")))))
             .parse(descriptor)
             .ok()?;
-        if article.is_none() {
+        if article.is_none() && additional_token_descriptor_needs_leading_article(descriptor) {
             return Some(format!("a {descriptor}"));
         }
     }
     Some(descriptor.to_string())
+}
+
+/// True when the descriptor needs a leading `"a "` before `parse_token_description`.
+/// Subtype-only specs (`"Food token"`) have no count and require an article.
+/// P/T-led specs (`"1/1 …"`, `"10/10 …"`) also require one: without it
+/// `parse_token_count_prefix` mis-reads the leading digits before `/` as a bare
+/// count and leaves `/toughness …`, breaking P/T parsing.
+fn additional_token_descriptor_needs_leading_article(descriptor: &str) -> bool {
+    let trimmed = descriptor.trim_start();
+    if nom_primitives::parse_pt_value(trimmed).is_ok() {
+        return true;
+    }
+    parse_count_expr(trimmed).is_none()
 }
 
 /// CR 614.1a + CR 111.1: Parse Xorn-class subtype-gated additional-token
@@ -10301,6 +10314,36 @@ mod tests {
     }
 
     #[test]
+    fn as_enters_choose_a_number_sentence_ending_period() {
+        // #722: "As Squall enters, choose a number." ends the sentence, so the
+        // "choose a number" clause reaches the parser as "a number." (trailing
+        // period). The as-enters-choose replacement must still be produced so the
+        // player is prompted to pick a number on ETB; the prior exact/space-only
+        // match dropped the period and yielded no choice.
+        let def = parse_replacement_line(
+            "As Squall enters, choose a number.",
+            "Squall, Gunblade Duelist",
+        )
+        .expect("choose-a-number ETB must produce a replacement");
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        assert!(matches!(def.mode, ReplacementMode::Mandatory));
+        let execute = def.execute.as_ref().unwrap();
+        assert!(
+            matches!(
+                *execute.effect,
+                Effect::Choose {
+                    choice_type: ChoiceType::NumberRange { min: 0, max: 20 },
+                    persist: true,
+                    ..
+                }
+            ),
+            "expected a persisted NumberRange(0,20) choice, got {:?}",
+            execute.effect
+        );
+    }
+
+    #[test]
     fn enters_tapped_then_choose_color_composes_tap_and_choice() {
         // CR 614.1c + CR 614.1d: Thriving land text ("This land enters
         // tapped. As it enters, choose a color other than green.") must compose
@@ -14350,6 +14393,59 @@ mod tests {
             .as_ref()
             .expect("additional Food token spec");
         assert_eq!(spec.characteristics.subtypes, vec!["Food".to_string()]);
+    }
+
+    /// CR 614.1a + CR 111.1: Stridehangar Automaton (#654) — artifact-token-gated
+    /// "those tokens plus an additional 1/1 colorless Thopter …" replacement.
+    #[test]
+    fn parses_stridehangar_additional_thopter_token_replacement() {
+        let text = "If one or more artifact tokens would be created under your control, those tokens plus an additional 1/1 colorless Thopter artifact creature token with flying are created instead.";
+        let def = parse_replacement_line(text, "Stridehangar Automaton")
+            .expect("should parse Stridehangar");
+        assert_eq!(def.event, ReplacementEvent::CreateToken);
+        assert_eq!(def.token_owner_scope, Some(ControllerRef::You));
+        assert!(
+            matches!(
+                def.condition,
+                Some(ReplacementCondition::TokenCoreTypeMatches { .. })
+            ),
+            "artifact tokens gate must be TokenCoreTypeMatches, got {:?}",
+            def.condition
+        );
+        let spec = def
+            .additional_token_spec
+            .as_ref()
+            .expect("additional Thopter token spec");
+        assert_eq!(spec.characteristics.power, Some(1));
+        assert_eq!(spec.characteristics.toughness, Some(1));
+        assert_eq!(spec.characteristics.subtypes, vec!["Thopter".to_string()]);
+        assert!(
+            spec.characteristics
+                .keywords
+                .iter()
+                .any(|k| matches!(k, crate::types::keywords::Keyword::Flying)),
+            "Thopter must have flying, got {:?}",
+            spec.characteristics.keywords
+        );
+    }
+
+    /// CR 614.1a + CR 111.1: Multi-digit P/T appended specs share the same
+    /// `"those tokens plus an additional <P/T> …"` grammar as 1/1 cards
+    /// (Stridehangar class). Article injection must recognize `10/10`, not
+    /// only single-digit power.
+    #[test]
+    fn parses_additional_token_replacement_with_multi_digit_pt_descriptor() {
+        let text = "If one or more tokens would be created under your control, those tokens plus an additional 10/10 colorless Eldrazi creature token are created instead.";
+        let def =
+            parse_replacement_line(text, "Eldrazi Spawn").expect("should parse multi-digit P/T");
+        assert_eq!(def.event, ReplacementEvent::CreateToken);
+        let spec = def
+            .additional_token_spec
+            .as_ref()
+            .expect("additional Eldrazi token spec");
+        assert_eq!(spec.characteristics.power, Some(10));
+        assert_eq!(spec.characteristics.toughness, Some(10));
+        assert_eq!(spec.characteristics.subtypes, vec!["Eldrazi".to_string()]);
     }
 
     /// CR 614.1a: The "twice that many" shape and the "those tokens plus"

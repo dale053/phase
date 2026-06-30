@@ -6215,6 +6215,83 @@ mod tests {
         parse_oracle_text(text, name, &keyword_names, &types, &subtypes)
     }
 
+    /// As Foretold (WHO/AKH): the once-per-turn "pay {0} rather than pay the mana
+    /// cost" free-cast line is correctly UNSUPPORTED. As Foretold places no zone
+    /// restriction on which spell the cost applies to, but the engine's
+    /// `CastFromHandFree` runtime path only covers hand and command-zone origins
+    /// (CR 601.2a). Implementing it correctly requires a general once-per-turn
+    /// alternative-cost modifier that composes with every cast-permission origin
+    /// (graveyard, exile, etc.) — a cross-cutting runtime refactor. Until that
+    /// work lands, the free-cast line must fall to `Effect::Unimplemented` rather
+    /// than falsely claiming coverage via the wrong zone-scoped path.
+    ///
+    /// The upkeep time-counter trigger is a separate Oracle line and must still
+    /// parse. The swallow auditor is suppressed when any ability is Unimplemented
+    /// (architecture rule: explicit Unimplemented beats swallow-detector noise), so
+    /// no spurious `Optional_YouMay` warning fires.
+    #[test]
+    fn as_foretold_free_cast_line_is_unsupported() {
+        let r = parse(
+            "At the beginning of your upkeep, put a time counter on this enchantment.\nOnce each turn, you may pay {0} rather than pay the mana cost for a spell you cast with mana value X or less, where X is the number of time counters on this enchantment.",
+            "As Foretold",
+            &[],
+            &["Enchantment"],
+            &[],
+        );
+
+        fn walk<'a>(ability: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+            out.push(&ability.effect);
+            if let Some(sub) = &ability.sub_ability {
+                walk(sub, out);
+            }
+        }
+        let mut effects = Vec::new();
+        for ability in &r.abilities {
+            walk(ability, &mut effects);
+        }
+        // The free-cast line is Unimplemented — zone-unrestricted "{0}" alternative
+        // cost cannot be lowered onto CastFromHandFree without misrepresenting scope.
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Unimplemented { .. })),
+            "As Foretold free-cast line must remain Effect::Unimplemented until \
+             a zone-agnostic alternative-cost modifier is implemented; got {effects:#?}"
+        );
+
+        // No spurious CastFromHandFree static must appear.
+        assert!(
+            r.statics
+                .iter()
+                .all(|s| !matches!(s.mode, StaticMode::CastFromHandFree { .. })),
+            "As Foretold must NOT produce a CastFromHandFree static (wrong zone scope); \
+             got {:?}",
+            r.statics
+        );
+
+        // The upkeep time-counter trigger must still parse correctly.
+        assert!(
+            r.triggers
+                .iter()
+                .any(|t| matches!(t.mode, TriggerMode::Phase)),
+            "As Foretold must keep its upkeep Phase trigger, got {:?}",
+            r.triggers
+        );
+
+        // Swallow auditor is suppressed when Unimplemented is present, so no
+        // Optional_YouMay warning fires despite "you may" appearing in the oracle text.
+        assert!(
+            !r.parse_warnings.iter().any(|w| matches!(
+                w,
+                OracleDiagnostic::SwallowedClause { detector, .. }
+                    if detector == "Optional_YouMay"
+            )),
+            "Optional_YouMay must not fire when Unimplemented suppresses swallow checks; \
+             got {:?}",
+            r.parse_warnings
+        );
+    }
+
     /// Cavernous Maw (std BATCH 12): the `{2}` activated ability animates the
     /// land into a 3/3 Elemental creature, and the confirmatory "It's still a
     /// Cave land" sentence (CR 205.1b, CR 305.7) must NOT remain
@@ -23034,6 +23111,77 @@ mod pipeline_snapshot_tests {
             ),
             "granted ability must deal damage equal to source power to any other target, got {:?}",
             granted.effect
+        );
+    }
+
+    /// CR 707.2 + CR 608.2c + CR 109.4: Fractured Identity — exile target
+    /// nonland permanent, then each player OTHER THAN ITS CONTROLLER creates a
+    /// token that's a copy of it. The second sentence must lower to a
+    /// `player_scope`-iterated `CopyTokenOf` whose scope is
+    /// `AllExcept { ParentObjectTargetController }`, with the copy source being
+    /// the exiled permanent (`ParentTarget`). Zero `Effect::Unimplemented`.
+    #[test]
+    fn fractured_identity_each_player_other_than_controller_copies_exiled_permanent() {
+        use crate::types::ability::{Effect, PlayerFilter, TargetFilter};
+
+        let p = parse_oracle_text(
+            "Exile target nonland permanent. Each player other than its controller \
+             creates a token that's a copy of it.",
+            "Fractured Identity",
+            &[],
+            &["Sorcery".into()],
+            &[],
+        );
+
+        let spell = &p.abilities[0];
+        assert!(
+            !has_unimplemented(spell),
+            "no Unimplemented in Fractured Identity, got {:?}",
+            spell
+        );
+
+        // Head: exile the targeted nonland permanent.
+        assert!(
+            matches!(
+                &*spell.effect,
+                Effect::ChangeZone {
+                    destination: Zone::Exile,
+                    ..
+                }
+            ),
+            "head clause must exile, got {:?}",
+            spell.effect
+        );
+
+        // Tail: per-player copy-token of the exiled permanent, scoped to every
+        // player except the exiled permanent's controller.
+        let sub = spell
+            .sub_ability
+            .as_ref()
+            .expect("Fractured Identity has a second-sentence sub-ability");
+        assert_eq!(
+            sub.player_scope,
+            Some(PlayerFilter::AllExcept {
+                exclude: Box::new(PlayerFilter::ParentObjectTargetController),
+            }),
+            "tail player_scope must exclude the exiled permanent's controller",
+        );
+        // The "it" anaphor links to the exiled permanent published by the head
+        // clause's `ChangeZone` as a tracked set (the standard cross-sentence
+        // exiled-object reference); `token_copy::resolve` resolves a
+        // `TrackedSet` copy source. The iterated player is the token owner.
+        assert!(
+            matches!(
+                &*sub.effect,
+                Effect::CopyTokenOf {
+                    target: TargetFilter::TrackedSet { .. },
+                    owner: TargetFilter::Controller,
+                    ..
+                }
+            ),
+            "tail must copy the exiled permanent (tracked-set anaphor) with the iterated \
+             player as owner, got {:?}",
+            sub.effect
         );
     }
 

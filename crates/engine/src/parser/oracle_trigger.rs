@@ -325,6 +325,56 @@ fn collect_trigger_condition_source_zones(condition: &TriggerCondition, out: &mu
     }
 }
 
+/// CR 113.6b + CR 400.7: When a trigger's intervening-if pins the source to a
+/// single zone ("if this card is in your graveyard") and the effect is an
+/// implicit self-return ("return it to the battlefield …") with no "from …"
+/// phrase, stamp that zone as `ChangeZone.origin` so the runtime can locate
+/// the object (Jocasta, Automaton Avenger — issue #4566).
+fn stamp_self_return_origin_from_trigger_condition(def: &mut TriggerDefinition) {
+    let zones = def
+        .condition
+        .as_ref()
+        .map(trigger_condition_source_zones)
+        .unwrap_or_default();
+    let Some(origin) = (zones.len() == 1).then(|| zones[0]) else {
+        return;
+    };
+    if let Some(execute) = def.execute.as_deref_mut() {
+        stamp_self_return_origin_in_effect(&mut execute.effect, origin);
+    }
+}
+
+fn stamp_self_return_origin_in_effect(effect: &mut Effect, origin: Zone) {
+    match effect {
+        Effect::ChangeZone {
+            origin: o,
+            destination,
+            target,
+            ..
+        } if matches!(
+            target,
+            TargetFilter::SelfRef | TargetFilter::TriggeringSource
+        ) && matches!(destination, Zone::Battlefield | Zone::Hand) =>
+        {
+            if o.is_none() {
+                *o = Some(origin);
+            }
+            if matches!(target, TargetFilter::TriggeringSource) {
+                *target = TargetFilter::SelfRef;
+            }
+        }
+        Effect::CreateDelayedTrigger { effect: inner, .. } => {
+            stamp_self_return_origin_in_effect(&mut inner.effect, origin);
+        }
+        Effect::ChooseOneOf { branches, .. } => {
+            for branch in branches.iter_mut() {
+                stamp_self_return_origin_in_effect(&mut branch.effect, origin);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// CR 107.3a + CR 107.3i + CR 601.2f + CR 603.2: In an ETB trigger on a spell
 /// cast for `{X}`, bare "X" in the trigger body refers to the value paid for
 /// `{X}` during the cast. At runtime the `QuantityRef::Variable{name:"X"}`
@@ -985,7 +1035,14 @@ pub(crate) fn parse_trigger_line_with_index_ir(
 
     // Parse the effect body
     let effect_for_parse_lower = effect_for_parse.to_lowercase();
-    let has_up_to = scan_contains(&effect_for_parse_lower, "up to one");
+    // CR 601.2c: An optional-targeting quantifier ("up to one target …" /
+    // "any number of target …") permits a variable number of targets down to
+    // zero, so the execute ability must surface `optional_targeting` and let the
+    // player decline. Without this, "attach any number of target Equipment you
+    // control to it" (Super-Soldier Serum) forces a mandatory target and
+    // softlocks when every Equipment is already attached.
+    let has_up_to = scan_contains(&effect_for_parse_lower, "up to one")
+        || scan_contains(&effect_for_parse_lower, "any number of target");
     let body = if !effect_for_parse.is_empty() {
         if parse_monarch_turn_began_condition(effect_for_parse_lower.as_str()).is_some() {
             Some(TriggerBody::PreLowered(Box::new(AbilityDefinition::new(
@@ -1315,6 +1372,8 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     {
         def.trigger_zones = vec![zone];
     }
+
+    stamp_self_return_origin_from_trigger_condition(&mut def);
 
     // CR 107.3a + CR 107.3i + CR 601.2f: Rewrite X in ETB-self triggers.
     if trigger_should_rewrite_cost_x(&def) {
@@ -1754,6 +1813,34 @@ fn extract_unless_pay_modifier(
         return (text.to_string(), None);
     };
 
+    // CR 603.7a + CR 118.12a (issue #4369): when the "unless you pay" lives in a
+    // DELAYED-trigger sentence ("At the beginning of [the/your] next ..., sacrifice
+    // it unless you pay {cost}" — Ashling, the Limitless; Satya, Aetherflux
+    // Genius), the alternative cost belongs to that delayed sacrifice, NOT the
+    // parent trigger. Hoisting it here makes the engine demand payment when the
+    // token is created (wrong time). Decline to hoist; the per-clause path
+    // (`extract_resolution_unless_pay_modifier`, applied in `lower_effect_chain_ir`
+    // before wrapping in `CreateDelayedTrigger`) attaches the cost to the delayed
+    // trigger's inner def. Detected by reusing the canonical delayed-temporal-
+    // prefix recognizer on the start of the sentence that contains the "unless".
+    // Forward-scan past each sentence boundary preceding the "unless" (via the
+    // `split_once_on` combinator) so `enclosing` is just the sentence that
+    // directly contains it; the byte offset back into `text` preserves original
+    // case for `strip_temporal_prefix`.
+    let mut enclosing = &lower[..unless_pos];
+    while let Ok((_, (_, after))) = nom_primitives::split_once_on(enclosing, ". ") {
+        enclosing = after;
+    }
+    let unless_sentence_start = unless_pos - enclosing.len();
+    if crate::parser::oracle_effect::lower::strip_temporal_prefix(
+        text[unless_sentence_start..].trim_start(),
+    )
+    .1
+    .is_some()
+    {
+        return (text.to_string(), None);
+    }
+
     let after_unless = &lower[unless_pos + 8..];
 
     // CR 608.2c: When the primary effect is itself a discard imperative
@@ -2116,6 +2203,33 @@ pub(crate) fn parse_unless_alt_cost(after_unless: &str) -> Option<AbilityCost> {
     // "you pay N life" / "you pay N life." — life amount is bare integer.
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("you pay ").parse(after_unless) {
         if let Some(cost) = parse_unless_life_cost(rest) {
+            return Some(cost);
+        }
+    }
+
+    // CR 107.14 + CR 202.3 (issue #4369): "you pay an amount of {E} equal to ..."
+    // — a dynamic energy alternative (Satya, Aetherflux Genius's delayed
+    // "sacrifice that token unless you pay an amount of {E} equal to its mana
+    // value"). Must precede the brace-run mana arm below ("an amount of" is not a
+    // mana run). Reuses the shared dynamic-energy building block.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("you pay ").parse(after_unless) {
+        if let Some(amount) = super::oracle_effect::parse_dynamic_energy_unless_cost(
+            rest.trim_end_matches('.').trim(),
+        ) {
+            return Some(AbilityCost::PayEnergy { amount });
+        }
+    }
+
+    // CR 118.12 + CR 202.1: "you pay {explicit mana}" — an explicit mana cost as
+    // the alternative (issue #4369, Ashling, the Limitless's delayed "sacrifice
+    // it unless you pay {W}{U}{B}{R}{G}"). The trigger-level caller reaches its
+    // own brace-run mana arm after this function returns None, but the per-clause
+    // resolution path (`extract_resolution_unless_pay_modifier`) relies solely on
+    // this single authority, so a delayed sub-clause's mana unless is invisible
+    // without it. Placed AFTER the "N life" arm so life keeps precedence; reuses
+    // the shared `parse_unless_mana_payment` building block.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("you pay ").parse(after_unless) {
+        if let Some(cost) = parse_unless_mana_payment(rest.trim_end_matches('.').trim()) {
             return Some(cost);
         }
     }
@@ -2967,6 +3081,7 @@ pub(crate) fn static_condition_to_trigger_condition(
             player: PlayerFilter::Controller,
         }),
         StaticCondition::DayNightIs { .. } => None,
+        StaticCondition::SharesColorWithMostCommonColorAmongPermanents => None,
 
         // CR 608.2c: Quantity comparisons map 1:1 (same fields). The only
         // asymmetry is the `Another` → `OtherThanTriggerObject` substitution
@@ -9463,6 +9578,10 @@ fn try_parse_special_trigger_pattern(lower: &str) -> Option<(TriggerMode, Trigge
         return Some(result);
     }
 
+    if let Some(result) = try_parse_you_attack_with_commander(lower) {
+        return Some(result);
+    }
+
     if let Some(result) = try_parse_n_or_more_attacks(lower) {
         return Some(result);
     }
@@ -9851,6 +9970,35 @@ fn apply_attachment_prop(filter: TargetFilter, prop: Option<FilterProp>) -> Targ
         }
         (other, _) => other,
     }
+}
+
+/// CR 903.3 + CR 508.1: "whenever you attack with [your] commander" — fires when
+/// the scoped player declares a commander as an attacker (Jocasta, Automaton Avenger).
+fn try_parse_you_attack_with_commander(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
+    let (after_prefix, ()) = alt((
+        value((), tag::<_, _, OracleError<'_>>("whenever ")),
+        value((), tag("when ")),
+    ))
+    .parse(lower)
+    .ok()?;
+
+    let (after_actor, ()) = value((), tag::<_, _, OracleError<'_>>("you attack with "))
+        .parse(after_prefix)
+        .ok()?;
+
+    let (filter, rest) = parse_commander_subject_filter_prefix(after_actor)?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    let mut def = make_base();
+    def.mode = TriggerMode::YouAttack;
+    def.valid_target = Some(TargetFilter::Typed(
+        TypedFilter::default().controller(ControllerRef::You),
+    ));
+    def.valid_card = Some(filter);
+    def.batched = true;
+    Some((TriggerMode::YouAttack, def))
 }
 
 /// Parse "whenever N or more creatures [you control] attack [a player]" patterns.
@@ -11038,6 +11186,36 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
                 def.condition = Some(TriggerCondition::ControlsNone { filter });
                 def.valid_card = Some(TargetFilter::SelfRef);
                 return Some((TriggerMode::StateCondition, def));
+            }
+        }
+    }
+
+    // CR 603.8: "when you control a [filter]" — the positive-existence sibling of
+    // the "control no [filter]" arm above. Fires whenever the controller controls
+    // a permanent matching the filter (Endangered Armodon: "When you control a
+    // creature with toughness 2 or less, sacrifice this creature."). Filter
+    // recognition is delegated to `parse_inner_condition` (the shared game-state
+    // condition authority) and bridged to `TriggerCondition::ControlsType` via
+    // `static_condition_to_trigger_condition`, so every presence filter the
+    // condition parser already handles (subtype, type, P/T comparator, keyword,
+    // …) is covered without re-implementing filter parsing here. Gated on a
+    // `ControlsType` result so only genuine single-permanent presence conditions
+    // become state triggers; the effect ("sacrifice this creature") is parsed
+    // separately by the caller, exactly as for the `ControlsNone` arm.
+    for prefix in ["whenever ", "when "] {
+        if let Ok((rest, ())) = value((), tag::<_, _, OracleError<'_>>(prefix)).parse(lower) {
+            if let Ok((cond_rest, sc)) = parse_inner_condition(rest) {
+                if cond_rest.trim().is_empty() {
+                    if let Some(cond @ TriggerCondition::ControlsType { .. }) =
+                        static_condition_to_trigger_condition(&sc)
+                    {
+                        let mut def = make_base();
+                        def.mode = TriggerMode::StateCondition;
+                        def.condition = Some(cond);
+                        def.valid_card = Some(TargetFilter::SelfRef);
+                        return Some((TriggerMode::StateCondition, def));
+                    }
+                }
             }
         }
     }
@@ -14416,6 +14594,62 @@ mod tests {
         assert!(def.execute.is_some());
     }
 
+    /// CR 608.2c + CR 712.2 (issue #4543): Tamiyo, Inquisitive Student —
+    /// "When you draw your third card in a turn, exile Tamiyo, then return her
+    /// to the battlefield transformed under her owner's control." The exile
+    /// step targets the source (`~` → SelfRef); the "return her ... transformed"
+    /// sub-clause's bare "her" must ALSO bind to the source (SelfRef), not to
+    /// `TriggeringSource`. The trigger subject is the player ("you draw …"), so
+    /// the source has no entry in the CardDrawn event — before the fix the
+    /// return resolved to an empty target set and Tamiyo was stranded in exile.
+    /// The SelfRef-anaphor rewrite was gated on a typed trigger subject; it now
+    /// fires for player/event subjects too because the antecedent is the named
+    /// prior clause.
+    #[test]
+    fn tamiyo_flip_return_transformed_binds_to_self_ref() {
+        use crate::types::ability::Effect;
+
+        let def = parse_trigger_line(
+            "When you draw your third card in a turn, exile Tamiyo, then return her to the battlefield transformed under her owner's control.",
+            "Tamiyo, Inquisitive Student",
+        );
+        let exec = def.execute.as_deref().expect("Tamiyo trigger execute body");
+        // Exile step: source named via `~`.
+        let Effect::ChangeZone {
+            destination,
+            target,
+            ..
+        } = &*exec.effect
+        else {
+            panic!("expected exile ChangeZone head, got {:?}", exec.effect);
+        };
+        assert_eq!(*destination, Zone::Exile);
+        assert_eq!(*target, TargetFilter::SelfRef);
+        // Return step: "her" must bind to the source and enter transformed.
+        let sub = exec.sub_ability.as_deref().expect("return sub_ability");
+        let Effect::ChangeZone {
+            destination,
+            target,
+            enter_transformed,
+            ..
+        } = &*sub.effect
+        else {
+            panic!("expected return ChangeZone sub, got {:?}", sub.effect);
+        };
+        assert_eq!(*destination, Zone::Battlefield);
+        assert!(
+            *enter_transformed,
+            "return must enter transformed (CR 712.2)"
+        );
+        assert_eq!(
+            *target,
+            TargetFilter::SelfRef,
+            "the 'return her transformed' anaphor must bind to the source (SelfRef), \
+             not TriggeringSource — otherwise the CardDrawn event has no source and \
+             Tamiyo is stranded in exile"
+        );
+    }
+
     /// SHAPE TEST — issue #3299: `parse_trigger_lines` must not compound-split
     /// Syr Konrad's disjunctive zone-change condition into separate triggers.
     #[test]
@@ -14971,6 +15205,33 @@ mod tests {
             }
             other => panic!("expected attachment intervening-if, got {other:?}"),
         }
+    }
+
+    /// CR 601.2c: "attach any number of target Equipment you control to it"
+    /// (Super-Soldier Serum) is a variable-count target down to zero. The execute
+    /// ability must carry `optional_targeting` so the player can decline — without
+    /// it the trigger forces a mandatory Equipment target and softlocks when every
+    /// Equipment is already attached to the creature.
+    #[test]
+    fn trigger_attacks_or_blocks_attach_any_number_optional_targeting() {
+        let def = parse_trigger_line(
+            "Whenever enchanted creature attacks or blocks, attach any number of target Equipment you control to it.",
+            "Super-Soldier Serum",
+        );
+        assert_eq!(def.mode, TriggerMode::AttacksOrBlocks);
+        let execute = def
+            .execute
+            .as_deref()
+            .expect("attach body must lower to an execute ability");
+        assert!(
+            matches!(execute.effect.as_ref(), Effect::Attach { .. }),
+            "expected Attach effect, got {:?}",
+            execute.effect
+        );
+        assert!(
+            execute.optional_targeting,
+            "\"any number of target\" must surface optional_targeting=true so the player can decline"
+        );
     }
 
     #[test]
@@ -16527,6 +16788,140 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 1 }
             }
         );
+    }
+
+    #[test]
+    fn trigger_jocasta_commander_attack_return_tapped_and_attacking() {
+        use crate::parser::oracle::parse_oracle_text;
+
+        let oracle = "Flying\n\
+            Whenever your commander deals combat damage to a player, put a +1/+1 counter on Jocasta.\n\
+            Whenever you attack with your commander, if this card is in your graveyard, you may return it to the battlefield tapped and attacking.";
+
+        let parsed = parse_oracle_text(
+            oracle,
+            "Jocasta, Automaton Avenger",
+            &[],
+            &["Artifact".to_string(), "Creature".to_string()],
+            &["Robot".to_string(), "Hero".to_string()],
+        );
+        let graveyard_return = parsed
+            .triggers
+            .iter()
+            .find(|t| {
+                t.execute
+                    .as_ref()
+                    .is_some_and(|a| matches!(a.effect.as_ref(), Effect::ChangeZone { .. }))
+            })
+            .expect("graveyard return trigger must exist in full pipeline");
+        assert!(
+            graveyard_return.trigger_zones.contains(&Zone::Graveyard),
+            "graveyard intervening-if must set trigger_zones, got {:?}",
+            graveyard_return.trigger_zones
+        );
+        assert_eq!(graveyard_return.mode, TriggerMode::YouAttack);
+        match &graveyard_return.valid_card {
+            Some(TargetFilter::Typed(tf)) => {
+                assert!(tf
+                    .properties
+                    .iter()
+                    .any(|p| matches!(p, FilterProp::IsCommander)));
+            }
+            other => panic!(
+                "YouAttack with your commander must set IsCommander valid_card, got {other:?}"
+            ),
+        }
+        let execute = graveyard_return
+            .execute
+            .as_ref()
+            .expect("trigger should have execute ability");
+        match execute.effect.as_ref() {
+            Effect::ChangeZone {
+                origin,
+                destination,
+                enter_tapped,
+                enters_attacking,
+                target,
+                ..
+            } => {
+                assert_eq!(*destination, Zone::Battlefield);
+                assert_eq!(
+                    origin,
+                    &Some(Zone::Graveyard),
+                    "graveyard intervening-if must stamp ChangeZone origin"
+                );
+                assert!(
+                    enter_tapped.is_tapped(),
+                    "enter_tapped must be set, got {enter_tapped:?}"
+                );
+                assert!(enters_attacking, "enters_attacking must be true");
+                assert!(matches!(target, TargetFilter::SelfRef));
+            }
+            other => panic!("expected Effect::ChangeZone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stamp_self_return_origin_skips_nested_parent_target_return() {
+        use crate::types::ability::{AbilityDefinition, AbilityKind};
+        use crate::types::zones::EtbTapState;
+
+        let mut trigger = TriggerDefinition::new(TriggerMode::YouAttack);
+        trigger.condition = Some(TriggerCondition::SourceInZone {
+            zone: Zone::Graveyard,
+        });
+        let mut head = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                origin: None,
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: EtbTapState::Tapped,
+                enters_attacking: true,
+                up_to: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+            },
+        );
+        head.sub_ability = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                origin: None,
+                destination: Zone::Hand,
+                target: TargetFilter::ParentTarget,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+            },
+        )));
+        trigger.execute = Some(Box::new(head));
+
+        stamp_self_return_origin_from_trigger_condition(&mut trigger);
+
+        let execute = trigger.execute.as_ref().expect("execute");
+        match execute.effect.as_ref() {
+            Effect::ChangeZone { origin, target, .. } => {
+                assert_eq!(origin, &Some(Zone::Graveyard));
+                assert_eq!(*target, TargetFilter::SelfRef);
+            }
+            other => panic!("expected head ChangeZone, got {other:?}"),
+        }
+        let sub = execute.sub_ability.as_ref().expect("nested return");
+        match sub.effect.as_ref() {
+            Effect::ChangeZone { origin, target, .. } => {
+                assert_eq!(origin, &None);
+                assert_eq!(*target, TargetFilter::ParentTarget);
+            }
+            other => panic!("expected nested ParentTarget ChangeZone, got {other:?}"),
+        }
     }
 
     #[test]
@@ -18697,6 +19092,111 @@ mod tests {
         }
     }
 
+    /// CR 603.7a + CR 118.12a (issue #4369): Ashling, the Limitless — "Whenever
+    /// you sacrifice a nontoken Elemental, create a token that's a copy of it.
+    /// The token gains haste until end of turn. At the beginning of your next
+    /// end step, sacrifice it unless you pay {W}{U}{B}{R}{G}." The "unless you
+    /// pay {W}{U}{B}{R}{G}" alternative cost belongs to the DELAYED end-step
+    /// sacrifice, not to the parent "Whenever you sacrifice" trigger. Before the
+    /// fix `extract_unless_pay_modifier` scanned the whole multi-sentence effect,
+    /// found the "unless" in the delayed sentence, and hoisted the cost onto the
+    /// parent trigger — so the engine demanded the 5-color payment when the token
+    /// copy was created (wrong time), letting the player keep the token without
+    /// the mana. The cost must ride the `CreateDelayedTrigger`'s inner sacrifice.
+    #[test]
+    fn ashling_delayed_end_step_unless_pay_rides_delayed_sacrifice() {
+        use crate::types::ability::{AbilityCost, Effect};
+
+        // Walk the execute chain into the CreateDelayedTrigger's inner def.
+        fn find_delayed(def: &AbilityDefinition) -> Option<&AbilityDefinition> {
+            if let Effect::CreateDelayedTrigger { effect: inner, .. } = &*def.effect {
+                return Some(inner);
+            }
+            def.sub_ability
+                .as_deref()
+                .and_then(find_delayed)
+                .or_else(|| def.else_ability.as_deref().and_then(find_delayed))
+        }
+
+        let def = parse_trigger_line(
+            "Whenever you sacrifice a nontoken Elemental, create a token that's a copy of it. \
+             The token gains haste until end of turn. At the beginning of your next end step, \
+             sacrifice it unless you pay {W}{U}{B}{R}{G}.",
+            "Ashling, the Limitless",
+        );
+
+        // (1) The parent sacrifice trigger must NOT carry the delayed unless-cost.
+        assert_eq!(
+            def.unless_pay, None,
+            "the delayed end-step unless-cost must not be hoisted onto the parent trigger"
+        );
+
+        // (2) The delayed trigger's inner sacrifice carries the {W}{U}{B}{R}{G} cost.
+        let exec = def
+            .execute
+            .as_deref()
+            .expect("Ashling trigger execute body");
+        let delayed = find_delayed(exec).expect("CreateDelayedTrigger in the effect chain");
+        let unless = delayed
+            .unless_pay
+            .as_ref()
+            .expect("the delayed sacrifice must carry the unless-cost");
+        match &unless.cost {
+            AbilityCost::Mana { cost } => assert_eq!(
+                cost.mana_value(),
+                5,
+                "the delayed unless-cost must be the 5-color {{W}}{{U}}{{B}}{{R}}{{G}}, got {cost:?}"
+            ),
+            other => panic!("delayed unless-cost must be AbilityCost::Mana, got {other:?}"),
+        }
+    }
+
+    /// CR 603.7a + CR 118.12a + CR 107.14 (issue #4369): Satya, Aetherflux Genius
+    /// — the energy-cost sibling of the same class: "Whenever Satya attacks, ...
+    /// At the beginning of the next end step, sacrifice that token unless you pay
+    /// an amount of {E} equal to its mana value." The dynamic-energy unless-cost
+    /// must ride the delayed sacrifice (not the parent attack trigger), exactly
+    /// like Ashling's mana cost — proving the fix is class-general across cost
+    /// types, not a one-off for Ashling.
+    #[test]
+    fn satya_delayed_end_step_energy_unless_rides_delayed_sacrifice() {
+        use crate::types::ability::{AbilityCost, Effect};
+
+        fn find_delayed(def: &AbilityDefinition) -> Option<&AbilityDefinition> {
+            if let Effect::CreateDelayedTrigger { effect: inner, .. } = &*def.effect {
+                return Some(inner);
+            }
+            def.sub_ability
+                .as_deref()
+                .and_then(find_delayed)
+                .or_else(|| def.else_ability.as_deref().and_then(find_delayed))
+        }
+
+        let def = parse_trigger_line(
+            "Whenever Satya attacks, create a tapped and attacking token that's a copy of up to \
+             one other target nontoken creature you control. You get {E}{E}. At the beginning of \
+             the next end step, sacrifice that token unless you pay an amount of {E} equal to its \
+             mana value.",
+            "Satya, Aetherflux Genius",
+        );
+
+        assert_eq!(
+            def.unless_pay, None,
+            "the delayed end-step energy unless-cost must not be hoisted onto the parent trigger"
+        );
+        let exec = def.execute.as_deref().expect("Satya trigger execute body");
+        let delayed = find_delayed(exec).expect("CreateDelayedTrigger in the effect chain");
+        let unless = delayed
+            .unless_pay
+            .as_ref()
+            .expect("the delayed sacrifice must carry the energy unless-cost");
+        assert!(
+            matches!(unless.cost, AbilityCost::PayEnergy { .. }),
+            "delayed unless-cost must be AbilityCost::PayEnergy, got {:?}",
+            unless.cost
+        );
+    }
+
     #[test]
     fn non_token_enters_exile_it_stays_triggering_source() {
         // No-regression: a non-token ETB trigger "exile it" has NO token creator
@@ -18732,6 +19232,89 @@ mod tests {
             find_exile(exec),
             Some(TargetFilter::TriggeringSource),
             "non-token 'exile it' must stay TriggeringSource (no token creator → pass not entered)"
+        );
+    }
+
+    /// CR 608.2c + CR 603.7c (issue #4601): a PHASE-triggered token-copier —
+    /// Mishra, Eminent One: "At the beginning of combat on your turn, create a
+    /// token that's a copy of target noncreature artifact you control, … It
+    /// gains haste until end of turn. Sacrifice it at the beginning of the next
+    /// end step." Unlike the ETB copiers above, a Phase trigger has no
+    /// triggering object, so the bare-"it" in "Sacrifice it" lowers to `SelfRef`
+    /// (the source — Mishra) rather than `TriggeringSource`. The antecedent is
+    /// still the newly created TOKEN, so the delayed sacrifice must bind
+    /// `LastCreated` — otherwise Mishra sacrifices ITSELF at the end step.
+    #[test]
+    fn phase_trigger_token_copier_sacrifice_anaphor_binds_created_token() {
+        fn collect<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+            out.push(&def.effect);
+            if let Effect::CreateDelayedTrigger { effect: inner, .. } = &*def.effect {
+                collect(inner, out);
+            }
+            if let Some(sub) = def.sub_ability.as_deref() {
+                collect(sub, out);
+            }
+            if let Some(els) = def.else_ability.as_deref() {
+                collect(els, out);
+            }
+        }
+        let def = parse_trigger_line(
+            "At the beginning of combat on your turn, create a token that's a copy of target noncreature artifact you control, except its name is Mishra's Warform and it's a 4/4 Construct artifact creature in addition to its other types. It gains haste until end of turn. Sacrifice it at the beginning of the next end step.",
+            "Mishra, Eminent One",
+        );
+        let exec = def.execute.as_ref().expect("execute must be Some");
+        let mut effs = Vec::new();
+        collect(exec, &mut effs);
+        let sac_target = effs.iter().find_map(|e| match e {
+            Effect::Sacrifice { target, .. } => Some(target.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            sac_target,
+            Some(TargetFilter::LastCreated),
+            "the delayed 'Sacrifice it' must bind the created token (LastCreated), not \
+             Mishra itself (SelfRef) — otherwise Mishra sacrifices itself at the end step",
+        );
+    }
+
+    /// CR 603.7c + CR 608.2c (issue #4601 review): the same Phase-triggered
+    /// token-copier anaphor, but with a LIBRARY-POSITION cleanup instead of a
+    /// sacrifice — "… create a token that's a copy of target creature you
+    /// control. It gains haste until end of turn. Put it on the bottom of its
+    /// owner's library at the beginning of the next end step." A Phase trigger
+    /// has no triggering object, so the bare-"it" in the delayed "Put it …"
+    /// lowers to `SelfRef`; `Effect::PutAtLibraryPosition` is a token-cleanup
+    /// move just like the sacrifice form, so it must rebind to `LastCreated`.
+    #[test]
+    fn phase_trigger_token_copier_library_cleanup_anaphor_binds_created_token() {
+        fn collect<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+            out.push(&def.effect);
+            if let Effect::CreateDelayedTrigger { effect: inner, .. } = &*def.effect {
+                collect(inner, out);
+            }
+            if let Some(sub) = def.sub_ability.as_deref() {
+                collect(sub, out);
+            }
+            if let Some(els) = def.else_ability.as_deref() {
+                collect(els, out);
+            }
+        }
+        let def = parse_trigger_line(
+            "At the beginning of combat on your turn, create a token that's a copy of target creature you control. It gains haste until end of turn. Put it on the bottom of its owner's library at the beginning of the next end step.",
+            "Test Phase Library Copier",
+        );
+        let exec = def.execute.as_ref().expect("execute must be Some");
+        let mut effs = Vec::new();
+        collect(exec, &mut effs);
+        let lib_target = effs.iter().find_map(|e| match e {
+            Effect::PutAtLibraryPosition { target, .. } => Some(target.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            lib_target,
+            Some(TargetFilter::LastCreated),
+            "the delayed 'Put it on the bottom of its owner's library' must bind the \
+             created token (LastCreated), not the source (SelfRef)",
         );
     }
 
@@ -30561,6 +31144,162 @@ mod tests {
     }
 
     #[test]
+    fn state_trigger_control_a_creature_with_toughness() {
+        // CR 603.8: Endangered Armodon — the positive-existence sibling of the
+        // "control no [type]" state triggers above. Discriminating shape check:
+        // reverting the new parser arm yields no StateCondition/ControlsType
+        // trigger (the text falls through to Unimplemented), failing every
+        // assertion here.
+        let def = parse_trigger_line(
+            "When you control a creature with toughness 2 or less, sacrifice this creature.",
+            "Endangered Armodon",
+        );
+        assert_eq!(def.mode, TriggerMode::StateCondition);
+        if let Some(TriggerCondition::ControlsType { filter }) = &def.condition {
+            if let TargetFilter::Typed(tf) = filter {
+                assert!(
+                    tf.type_filters.contains(&TypeFilter::Creature),
+                    "expected Creature type filter in {:?}",
+                    tf.type_filters,
+                );
+                assert!(
+                    tf.properties.iter().any(|p| matches!(
+                        p,
+                        FilterProp::PtComparison {
+                            stat: PtStat::Toughness,
+                            comparator: Comparator::LE,
+                            ..
+                        }
+                    )),
+                    "expected `toughness N or less` PtComparison in {:?}",
+                    tf.properties,
+                );
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+            } else {
+                panic!("expected Typed filter, got {filter:?}");
+            }
+        } else {
+            panic!("expected ControlsType condition, got {:?}", def.condition);
+        }
+        // Effect should be sacrifice self.
+        let execute = def.execute.as_ref().expect("should have execute");
+        assert!(
+            matches!(*execute.effect, Effect::Sacrifice { .. }),
+            "expected Sacrifice, got {:?}",
+            execute.effect,
+        );
+    }
+
+    /// CR 603.8: Endangered Armodon's state trigger fires at runtime when its
+    /// controller controls a creature with toughness 2 or less, sacrificing
+    /// Endangered Armodon. Drives the real `check_state_triggers` →
+    /// `GameRunner` resolution path (not just the parsed AST): the
+    /// `ControlsType` condition is evaluated against the live battlefield and
+    /// the `Sacrifice` effect resolves. Discriminates against reverting the new
+    /// parser arm — without it the text produces no StateCondition trigger, so
+    /// the pre-assertion fails and Endangered Armodon is never sacrificed.
+    #[test]
+    fn endangered_armodon_state_trigger_fires_and_sacrifices_self() {
+        use crate::game::scenario::GameRunner;
+        use crate::game::triggers::check_state_triggers;
+        use crate::game::zones::create_object;
+        use crate::parser::oracle::parse_oracle_text;
+        use crate::types::card_type::CoreType;
+        use crate::types::identifiers::CardId;
+        use crate::types::phase::Phase;
+        use crate::types::zones::Zone;
+        use crate::types::PlayerId;
+        use std::sync::Arc;
+
+        const ORACLE: &str =
+            "When you control a creature with toughness 2 or less, sacrifice this creature.";
+
+        let parsed = parse_oracle_text(
+            ORACLE,
+            "Endangered Armodon",
+            &[],
+            &["Creature".to_string()],
+            &[],
+        );
+
+        // Confirm the state trigger was parsed — shape check before the runtime test.
+        assert!(
+            parsed
+                .triggers
+                .iter()
+                .any(|t| t.mode == TriggerMode::StateCondition),
+            "Endangered Armodon must parse a StateCondition trigger; got {:?}",
+            parsed.triggers,
+        );
+
+        let mut state = crate::types::game_state::GameState::new_two_player(7);
+        state.phase = Phase::PreCombatMain;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+
+        // Endangered Armodon (3/3) — its own toughness (3) does NOT satisfy the
+        // "toughness 2 or less" filter, so the trigger fires only because of the
+        // separate small creature below, not self-reference.
+        let armodon_id = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(0),
+            "Endangered Armodon".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&armodon_id).unwrap();
+            obj.controller = PlayerId(0);
+            obj.power = Some(3);
+            obj.toughness = Some(3);
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+            obj.base_trigger_definitions = Arc::new(parsed.triggers.clone());
+            obj.trigger_definitions = parsed.triggers.clone().into();
+        }
+
+        // A 1/1 creature under the same controller satisfies "a creature with
+        // toughness 2 or less", making the state condition true.
+        let token_id = create_object(
+            &mut state,
+            CardId(8),
+            PlayerId(0),
+            "Goblin".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&token_id).unwrap();
+            obj.controller = PlayerId(0);
+            obj.power = Some(1);
+            obj.toughness = Some(1);
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types.core_types.push(CoreType::Creature);
+        }
+
+        // CR 603.8: the state trigger detects the small creature and enqueues the
+        // sacrifice.
+        check_state_triggers(&mut state);
+        assert!(
+            state.pending_trigger.is_some() || !state.stack.is_empty(),
+            "state trigger must be pending or on the stack after check_state_triggers",
+        );
+
+        // Resolve the sacrifice and confirm Endangered Armodon left the battlefield.
+        let mut runner = GameRunner::from_state(state);
+        runner.advance_until_stack_empty();
+        let state = runner.state();
+        assert!(
+            !state.battlefield.iter().any(|id| *id == armodon_id),
+            "Endangered Armodon must be sacrificed once a toughness-≤2 creature is controlled",
+        );
+        assert!(
+            state.battlefield.iter().any(|id| *id == token_id),
+            "the toughness-≤2 creature is unaffected by the sacrifice",
+        );
+    }
+
+    #[test]
     fn state_trigger_has_no_ice_counters() {
         // Dark Depths: "When Dark Depths has no ice counters on it, sacrifice it."
         let def = parse_trigger_line(
@@ -34117,6 +34856,59 @@ mod snapshot_tests {
         assert_eq!(*target, TargetFilter::TriggeringSource);
     }
 
+    // CR 701.21a: Morkrut Necropod's
+    // "Whenever ~ attacks or blocks, sacrifice another creature or land" — the
+    // source-exclusion "another" must land `FilterProp::Another` on the CREATURE
+    // leg only. A creature is never a land, so distributing the exclusion to the
+    // land leg is meaningless; more importantly, WITHOUT the exclusion on the
+    // creature leg the source could sacrifice ITSELF, a functional bug (#4513).
+    // Parsed end-to-end through the production trigger entry to lock in that the
+    // sacrifice imperative re-applies the exclusion the count word consumed.
+    #[test]
+    fn morkrut_necropod_sacrifice_another_creature_or_land_trigger() {
+        let def = parse_trigger_line(
+            "Whenever Morkrut Necropod attacks or blocks, sacrifice another creature or land.",
+            "Morkrut Necropod",
+        );
+        let execute = def.execute.as_deref().expect("trigger has execute");
+        let Effect::Sacrifice { target, .. } = execute.effect.as_ref() else {
+            panic!("expected Sacrifice, got {:?}", execute.effect);
+        };
+        let TargetFilter::Or { filters } = target else {
+            panic!("expected an Or target for 'creature or land', got {target:?}");
+        };
+        assert_eq!(filters.len(), 2, "expected two legs, got {filters:?}");
+        // Leg 0: creature — the source-exclusion MUST be present.
+        let TargetFilter::Typed(creature_leg) = &filters[0] else {
+            panic!("expected a typed creature leg, got {:?}", filters[0]);
+        };
+        assert!(
+            creature_leg.type_filters.contains(&TypeFilter::Creature),
+            "first leg should be the creature leg, got {creature_leg:?}"
+        );
+        assert!(
+            creature_leg.properties.contains(&FilterProp::Another),
+            "creature leg must carry FilterProp::Another so the source can't \
+             sacrifice itself (#4513), got {creature_leg:?}"
+        );
+        // Leg 1: land — the source-exclusion is present here too. "Another" is
+        // applied to every leg: it is vacuous on the land leg (a creature source
+        // is never a land) but the uniform rule is what keeps a source that
+        // matches a non-first leg (e.g. an artifact creature in "creature or
+        // artifact") from sacrificing itself.
+        let TargetFilter::Typed(land_leg) = &filters[1] else {
+            panic!("expected a typed land leg, got {:?}", filters[1]);
+        };
+        assert!(
+            land_leg.type_filters.contains(&TypeFilter::Land),
+            "second leg should be the land leg, got {land_leg:?}"
+        );
+        assert!(
+            land_leg.properties.contains(&FilterProp::Another),
+            "land leg should carry FilterProp::Another (vacuous but uniform), got {land_leg:?}"
+        );
+    }
+
     // CR 701.3d: shorter form "becomes unattached" (future-proofing)
     #[test]
     fn trigger_becomes_unattached_short_form() {
@@ -35470,5 +36262,105 @@ mod enchanted_player_controls_tests {
                 );
             }
         }
+    }
+
+    /// CR 102.2 + CR 603.2 + CR 608.2d (issue #4361): Heartwood Storyteller —
+    /// "Whenever a player casts a noncreature spell, each of that player's
+    /// opponents may draw a card." The recipient is fanned out via
+    /// `player_scope = OpponentOfTriggeringPlayer` (each opponent of the CASTER,
+    /// not the controller); the body draw stays `Controller` (rebound per
+    /// opponent). The "may" is per-recipient (execute.optional), so the
+    /// trigger-level `def.optional` stays false (the whole trigger is mandatory
+    /// to put on the stack; each opponent independently chooses).
+    #[test]
+    fn heartwood_storyteller_opponents_of_caster_may_draw() {
+        use crate::types::ability::{Effect, PlayerFilter, QuantityExpr};
+
+        let def = parse_trigger_line(
+            "Whenever a player casts a noncreature spell, each of that player's opponents may draw a card.",
+            "Heartwood Storyteller",
+        );
+
+        assert_eq!(def.mode, TriggerMode::SpellCast);
+
+        // valid_card filters to noncreature spells (Non(Creature)).
+        match def.valid_card.as_ref().expect("valid_card") {
+            TargetFilter::Typed(tf) => assert!(
+                tf.type_filters
+                    .contains(&TypeFilter::Non(Box::new(TypeFilter::Creature))),
+                "expected Non(Creature) in valid_card, got {tf:?}"
+            ),
+            other => panic!("expected Typed valid_card, got {other:?}"),
+        }
+
+        // Trigger-level optional stays false (no leading "you may").
+        assert!(
+            !def.optional,
+            "trigger-level optional must be false; the 'may' is per-recipient"
+        );
+
+        let execute = def.execute.as_deref().expect("execute body");
+        // The per-recipient "may" lives on the execute body.
+        assert!(
+            execute.optional,
+            "execute.optional must be true (per-opponent \"may draw\")"
+        );
+        // Recipient SET fans out via player_scope = OpponentOfTriggeringPlayer.
+        assert_eq!(
+            execute.player_scope,
+            Some(PlayerFilter::OpponentOfTriggeringPlayer),
+            "draw must fan out to each opponent of the casting player"
+        );
+        // The body draw is the per-opponent Controller (rebound per iteration).
+        let draw = collect_effects(execute)
+            .into_iter()
+            .find_map(|e| match e {
+                Effect::Draw { count, target } => Some((count.clone(), target.clone())),
+                _ => None,
+            })
+            .expect("execute must contain a Draw effect");
+        assert_eq!(draw.0, QuantityExpr::Fixed { value: 1 }, "draws one card");
+        assert_eq!(
+            draw.1,
+            TargetFilter::Controller,
+            "body draw target stays Controller; player_scope rebinds it per opponent"
+        );
+    }
+
+    /// CR 102.2 (issue #4361): building-block coverage for the "each of that
+    /// player's opponents [may]" recipient + per-recipient optional, independent
+    /// of the card name. With "may" the execute body is optional; without it the
+    /// body is mandatory — both fan out via `OpponentOfTriggeringPlayer`.
+    #[test]
+    fn each_of_that_players_opponents_optional_building_block() {
+        use crate::types::ability::PlayerFilter;
+
+        let optional = parse_trigger_line(
+            "Whenever a player casts a noncreature spell, each of that player's opponents may draw a card.",
+            "Test Card",
+        );
+        let opt_exec = optional.execute.as_deref().expect("execute");
+        assert!(
+            opt_exec.optional,
+            "\"may\" makes the per-opponent draw optional"
+        );
+        assert_eq!(
+            opt_exec.player_scope,
+            Some(PlayerFilter::OpponentOfTriggeringPlayer)
+        );
+
+        let mandatory = parse_trigger_line(
+            "Whenever a player casts a noncreature spell, each of that player's opponents draw a card.",
+            "Test Card",
+        );
+        let mand_exec = mandatory.execute.as_deref().expect("execute");
+        assert!(
+            !mand_exec.optional,
+            "without \"may\" the per-opponent draw is mandatory"
+        );
+        assert_eq!(
+            mand_exec.player_scope,
+            Some(PlayerFilter::OpponentOfTriggeringPlayer)
+        );
     }
 }

@@ -157,6 +157,7 @@ pub mod rad_counters;
 pub mod rebound;
 pub mod regenerate;
 pub mod register_bending;
+pub mod remember_card;
 pub mod remove_all_damage;
 pub mod remove_from_combat;
 pub mod renown;
@@ -263,6 +264,18 @@ pub(crate) fn matches_player_scope(
                 && match scope {
                     PlayerFilter::Controller => p.id == controller,
                     PlayerFilter::All => true,
+                    // CR 608.2c + CR 109.4: predicate form — a player matches
+                    // unless it matches the `exclude` anchor. Exact for excludes
+                    // resolvable without ability targets (Controller, Opponent,
+                    // …); ability-target-dependent anchors
+                    // (ParentObjectTargetController) return `false` from this
+                    // generic predicate, so the player_scope driver routes
+                    // `AllExcept` through the ability-aware
+                    // `speed_effects::players_for_filter` instead, which is
+                    // authoritative for `AllExcept` effect-iteration.
+                    PlayerFilter::AllExcept { exclude } => {
+                        !matches_player_scope(state, p.id, exclude, controller, source_id)
+                    }
                     PlayerFilter::Opponent => p.id != controller,
                     PlayerFilter::DefendingPlayer => {
                         crate::game::targeting::resolve_event_context_target_for_event_or_state(
@@ -350,6 +363,20 @@ pub(crate) fn matches_player_scope(
                         });
                         triggering.is_none_or(|pid| pid != p.id)
                     }
+                    // CR 102.2 + CR 102.3 + CR 603.2: Each opponent of the
+                    // *triggering* (casting) player. The base anchor is the
+                    // caster, not the controller, so this legitimately includes
+                    // the source's controller as a recipient. Opponent-ness is
+                    // CR 102.3-aware (teammates in 2HG are not opponents) via
+                    // `players::is_opponent`. Fail closed when no trigger event
+                    // is in scope (caster anchor undefined).
+                    PlayerFilter::OpponentOfTriggeringPlayer => state
+                        .current_trigger_event
+                        .as_ref()
+                        .and_then(|e| crate::game::targeting::extract_player_from_event(e, state))
+                        .is_some_and(|caster| {
+                            crate::game::players::is_opponent(state, caster, p.id)
+                        }),
                     // CR 109.4: the parent-object-target anchor requires the
                     // resolving `ResolvedAbility` (for `ability.targets`),
                     // which this generic scope predicate does not carry. The
@@ -2952,6 +2979,7 @@ pub fn resolve_effect(
         Effect::RingTemptsYou => ring::resolve(state, ability, events),
         Effect::GrantCastingPermission { .. } => grant_permission::resolve(state, ability, events),
         Effect::ChooseFromZone { .. } => choose_from_zone::resolve(state, ability, events),
+        Effect::RememberCard { .. } => remember_card::resolve(state, ability, events),
         Effect::ForEachCategoryExile { .. } => {
             choose_from_zone::resolve_for_each_category(state, ability, events)
         }
@@ -4689,6 +4717,13 @@ fn extract_event_context_filter(effect: &Effect) -> Option<&TargetFilter> {
         | Effect::PreventDamage { target, .. }
         | Effect::Connive { target, .. }
         | Effect::PhaseOut { target, .. }
+        // Symmetry with PhaseOut across the PhaseOut/PhaseIn walker class. No
+        // current card hydrates a `PhaseIn` target from event context (The
+        // Pandorica snapshots `PhaseIn{ParentTarget}` into `ability.targets` at
+        // CreateDelayedTrigger resolution rather than carrying a
+        // TriggeringPlayer/DefendingPlayer filter), but listing it keeps the
+        // walker complete should such a card appear.
+        | Effect::PhaseIn { target, .. }
         | Effect::ForceBlock { target, .. }
         | Effect::ForceAttack { target, .. }
         | Effect::PutAtLibraryPosition { target, .. }
@@ -5307,14 +5342,29 @@ fn resolve_chain_body(
         let controller = ability.controller;
         // CR 101.4 + CR 800.4: Join Forces overrides the APNAP anchor with
         // "Starting with you"; otherwise this remains standard APNAP order.
-        let matching_players: Vec<PlayerId> = crate::game::players::apnap_order_from(
+        let apnap = crate::game::players::apnap_order_from(
             state,
             ability.starting_with.clone(),
             controller,
-        )
-        .into_iter()
-        .filter(|pid| matches_player_scope(state, *pid, scope, controller, ability.source_id))
-        .collect();
+        );
+        let matching_players: Vec<PlayerId> = if matches!(scope, PlayerFilter::AllExcept { .. }) {
+            // CR 608.2c + CR 109.4 + CR 608.2h: the `AllExcept` anchor may be an
+            // ability-target reference (ParentObjectTargetController), which the
+            // generic `matches_player_scope` predicate cannot resolve (it carries
+            // no `ResolvedAbility`). Route through the ability-aware
+            // `speed_effects::players_for_filter`, then re-impose APNAP order by
+            // intersecting against the apnap sequence.
+            let set =
+                crate::game::effects::speed_effects::players_for_filter(state, scope, ability);
+            apnap.into_iter().filter(|pid| set.contains(pid)).collect()
+        } else {
+            apnap
+                .into_iter()
+                .filter(|pid| {
+                    matches_player_scope(state, *pid, scope, controller, ability.source_id)
+                })
+                .collect()
+        };
         let (scoped_template, after_scope) = split_player_scope_chain(ability, scope);
         let after_scope_needs_linked_exile = after_scope.as_ref().is_some_and(|tail| {
             crate::game::exile_links::ability_contains_linked_exile_consumer(tail)
@@ -7719,6 +7769,12 @@ fn scoped_player_matches_filter(
         PlayerFilter::Controller => candidate == controller,
         PlayerFilter::Opponent => candidate != controller,
         PlayerFilter::All => true,
+        // CR 608.2c + CR 109.4: candidate matches unless it matches the anchor.
+        // Recursive against the same printed-controller-relative predicate;
+        // ability-target anchors fall through to the fail-closed arm below.
+        PlayerFilter::AllExcept { exclude } => {
+            !scoped_player_matches_filter(state, ability, candidate, exclude)
+        }
         PlayerFilter::OpponentLostLife => {
             candidate != controller
                 && state
@@ -7750,6 +7806,7 @@ fn scoped_player_matches_filter(
         | PlayerFilter::TriggeringPlayer
         | PlayerFilter::OpponentOtherThanTriggering
         | PlayerFilter::OpponentOfTriggeringPlayerNotAttacked
+        | PlayerFilter::OpponentOfTriggeringPlayer
         | PlayerFilter::VotedFor { .. }
         | PlayerFilter::ParentObjectTargetController
         | PlayerFilter::ChosenPlayer { .. }
@@ -20134,5 +20191,123 @@ mod tests {
             creature_obj.casting_permissions.is_empty(),
             "illegal looked creature must not receive a cast permission"
         );
+    }
+
+    /// CR 102.2 + CR 603.2 (issue #4361): `PlayerFilter::OpponentOfTriggeringPlayer`
+    /// matches every player who is an opponent of the CASTER (the triggering
+    /// player), independent of the effect controller. With a SpellCast event by
+    /// B: A matches, B does not. With no trigger event: neither matches
+    /// (caster anchor undefined → fail closed).
+    #[test]
+    fn opponent_of_triggering_player_matches_casters_opponents() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Heartwood Storyteller".to_string(),
+            Zone::Battlefield,
+        );
+
+        // B (PlayerId(1)) is the caster; the effect controller is A (PlayerId(0)).
+        state.current_trigger_event = Some(GameEvent::SpellCast {
+            card_id: CardId(9000),
+            controller: PlayerId(1),
+            object_id: ObjectId(9000),
+        });
+
+        assert!(
+            matches_player_scope(
+                &state,
+                PlayerId(0),
+                &PlayerFilter::OpponentOfTriggeringPlayer,
+                PlayerId(0),
+                source,
+            ),
+            "A is an opponent of the caster B and must match (even as the controller)"
+        );
+        assert!(
+            !matches_player_scope(
+                &state,
+                PlayerId(1),
+                &PlayerFilter::OpponentOfTriggeringPlayer,
+                PlayerId(0),
+                source,
+            ),
+            "B (the caster) is not its own opponent"
+        );
+
+        // No trigger event in scope → fail closed (neither matches).
+        state.current_trigger_event = None;
+        for pid in [PlayerId(0), PlayerId(1)] {
+            assert!(
+                !matches_player_scope(
+                    &state,
+                    pid,
+                    &PlayerFilter::OpponentOfTriggeringPlayer,
+                    PlayerId(0),
+                    source,
+                ),
+                "without a trigger event the caster anchor is undefined; {pid:?} must not match"
+            );
+        }
+    }
+
+    /// CR 102.3 (issue #4361): in Two-Headed Giant, the caster's TEAMMATE is not
+    /// an opponent, so `PlayerFilter::OpponentOfTriggeringPlayer` must exclude
+    /// them. With a 2HG topology (seats 0,1 = team 0; seats 2,3 = team 1) and a
+    /// SpellCast by seat 0, only the two members of the OTHER team match — not
+    /// the caster and not the caster's teammate (seat 1). A `p.id != caster`
+    /// predicate would wrongly include the teammate; `players::is_opponent` does
+    /// not.
+    #[test]
+    fn opponent_of_triggering_player_excludes_two_headed_giant_teammate() {
+        let mut state = GameState::new(
+            crate::types::format::FormatConfig::two_headed_giant(),
+            4,
+            42,
+        );
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Heartwood Storyteller".to_string(),
+            Zone::Battlefield,
+        );
+
+        // Seat 0 casts the spell (the triggering player).
+        state.current_trigger_event = Some(GameEvent::SpellCast {
+            card_id: CardId(9000),
+            controller: PlayerId(0),
+            object_id: ObjectId(9000),
+        });
+
+        // The caster (seat 0) and its teammate (seat 1) are NOT opponents.
+        for (pid, who) in [(PlayerId(0), "caster"), (PlayerId(1), "caster's teammate")] {
+            assert!(
+                !matches_player_scope(
+                    &state,
+                    pid,
+                    &PlayerFilter::OpponentOfTriggeringPlayer,
+                    PlayerId(0),
+                    source,
+                ),
+                "2HG: the {who} ({pid:?}) is not an opponent of the caster and must not match"
+            );
+        }
+
+        // The opposing team (seats 2 and 3) are both opponents and must match.
+        for pid in [PlayerId(2), PlayerId(3)] {
+            assert!(
+                matches_player_scope(
+                    &state,
+                    pid,
+                    &PlayerFilter::OpponentOfTriggeringPlayer,
+                    PlayerId(0),
+                    source,
+                ),
+                "2HG: opposing-team member {pid:?} is an opponent of the caster and must match"
+            );
+        }
     }
 }

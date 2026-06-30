@@ -601,6 +601,12 @@ fn static_mode_is_optional_permission(mode: &StaticMode) -> bool {
             | StaticMode::MayPlayAdditionalLand
             | StaticMode::AdditionalLandDrop { .. }
             | StaticMode::TopOfLibraryCastPermission { .. }
+            // CR 702.170a grant + CR 702.170f permission: "The top card of your
+            // library has plot" / "You may plot [filter] cards from the top of
+            // your library" — opt-in plot-from-library (Fblthp). The plot special
+            // action (CR 702.170b) is taken at the player's discretion.
+            | StaticMode::TopOfLibraryHasPlot
+            | StaticMode::TopOfLibraryPlotPermission
             // CR 702.8: "You may cast this spell as though it had flash" —
             // opt-in cast-timing permission.
             | StaticMode::CastWithFlash
@@ -649,6 +655,14 @@ fn static_mode_is_optional_permission(mode: &StaticMode) -> bool {
             // creatures had haste" — lifts the summoning-sickness gate on {T}/{Q}
             // activated abilities; the permission is opt-in by the "you may" surface.
             | StaticMode::CanActivateAbilitiesAsThoughHaste
+            // CR 118.9 + CR 118.9b: "You may cast [this] without paying its mana
+            // cost" / "you may pay {0} rather than pay the mana cost" is an
+            // alternative cost, and alternative costs are generally optional — the
+            // "you may" permission is the static's entire semantic content
+            // (Omniscience, As Foretold, Zaffai). Mirrors the sibling permission
+            // modes above; without it the swallow auditor false-positives an
+            // Optional_YouMay clause and demotes the card from "supported."
+            | StaticMode::CastFromHandFree { .. }
     )
 }
 
@@ -1442,6 +1456,13 @@ fn detect_dynamic_qty(
         "SelfManaCost",
         "SelfManaValue",
         "TargetManaCost",
+        // CR 702.170a: "The plot cost is equal to its mana cost" — the plot cost
+        // is intrinsic to the `TopOfLibraryHasPlot` static (computed at synthesis
+        // from the live top card's mana_cost), not a stored `QuantityExpr`. The
+        // static's presence in the AST is the coverage marker, mirroring the
+        // `SelfManaCost` precedent for Flashback/Scavenge "cost equal to its mana
+        // cost" (Fblthp, Lost on the Range).
+        "TopOfLibraryHasPlot",
         // CR 702.20a: "assigns combat damage equal to its toughness
         // rather than its power" — Brontodon class. Encoded as a typed
         // continuous-modification variant, not a quantity expression.
@@ -3174,6 +3195,84 @@ mod tests {
         assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
     }
 
+    /// CR 611.3: equipment and creature statics that fold "as long as" qualifiers
+    /// into attached-subject filters must not trip Condition_AsLongAs warnings
+    /// (issue #2234).
+    #[test]
+    fn condition_as_long_as_accepts_bronze_horse_and_champions_helm() {
+        use crate::types::ability::{FilterProp, ShieldKind, TypedFilter};
+        use crate::types::keywords::Keyword;
+        use crate::types::replacements::ReplacementEvent;
+        use crate::types::ContinuousModification;
+
+        let bronze = parse_named(
+            "Trample\nAs long as you control another creature, prevent all damage that would be dealt to this creature by spells that target it.",
+            "Bronze Horse",
+            &["Artifact", "Creature"],
+        );
+        assert!(
+            !bronze
+                .replacements
+                .iter()
+                .any(|r| r.execute.as_deref().is_some_and(def_tree_has_unimplemented)),
+            "Bronze Horse replacement must parse without Unimplemented"
+        );
+        let as_long_as = "as long as";
+        assert!(
+            bronze.replacements.iter().any(|r| {
+                r.event == ReplacementEvent::DamageDone
+                    && r.valid_card == Some(TargetFilter::SelfRef)
+                    && matches!(r.shield_kind, ShieldKind::Prevention { .. })
+                    && r.description
+                        .as_deref()
+                        .is_some_and(|d| d.to_ascii_lowercase().contains(as_long_as))
+            }),
+            "expected gated damage-prevention replacement, got {:#?}",
+            bronze.replacements
+        );
+        assert!(!has_swallowed_detector(&bronze, "Condition_AsLongAs"));
+
+        let helm = parse_named(
+            "Equipped creature gets +2/+2.\nAs long as equipped creature is legendary, it has hexproof. (It can't be the target of spells or abilities your opponents control.)\nEquip {1}",
+            "Champion's Helm",
+            &["Artifact", "Equipment"],
+        );
+        assert!(
+            !helm.abilities.iter().any(def_tree_has_unimplemented)
+                && !helm
+                    .triggers
+                    .iter()
+                    .any(|t| t.execute.as_deref().is_some_and(def_tree_has_unimplemented)),
+            "Champion's Helm must parse without Unimplemented"
+        );
+        assert!(
+            helm.statics.iter().any(|s| {
+                matches!(s.mode, crate::types::statics::StaticMode::Continuous)
+                    && matches!(
+                        &s.affected,
+                        Some(TargetFilter::Typed(TypedFilter {
+                            properties,
+                            ..
+                        })) if properties.contains(&FilterProp::EquippedBy)
+                            && properties.contains(&FilterProp::HasSupertype {
+                                value: crate::types::card_type::Supertype::Legendary
+                            })
+                    )
+                    && s.modifications.iter().any(|m| {
+                        matches!(
+                            m,
+                            ContinuousModification::AddKeyword {
+                                keyword: Keyword::Hexproof
+                            }
+                        )
+                    })
+            }),
+            "expected legendary-equipped hexproof static, got {:#?}",
+            helm.statics
+        );
+        assert!(!has_swallowed_detector(&helm, "Condition_AsLongAs"));
+    }
+
     #[test]
     fn condition_as_long_as_accepts_inverted_attached_subject_color_grant() {
         // CR 611.3a + CR 613: Shield of the Oversoul folds "is white/green" into
@@ -3644,6 +3743,128 @@ mod tests {
             other => panic!("expected SearchOutsideGame, got {other:?}"),
         }
         assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+    }
+
+    /// CR 611.2a: Amplifire — upkeep P/T set uses "until your next turn" duration
+    /// on a layer effect; must not trip Duration_NextTurn swallow warnings (issue #2239).
+    #[test]
+    fn duration_next_turn_accepts_amplifire_upkeep_pt_set() {
+        use crate::types::ability::{ContinuousModification, Duration, PlayerScope};
+
+        let parsed = parse_named(
+            "At the beginning of your upkeep, reveal cards from the top of your library until you reveal a creature card. Until your next turn, this creature's base power becomes twice that card's power and its base toughness becomes twice that card's toughness. Put the revealed cards on the bottom of your library in a random order.",
+            "Amplifire",
+            &["Creature"],
+        );
+        let execute = parsed.triggers[0]
+            .execute
+            .as_ref()
+            .expect("Amplifire upkeep trigger");
+        assert!(
+            !def_tree_has_unimplemented(execute),
+            "Amplifire trigger must parse without Unimplemented"
+        );
+        assert!(
+            matches!(execute.effect.as_ref(), Effect::RevealUntil { .. }),
+            "Amplifire head must be RevealUntil, got {:?}",
+            execute.effect
+        );
+        fn find_timed_pt_layer(def: &AbilityDefinition) -> Option<&AbilityDefinition> {
+            let has_pt_layer = matches!(
+                def.effect.as_ref(),
+                Effect::GenericEffect {
+                    static_abilities,
+                    ..
+                } if static_abilities.iter().any(|s| {
+                    s.modifications.iter().any(|m| {
+                        matches!(
+                            m,
+                            ContinuousModification::SetPowerDynamic { .. }
+                                | ContinuousModification::SetToughnessDynamic { .. }
+                        )
+                    })
+                })
+            );
+            if has_pt_layer
+                && matches!(
+                    def.duration,
+                    Some(Duration::UntilNextTurnOf {
+                        player: PlayerScope::Controller
+                    })
+                )
+            {
+                return Some(def);
+            }
+            def.sub_ability
+                .as_deref()
+                .and_then(find_timed_pt_layer)
+                .or_else(|| def.else_ability.as_deref().and_then(find_timed_pt_layer))
+        }
+        assert!(
+            find_timed_pt_layer(execute).is_some(),
+            "expected until-your-next-turn duration on the P/T layer clause, got {execute:#?}",
+        );
+        assert!(!has_swallowed_detector(&parsed, "Duration_NextTurn"));
+    }
+
+    /// CR 400.11 + CR 701.23j: Wish-cycle and planeswalker wishboard fetches must
+    /// lower to SearchOutsideGame without Optional_YouMay swallow warnings (issue #2276).
+    #[test]
+    fn optional_you_may_accepts_wishboard_creature_or_land_and_loyalty_fetches() {
+        let living_wish = parse_named(
+            "You may reveal a creature or land card you own from outside the game and put it into your hand. Exile Living Wish.",
+            "Living Wish",
+            &["Sorcery"],
+        );
+        assert!(
+            !living_wish.abilities.iter().any(def_tree_has_unimplemented),
+            "Living Wish must parse without Unimplemented"
+        );
+        let living = living_wish
+            .abilities
+            .iter()
+            .find_map(find_search_outside_game)
+            .expect("Living Wish outside-game search");
+        assert!(matches!(living, Effect::SearchOutsideGame { count, .. } if count.is_up_to()));
+        assert!(!has_swallowed_detector(&living_wish, "Optional_YouMay"));
+
+        let karn = parse_named(
+            "[−2]: You may reveal an artifact card you own from outside the game or choose a face-up artifact card you own in exile. Put that card into your hand.",
+            "Karn, the Great Creator",
+            &["Planeswalker"],
+        );
+        assert!(
+            !karn.abilities.iter().any(def_tree_has_unimplemented),
+            "Karn -2 must parse without Unimplemented"
+        );
+        let karn_search = karn
+            .abilities
+            .iter()
+            .find_map(find_search_outside_game)
+            .expect("Karn -2 outside-game search");
+        assert!(matches!(
+            karn_search,
+            Effect::SearchOutsideGame {
+                source_pool: OutsideGameSourcePool::SideboardAndFaceUpExile,
+                ..
+            }
+        ));
+        assert!(!has_swallowed_detector(&karn, "Optional_YouMay"));
+
+        let vivien = parse_named(
+            "[−5]: You may reveal a creature card you own from outside the game and put it into your hand.",
+            "Vivien, Arkbow Ranger",
+            &["Planeswalker"],
+        );
+        assert!(
+            !vivien.abilities.iter().any(def_tree_has_unimplemented),
+            "Vivien -5 must parse without Unimplemented"
+        );
+        assert!(vivien
+            .abilities
+            .iter()
+            .any(|a| matches!(a.effect.as_ref(), Effect::SearchOutsideGame { .. })));
+        assert!(!has_swallowed_detector(&vivien, "Optional_YouMay"));
     }
 
     #[test]
@@ -4750,6 +4971,24 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         let parsed = parse(
             "Put a +1/+1 counter on target creature you control, then double the number of +1/+1 counters on that creature.",
             &["Instant"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "DynamicQty"));
+    }
+
+    /// CR 702.170a: Fblthp's "The plot cost is equal to its mana cost" is the
+    /// intrinsic plot cost of the `TopOfLibraryHasPlot` static (computed at
+    /// synthesis, no stored `QuantityExpr`), so the " equal to " marker must NOT
+    /// raise a DynamicQty swallow warning — the static's presence is the carrier
+    /// (mirrors the SelfManaCost precedent). Reverting the marker re-reds Fblthp.
+    #[test]
+    fn dynamic_qty_accepts_plot_cost_equal_to_mana_cost() {
+        let parsed = parse_named(
+            "You may look at the top card of your library any time.\n\
+             The top card of your library has plot. The plot cost is equal to its mana cost.\n\
+             You may plot nonland cards from the top of your library.",
+            "Fblthp, Lost on the Range",
+            &["Creature"],
         );
 
         assert!(!has_swallowed_detector(&parsed, "DynamicQty"));
