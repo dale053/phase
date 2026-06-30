@@ -3960,9 +3960,7 @@ async fn handle_client_message(
                     // Snapshot the public-game entry while the lock is still
                     // held; avoids re-locking lobby after the broadcast below.
                     if public {
-                        lob.public_games()
-                            .into_iter()
-                            .find(|g| g.game_code == game_code)
+                        lob.public_game(&game_code)
                     } else {
                         None
                     }
