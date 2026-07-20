@@ -692,27 +692,127 @@ fn object_ids_in_player_zone(state: &GameState, player: PlayerId, zone: Zone) ->
     }
 }
 
-/// CR 700.2: Resolve the `Chooser` enum to an actual `PlayerId`.
-/// For `Opponent`, first checks ability targets for a pre-targeted opponent player
-/// (handles "target opponent chooses"), then falls back to the first opponent in APNAP order.
+/// CR 800.4g + CR 800.4h: Resolve the `Chooser` enum to an actual
+/// live `PlayerId`. Re-checked on EVERY call (not just at ability-cast time)
+/// so a chooser who has since left the game is redirected rather than
+/// producing a prompt for a departed player.
 fn resolve_chooser(state: &GameState, ability: &ResolvedAbility, chooser: Chooser) -> PlayerId {
     match chooser {
-        Chooser::Controller => ability.controller,
+        Chooser::Controller => {
+            if players::is_alive(state, ability.controller) {
+                ability.controller
+            } else {
+                // CR 800.4h: the next player in turn order makes the choice.
+                players::next_player(state, ability.controller)
+            }
+        }
         Chooser::Opponent => {
             // Check if an opponent was already targeted by the spell.
             if let Some(targeted_opponent) = ability.targets.iter().find_map(|t| match t {
-                TargetRef::Player(id) if *id != ability.controller => Some(*id),
+                TargetRef::Player(id)
+                    if *id != ability.controller && players::is_alive(state, *id) =>
+                {
+                    Some(*id)
+                }
                 _ => None,
             }) {
                 return targeted_opponent;
             }
-            // Fallback: first opponent in APNAP order (CR-correct for 2-player).
+            // CR 800.4g: "If the original choice was to be made by an
+            // opponent ..., that player chooses another opponent if
+            // possible." `players::opponents` already filters to living
+            // players.
             players::opponents(state, ability.controller)
                 .into_iter()
                 .next()
-                .unwrap_or(ability.controller)
+                .unwrap_or_else(|| players::next_player(state, ability.controller))
         }
     }
+}
+
+/// CR 800.4g/h + CR 101.4 + CR 608.2c: If the player currently prompted by an
+/// in-flight `WaitingFor::ChooseFromZoneChoice` that belongs to a per-player
+/// (`PendingPerPlayerZoneChoice`) or per-category (`PendingPerCategoryZoneChoice`)
+/// iteration has left the game, re-resolve a LIVE chooser for the SAME
+/// already-offered `cards`/`count`/`up_to`/`constraint` in place — rather
+/// than letting the generic elimination redirect
+/// (`elimination::eliminate_players_simultaneously`) collapse the prompt to
+/// `Priority` and silently reduce the in-flight pick to zero cards
+/// (issue #4823). Only the `player` field is rewritten; every other field of
+/// the prompt — and the pending struct itself — is left untouched, so the
+/// new chooser is offered EXACTLY the same zone/cards/constraint the
+/// departed player would have answered.
+///
+/// A single-shot `ChooseFromZone` prompt (no `pending_per_player_zone_choice`
+/// / `pending_per_category_zone_choice`) has no surviving `ability`/`Chooser`
+/// to re-resolve against once parked — that shape is out of scope for this
+/// fix (issue #4823's reported repro is specifically the per-player/
+/// per-category APNAP iterations); the generic collapse in `elimination.rs`
+/// still applies to it unchanged.
+///
+/// KNOWN GAP (tracked follow-up, not fixed here): a departed non-chooser ZONE
+/// OWNER — as opposed to the fixed chooser this function redirects — whose
+/// `cards` are already offered in an in-flight prompt is not revalidated here.
+/// Once `prompt_next_each_player` collects `cards` from the current owner's zone
+/// and parks the prompt, that owner's identity lives only in the ephemeral
+/// `WaitingFor::ChooseFromZoneChoice.cards` (raw object ids with no owner tag),
+/// never in `PendingPerPlayerZoneChoice`. If that specific owner leaves the game
+/// while the pick is outstanding, `exile_owned_objects_on_player_left_game`
+/// (CR 800.4a) may exile those exact objects out from under the outstanding pick,
+/// yet neither this function (gated solely on the chooser's own liveness) nor
+/// `prune_player_ordered_queues` (which only prunes the FUTURE `remaining_players`
+/// queue, not the already-offered `cards`) revalidates the offered list — so the
+/// still-alive chooser could submit a pick referencing now-gone objects. Narrower
+/// than issue #4823's reported symptoms (it requires a non-chooser player's
+/// elimination to interleave with an already-parked prompt); tracked as a
+/// follow-up, not fixed here.
+///
+/// Returns `true` when it rewrote `state.waiting_for` in place; the caller
+/// (`elimination::eliminate_players_simultaneously`) then observes a live
+/// `player` on its own subsequent `acting_player()` check and naturally
+/// skips its generic collapse for this `WaitingFor` — no coordination beyond
+/// call ordering is required.
+pub(crate) fn redirect_departed_chooser(state: &mut GameState) -> bool {
+    let current_chooser = match &state.waiting_for {
+        WaitingFor::ChooseFromZoneChoice { player, .. } => *player,
+        _ => return false,
+    };
+    if players::is_alive(state, current_chooser) {
+        return false;
+    }
+
+    let chooser_and_ability: Option<(Chooser, ResolvedAbility)> = if let Some(pending) =
+        &state.pending_per_player_zone_choice
+    {
+        match &pending.ability.effect {
+            Effect::ChooseFromZone { chooser, .. } => Some((*chooser, (*pending.ability).clone())),
+            _ => None,
+        }
+    } else if let Some(pending) = &state.pending_per_category_zone_choice {
+        match &pending.ability.effect {
+            Effect::ForEachCategoryExile { chooser, .. } => {
+                Some((*chooser, (*pending.ability).clone()))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let Some((chooser, ability)) = chooser_and_ability else {
+        return false;
+    };
+
+    let new_chooser = resolve_chooser(state, &ability, chooser);
+
+    match &mut state.waiting_for {
+        WaitingFor::ChooseFromZoneChoice { player, .. } => *player = new_chooser,
+        _ => unreachable!(
+            "verified ChooseFromZoneChoice above; nothing between the two \
+             matches mutates state.waiting_for"
+        ),
+    }
+    true
 }
 
 pub fn selection_satisfies_constraint(
@@ -2345,5 +2445,264 @@ mod tests {
             Some(&vec![ObjectId(7), ObjectId(8)]),
             "the prior producer's set must be untouched, never inherited by the iteration"
         );
+    }
+
+    // --- issue #4823: departed-chooser redirect (CR 800.4g / CR 800.4h) ---
+
+    fn three_player_state() -> GameState {
+        GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42)
+    }
+
+    /// Benign ability whose only relevant fields for `resolve_chooser` are
+    /// `controller` and `targets`; the effect body is never inspected there.
+    fn chooser_ability(
+        source: ObjectId,
+        controller: PlayerId,
+        targets: Vec<TargetRef>,
+    ) -> ResolvedAbility {
+        ResolvedAbility::new(
+            Effect::GainLife {
+                amount: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            targets,
+            source,
+            controller,
+        )
+    }
+
+    #[test]
+    fn resolve_chooser_redirects_departed_controller_to_next_player() {
+        let mut state = three_player_state();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Src".into(),
+            Zone::Exile,
+        );
+        let ability = chooser_ability(source, PlayerId(0), vec![]);
+
+        // A live controller resolves to itself.
+        assert_eq!(
+            resolve_chooser(&state, &ability, Chooser::Controller),
+            PlayerId(0)
+        );
+
+        // CR 800.4h: once the controller/chooser leaves, the next player in
+        // turn order makes the choice instead.
+        state.players[0].is_eliminated = true;
+        let expected = players::next_player(&state, PlayerId(0));
+        assert_eq!(
+            resolve_chooser(&state, &ability, Chooser::Controller),
+            expected
+        );
+        assert_eq!(expected, PlayerId(1));
+    }
+
+    #[test]
+    fn resolve_chooser_redirects_departed_targeted_opponent_to_living_opponent() {
+        let mut state = three_player_state();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Src".into(),
+            Zone::Exile,
+        );
+        // Controller P0; opponent-chooser was targeted at P1.
+        let ability = chooser_ability(source, PlayerId(0), vec![TargetRef::Player(PlayerId(1))]);
+
+        // While P1 is alive it remains the opponent chooser.
+        assert_eq!(
+            resolve_chooser(&state, &ability, Chooser::Opponent),
+            PlayerId(1)
+        );
+
+        // CR 800.4g: the targeted opponent leaves → another living opponent
+        // (P2) makes the choice.
+        state.players[1].is_eliminated = true;
+        assert_eq!(
+            resolve_chooser(&state, &ability, Chooser::Opponent),
+            PlayerId(2)
+        );
+    }
+
+    #[test]
+    fn resolve_chooser_multi_authority_departed_opponent_and_controller() {
+        // CR 800.4g: BOTH the targeted opponent (P1) and the controller (P0)
+        // leave simultaneously; a surviving opponent (P2) must still be chosen.
+        let mut state = three_player_state();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Src".into(),
+            Zone::Exile,
+        );
+        let ability = chooser_ability(source, PlayerId(0), vec![TargetRef::Player(PlayerId(1))]);
+
+        state.players[0].is_eliminated = true;
+        state.players[1].is_eliminated = true;
+        assert_eq!(
+            resolve_chooser(&state, &ability, Chooser::Opponent),
+            PlayerId(2)
+        );
+    }
+
+    #[test]
+    fn redirect_departed_chooser_preserves_per_player_payload() {
+        let mut state = three_player_state();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Src".into(),
+            Zone::Exile,
+        );
+        let c1 = create_object(&mut state, CardId(2), PlayerId(1), "A".into(), Zone::Exile);
+        let c2 = create_object(&mut state, CardId(3), PlayerId(2), "B".into(), Zone::Exile);
+
+        let ability = ResolvedAbility::new(
+            Effect::ChooseFromZone {
+                count: 2,
+                zone: Zone::Exile,
+                additional_zones: Vec::new(),
+                zone_owner: ZoneOwner::EachPlayer,
+                filter: None,
+                chooser: Chooser::Controller,
+                up_to: true,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                constraint: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        state.pending_per_player_zone_choice =
+            Some(crate::types::game_state::PendingPerPlayerZoneChoice {
+                ability: Box::new(ability),
+                remaining_players: vec![PlayerId(1), PlayerId(2)],
+                accumulated: false,
+            });
+        let constraint = Some(ChooseFromZoneConstraint::DistinctCardTypes {
+            categories: vec![CoreType::Creature],
+        });
+        state.waiting_for = WaitingFor::ChooseFromZoneChoice {
+            player: PlayerId(0),
+            cards: vec![c1, c2],
+            count: 2,
+            up_to: true,
+            constraint: constraint.clone(),
+            source_id: source,
+        };
+
+        // The single fixed chooser (controller P0) leaves the game.
+        state.players[0].is_eliminated = true;
+
+        assert!(redirect_departed_chooser(&mut state));
+        match &state.waiting_for {
+            WaitingFor::ChooseFromZoneChoice {
+                player,
+                cards,
+                count,
+                up_to,
+                constraint: c,
+                source_id,
+            } => {
+                assert_eq!(*player, PlayerId(1), "chooser must redirect, not collapse");
+                assert_eq!(cards, &vec![c1, c2], "offered cards must be preserved");
+                assert_eq!(*count, 2, "count must be preserved");
+                assert!(*up_to, "up_to must be preserved");
+                assert_eq!(c, &constraint, "constraint must be preserved");
+                assert_eq!(*source_id, source, "source must be preserved");
+            }
+            other => panic!("prompt collapsed instead of redirecting: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redirect_departed_chooser_preserves_per_category_payload() {
+        let mut state = three_player_state();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Src".into(),
+            Zone::Exile,
+        );
+        let c1 = create_object(&mut state, CardId(2), PlayerId(0), "A".into(), Zone::Exile);
+
+        let ability = ResolvedAbility::new(
+            Effect::ForEachCategoryExile {
+                category: crate::types::ability::IterationCategory::Color,
+                zone: Zone::Exile,
+                chooser: Chooser::Controller,
+                up_to: true,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        state.pending_per_category_zone_choice =
+            Some(crate::types::game_state::PendingPerCategoryZoneChoice {
+                ability: Box::new(ability),
+                pool: vec![c1],
+                remaining_member_filters: Vec::new(),
+            });
+        state.waiting_for = WaitingFor::ChooseFromZoneChoice {
+            player: PlayerId(0),
+            cards: vec![c1],
+            count: 1,
+            up_to: true,
+            constraint: None,
+            source_id: source,
+        };
+
+        state.players[0].is_eliminated = true;
+
+        assert!(redirect_departed_chooser(&mut state));
+        match &state.waiting_for {
+            WaitingFor::ChooseFromZoneChoice {
+                player,
+                cards,
+                count,
+                ..
+            } => {
+                assert_eq!(*player, PlayerId(1), "per-category chooser must redirect");
+                assert_eq!(cards, &vec![c1], "per-category offered cards preserved");
+                assert_eq!(*count, 1);
+            }
+            other => panic!("per-category prompt collapsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redirect_departed_chooser_noops_for_living_chooser() {
+        let mut state = three_player_state();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Src".into(),
+            Zone::Exile,
+        );
+        state.waiting_for = WaitingFor::ChooseFromZoneChoice {
+            player: PlayerId(0),
+            cards: vec![],
+            count: 1,
+            up_to: false,
+            constraint: None,
+            source_id: source,
+        };
+        // No pending iteration and the chooser is alive → no rewrite.
+        assert!(!redirect_departed_chooser(&mut state));
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ChooseFromZoneChoice {
+                player: PlayerId(0),
+                ..
+            }
+        ));
     }
 }

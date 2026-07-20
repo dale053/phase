@@ -6,6 +6,7 @@ use crate::types::match_config::MatchPhase;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 
+use super::effects::choose_from_zone;
 use super::players;
 
 /// Eliminate a player from the game per CR 800.4.
@@ -90,6 +91,7 @@ pub fn eliminate_players_simultaneously(
     // `pending_trigger_order` / `deferred_triggers` orphaned on `GameOver`.
     prune_pending_trigger_order(state);
     prune_deferred_triggers_for_eliminated_players(state);
+    prune_player_ordered_queues(state);
 
     if let Some(winner) = game_over_winner {
         // Terminal: drop trigger scaffolding the client would otherwise show as
@@ -98,6 +100,12 @@ pub fn eliminate_players_simultaneously(
         state.deferred_triggers.clear();
         state.pending_trigger = None;
         state.pending_trigger_entry = None;
+        state.pending_phase_transition_progress = None;
+        state.pending_team_draw_step.clear();
+        state.pending_choose_one_of = None;
+        state.pending_per_player_zone_choice = None;
+        state.pending_per_category_zone_choice = None;
+        state.pending_vote_ballot_iteration = None;
         state.waiting_for = WaitingFor::GameOver { winner };
     } else {
         // CR 603.3b: If prune collapsed an ordering pass into
@@ -113,12 +121,16 @@ pub fn eliminate_players_simultaneously(
         // by emitting MulliganStarted-equivalent transition state.
         prune_mulligan_pending(state, events);
 
+        choose_from_zone::redirect_departed_chooser(state);
+
         if let Some(waiting_pid) = state.waiting_for.acting_player() {
             if !players::is_alive(state, waiting_pid) {
                 let next = players::next_player(state, waiting_pid);
                 state.waiting_for = WaitingFor::Priority { player: next };
             }
         }
+
+        resume_interrupted_apnap_queues(state, events);
     }
 }
 
@@ -265,6 +277,116 @@ fn prune_deferred_triggers_for_eliminated_players(state: &mut GameState) {
             .find(|player| player.id == ctx.pending.controller)
             .is_some_and(|player| !player.is_eliminated)
     });
+}
+
+/// CR 800.4a + CR 101.4: Drop any player no longer in the game from every
+/// APNAP "remaining players/voters to prompt" queue whose front is itself
+/// the next actor/subject — NOT the fixed-chooser structures
+/// (`pending_per_player_zone_choice`/`pending_per_category_zone_choice`),
+/// which are handled live, per-call, by `choose_from_zone::resolve_chooser`/
+/// `redirect_departed_chooser` instead (see those functions for why: their
+/// prompted player is a fixed snapshot, not the queue front).
+/// `pending_per_category_zone_choice` is intentionally excluded even from
+/// this pruning — its iteration axis (`remaining_member_filters: Vec<TargetFilter>`)
+/// is category-keyed, not player-keyed.
+///
+/// KNOWN GAP (tracked follow-up, not fixed here): this function only prunes the
+/// FUTURE `remaining_players`/`remaining_voters` queues. The CURRENT prompted
+/// player of a `pending_choose_one_of` / `pending_vote_ballot_iteration`
+/// iteration (already popped off its queue and sitting in
+/// `WaitingFor::ChooseOneOfBranch { player, .. }` or the equivalent vote-ballot
+/// `WaitingFor`) is NOT given the chooser-redirect treatment that
+/// `redirect_departed_chooser` gives `ChooseFromZoneChoice`/`ForEachCategoryExile`.
+/// If that specific current player departs, the untouched generic collapse below
+/// (in `eliminate_players_simultaneously`) silently moves to `Priority` for the
+/// next living player, dropping that specific choice rather than
+/// CR 800.4h-delegating it to the next player in turn order. This is narrower
+/// than issue #4823's three reported symptoms (the game still proceeds; no
+/// softlock results), but it is the same bug class; tracked as a follow-up, not
+/// fixed here (mirrors the accepted out-of-scope single-shot `ChooseFromZoneChoice`
+/// and `DiscardToHandSize` gaps).
+fn prune_player_ordered_queues(state: &mut GameState) {
+    let living: HashSet<PlayerId> = state
+        .players
+        .iter()
+        .filter(|p| !p.is_eliminated)
+        .map(|p| p.id)
+        .collect();
+
+    state
+        .pending_team_draw_step
+        .retain(|pid| living.contains(pid));
+
+    if let Some(progress) = state.pending_phase_transition_progress.as_mut() {
+        progress
+            .remaining_players
+            .retain(|pid| living.contains(pid));
+    }
+    if let Some(pending) = state.pending_choose_one_of.as_mut() {
+        pending.remaining_players.retain(|pid| living.contains(pid));
+    }
+    if let Some(pending) = state.pending_per_player_zone_choice.as_mut() {
+        pending.remaining_players.retain(|pid| living.contains(pid));
+    }
+    if let Some(pending) = state.pending_vote_ballot_iteration.as_mut() {
+        pending.remaining_voters.retain(|pid| living.contains(pid));
+    }
+}
+
+/// CR 800.4a: Resume any APNAP-ordered drain queue left stranded when its
+/// front-of-queue actor departed (issue #4823). Order matters and is
+/// deliberate — do not reorder without re-reading the reasoning below:
+///
+/// 1. Team-draw first: its own resume path (`draw_through_replacement`)
+///    always reparks through a `WaitingFor::ReplacementChoice`, which is
+///    guaranteed to be re-answered via the sole production dispatch arm
+///    (`GameAction::ChooseReplacement` -> `handle_replacement_choice`), whose
+///    epilogue unconditionally re-attempts `pending_phase_transition_progress`
+///    regardless of what caused the original `ReplacementChoice`. So even if
+///    this step reparks away from `Priority`, phase-transition's resume is
+///    not lost — it's deferred to (and reliably delivered by) that path.
+/// 2. Phase-transition second (not last): `pending_phase_transition_progress`
+///    is the most fragile of the three — it has exactly two drain call sites
+///    in the ENTIRE engine (the seed-and-drain in `turns::enter_phase`, and
+///    `handle_replacement_choice`'s epilogue). `auto_advance` deliberately
+///    bails the instant this field is `Some`, by design, trusting only that
+///    one cascade to ever revisit it. It must run before `pending_continuation`
+///    precisely so a departed player's own dormant continuation can never
+///    starve it of its one guaranteed chance to resume within this
+///    one-shot elimination cascade.
+/// 3. Continuation last: `pending_continuation` is not similarly fragile —
+///    15+ production call sites in `engine_resolution_choices.rs` already
+///    retry it generically whenever any action resolves back to `Priority`.
+///    If draining it here reparks `state.waiting_for` onto a fresh
+///    interactive prompt instead of settling back to `Priority`, that's
+///    fine — the prompt's own eventual answer drains the continuation
+///    normally later, through one of those other retry points.
+///
+/// Each step is freshly gated on live `matches!(state.waiting_for, Priority)`
+/// (re-read after any prior step's possible reassignment, not cached) —
+/// matching the exact same gating pattern already used at every other
+/// production call site of these same drain functions
+/// (`engine_replacement.rs`'s own epilogue cascade). This is what prevents
+/// clobbering an unrelated, still-alive player's legitimate in-flight prompt
+/// (e.g. a live player's own competing CR 616.1 ordering choice) with a
+/// drain that belongs to a completely different, already-resolved elimination
+/// event.
+fn resume_interrupted_apnap_queues(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    if matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && !state.pending_team_draw_step.is_empty()
+    {
+        if let Some(wf) = super::turns::drain_pending_team_draw_step(state, events) {
+            state.waiting_for = wf;
+        }
+    }
+    if matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && state.pending_phase_transition_progress.is_some()
+    {
+        super::turns::drain_pending_phase_transition_progress(state, events);
+    }
+    if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        crate::game::effects::drain_pending_continuation(state, events);
+    }
 }
 
 /// CR 603.3b: If prune collapsed an ordering pass into `deferred_triggers`
@@ -564,11 +686,31 @@ pub(super) fn ensure_game_over_if_terminal(state: &mut GameState, events: &mut V
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
-    use crate::types::ability::{Effect, ResolvedAbility};
+    use crate::types::ability::{Effect, QuantityExpr, ResolvedAbility, TargetFilter};
     use crate::types::format::FormatConfig;
-    use crate::types::game_state::{CastingVariant, PendingCast, StackEntry, StackEntryKind};
+    use crate::types::game_state::{
+        CastingVariant, PendingCast, PendingChooseOneOf, PendingContinuation,
+        PendingPerCategoryZoneChoice, PendingPerPlayerZoneChoice, PendingVoteBallotIteration,
+        PhaseTransitionProgress, StackEntry, StackEntryKind,
+    };
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::mana::ManaCost;
+    use crate::types::phase::Phase;
+    use std::collections::VecDeque;
+
+    /// Benign controller-targeted life-gain used to populate parked-pending
+    /// fields where the effect body is irrelevant to the behavior under test.
+    fn gain_life_ability(source: ObjectId, controller: PlayerId) -> ResolvedAbility {
+        ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            controller,
+        )
+    }
 
     fn setup_two_player() -> GameState {
         let mut state = GameState::new_two_player(42);
@@ -1087,5 +1229,440 @@ mod tests {
                 winner: Some(PlayerId(1))
             }
         ));
+    }
+
+    // --- issue #4823: parked-choice departure softlock ---
+
+    #[test]
+    fn elimination_resumes_stranded_phase_transition_progress() {
+        // Symptom 1: the departed player is at the front of a CR 616.1
+        // empty-mana-pool ordering queue; the queue must resume and complete.
+        let mut state = setup_three_player();
+        state.pending_phase_transition_progress = Some(PhaseTransitionProgress {
+            remaining_players: VecDeque::from(vec![PlayerId(1), PlayerId(2)]),
+            next_phase: Phase::PreCombatMain,
+            in_combat: false,
+            entering_cleanup: false,
+        });
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(1),
+        };
+
+        let mut events = Vec::new();
+        eliminate_player(&mut state, PlayerId(1), &mut events);
+
+        assert!(
+            state.pending_phase_transition_progress.is_none(),
+            "front-of-queue departure must not strand phase-transition progress, got {:?}",
+            state.pending_phase_transition_progress
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::PhaseChanged { .. })),
+            "the stranded phase transition must complete (PhaseChanged) after resume"
+        );
+    }
+
+    #[test]
+    fn elimination_resumes_team_draw_after_front_player_departs() {
+        // Symptom 2: the departed player is at the front of the team-draw
+        // queue; the next living queued player must still draw.
+        let mut state = setup_three_player();
+        let card = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(2),
+            "Draw Me".to_string(),
+            Zone::Library,
+        );
+        state.pending_team_draw_step = vec![PlayerId(1), PlayerId(2)];
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(1),
+        };
+
+        let mut events = Vec::new();
+        eliminate_player(&mut state, PlayerId(1), &mut events);
+
+        assert!(
+            !state.pending_team_draw_step.contains(&PlayerId(1)),
+            "the departed player must be pruned from the draw queue"
+        );
+        assert!(
+            state.players[2].hand.contains(&card),
+            "the next living queued player must still draw their card"
+        );
+        assert!(
+            state.pending_team_draw_step.is_empty(),
+            "the draw queue must drain fully after the departure"
+        );
+    }
+
+    #[test]
+    fn elimination_drains_orphaned_pending_continuation() {
+        // Symptom 3: a continuation stranded behind the departed player's
+        // (out-of-redirect-scope) single-shot prompt must drain once the
+        // prompt collapses.
+        let mut state = setup_three_player();
+        let source = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(2),
+            "Src".to_string(),
+            Zone::Exile,
+        );
+        let cont = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(2),
+        );
+        state.pending_continuation = Some(PendingContinuation::new(Box::new(cont)));
+        let p2_life_before = state.players[2].life;
+
+        // Single-shot (no per-player/per-category) prompt for the departing
+        // player — out of `redirect_departed_chooser` scope, so it collapses
+        // generically to Priority and the continuation then drains.
+        state.waiting_for = WaitingFor::ChooseFromZoneChoice {
+            player: PlayerId(1),
+            cards: vec![],
+            count: 0,
+            up_to: false,
+            constraint: None,
+            source_id: source,
+        };
+
+        let mut events = Vec::new();
+        eliminate_player(&mut state, PlayerId(1), &mut events);
+
+        assert!(
+            state.pending_continuation.is_none(),
+            "the orphaned continuation must drain once the blocking prompt collapses"
+        );
+        assert_eq!(
+            state.players[2].life,
+            p2_life_before + 3,
+            "the drained continuation's effect must have applied"
+        );
+    }
+
+    #[test]
+    fn terminal_game_over_clears_all_parked_pending_fields() {
+        // Terminal branch: the six new parked-pending fields must be cleared.
+        let mut state = setup_two_player();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Src".to_string(),
+            Zone::Exile,
+        );
+
+        state.pending_phase_transition_progress = Some(PhaseTransitionProgress {
+            remaining_players: VecDeque::from(vec![PlayerId(0)]),
+            next_phase: Phase::PreCombatMain,
+            in_combat: false,
+            entering_cleanup: false,
+        });
+        state.pending_team_draw_step = vec![PlayerId(0)];
+        state.pending_choose_one_of = Some(PendingChooseOneOf {
+            controller: PlayerId(0),
+            source_id: source,
+            branches: Vec::new(),
+            parent_targets: Vec::new(),
+            context: crate::types::ability::SpellContext::default(),
+            remaining_players: vec![PlayerId(0)],
+        });
+        state.pending_per_player_zone_choice = Some(PendingPerPlayerZoneChoice {
+            ability: Box::new(gain_life_ability(source, PlayerId(0))),
+            remaining_players: vec![PlayerId(0)],
+            accumulated: false,
+        });
+        state.pending_per_category_zone_choice = Some(PendingPerCategoryZoneChoice {
+            ability: Box::new(gain_life_ability(source, PlayerId(0))),
+            pool: Vec::new(),
+            remaining_member_filters: Vec::new(),
+        });
+        state.pending_vote_ballot_iteration = Some(PendingVoteBallotIteration {
+            ability_template: Box::new(crate::types::ability::AbilityDefinition::new(
+                crate::types::ability::AbilityKind::Spell,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            )),
+            remaining_voters: vec![PlayerId(0)],
+            source_id: source,
+            controller: PlayerId(0),
+        });
+
+        let mut events = Vec::new();
+        eliminate_player(&mut state, PlayerId(0), &mut events);
+
+        assert!(matches!(state.waiting_for, WaitingFor::GameOver { .. }));
+        assert!(state.pending_phase_transition_progress.is_none());
+        assert!(state.pending_team_draw_step.is_empty());
+        assert!(state.pending_choose_one_of.is_none());
+        assert!(state.pending_per_player_zone_choice.is_none());
+        assert!(state.pending_per_category_zone_choice.is_none());
+        assert!(state.pending_vote_ballot_iteration.is_none());
+    }
+
+    #[test]
+    fn unrelated_elimination_leaves_live_players_prompt_untouched() {
+        // Hostile/negative: a live player (P2) has a legitimate in-flight
+        // prompt while an UNRELATED player (P1) is eliminated. P2's prompt and
+        // payload must be completely untouched.
+        let mut state = setup_three_player();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(2),
+            "Src".to_string(),
+            Zone::Exile,
+        );
+        let card = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(2),
+            "Pick".to_string(),
+            Zone::Exile,
+        );
+        let prompt = WaitingFor::ChooseFromZoneChoice {
+            player: PlayerId(2),
+            cards: vec![card],
+            count: 1,
+            up_to: false,
+            constraint: None,
+            source_id: source,
+        };
+        state.waiting_for = prompt.clone();
+
+        let mut events = Vec::new();
+        eliminate_player(&mut state, PlayerId(1), &mut events);
+
+        assert_eq!(
+            state.waiting_for, prompt,
+            "an unrelated elimination must not disturb a live player's in-flight prompt"
+        );
+    }
+
+    #[test]
+    fn prune_player_ordered_queues_drops_departed_keeps_survivors() {
+        // Unit-level: pruning removes the departed player from every queue
+        // without reordering or dropping surviving entries.
+        let mut state = setup_three_player();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Src".to_string(),
+            Zone::Exile,
+        );
+        let all = vec![PlayerId(0), PlayerId(1), PlayerId(2)];
+        let survivors = vec![PlayerId(0), PlayerId(2)];
+
+        state.pending_team_draw_step = all.clone();
+        state.pending_phase_transition_progress = Some(PhaseTransitionProgress {
+            remaining_players: VecDeque::from(all.clone()),
+            next_phase: Phase::PreCombatMain,
+            in_combat: false,
+            entering_cleanup: false,
+        });
+        state.pending_choose_one_of = Some(PendingChooseOneOf {
+            controller: PlayerId(0),
+            source_id: source,
+            branches: Vec::new(),
+            parent_targets: Vec::new(),
+            context: crate::types::ability::SpellContext::default(),
+            remaining_players: all.clone(),
+        });
+        state.pending_per_player_zone_choice = Some(PendingPerPlayerZoneChoice {
+            ability: Box::new(gain_life_ability(source, PlayerId(0))),
+            remaining_players: all.clone(),
+            accumulated: false,
+        });
+        state.pending_vote_ballot_iteration = Some(PendingVoteBallotIteration {
+            ability_template: Box::new(crate::types::ability::AbilityDefinition::new(
+                crate::types::ability::AbilityKind::Spell,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            )),
+            remaining_voters: all.clone(),
+            source_id: source,
+            controller: PlayerId(0),
+        });
+
+        // Only mark P1 eliminated; exercise the pruning helper in isolation.
+        state.players[1].is_eliminated = true;
+        prune_player_ordered_queues(&mut state);
+
+        assert_eq!(state.pending_team_draw_step, survivors);
+        assert_eq!(
+            state
+                .pending_phase_transition_progress
+                .as_ref()
+                .unwrap()
+                .remaining_players,
+            VecDeque::from(survivors.clone())
+        );
+        assert_eq!(
+            state
+                .pending_choose_one_of
+                .as_ref()
+                .unwrap()
+                .remaining_players,
+            survivors
+        );
+        assert_eq!(
+            state
+                .pending_per_player_zone_choice
+                .as_ref()
+                .unwrap()
+                .remaining_players,
+            survivors
+        );
+        assert_eq!(
+            state
+                .pending_vote_ballot_iteration
+                .as_ref()
+                .unwrap()
+                .remaining_voters,
+            survivors
+        );
+    }
+
+    #[test]
+    fn eliminate_player_redirects_parked_per_player_chooser_end_to_end() {
+        // End-to-end through the REAL production entry point (`eliminate_player`):
+        // a live per-player `ChooseFromZone` iteration has parked a
+        // `WaitingFor::ChooseFromZoneChoice` on its fixed chooser (controller P0).
+        // P0 is eliminated while its pick is outstanding. This proves that inside
+        // `eliminate_players_simultaneously`, `redirect_departed_chooser` (which
+        // reads `pending.ability` and rewrites `waiting_for.player`) correctly
+        // pre-empts the subsequent generic `acting_player()` collapse check, so
+        // the departed chooser's in-flight pick is redirected rather than
+        // silently reduced to an empty selection. CR 800.4h delegates the
+        // departed chooser's choice to the next player in turn order rather
+        // than dropping it (issue #4823).
+        let mut state = setup_three_player();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Src".to_string(),
+            Zone::Exile,
+        );
+        // Offered cards are owned by the still-living zone owners (P1, P2) so P0's
+        // own object-exile on departure cannot disturb the offered `cards` list.
+        let c1 = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "A".to_string(),
+            Zone::Exile,
+        );
+        let c2 = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(2),
+            "B".to_string(),
+            Zone::Exile,
+        );
+
+        let ability = ResolvedAbility::new(
+            Effect::ChooseFromZone {
+                count: 2,
+                zone: Zone::Exile,
+                additional_zones: Vec::new(),
+                zone_owner: crate::types::ability::ZoneOwner::EachPlayer,
+                filter: None,
+                chooser: crate::types::ability::Chooser::Controller,
+                up_to: true,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                constraint: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        state.pending_per_player_zone_choice = Some(PendingPerPlayerZoneChoice {
+            ability: Box::new(ability),
+            remaining_players: vec![PlayerId(1), PlayerId(2)],
+            accumulated: false,
+        });
+        let constraint = Some(
+            crate::types::ability::ChooseFromZoneConstraint::DistinctCardTypes {
+                categories: vec![crate::types::card_type::CoreType::Creature],
+            },
+        );
+        state.waiting_for = WaitingFor::ChooseFromZoneChoice {
+            player: PlayerId(0),
+            cards: vec![c1, c2],
+            count: 2,
+            up_to: true,
+            constraint: constraint.clone(),
+            source_id: source,
+        };
+
+        // Real production entry point: eliminate the fixed chooser (P0). In a
+        // 3-player game the game continues, so the redirect (not the terminal
+        // clear) branch runs.
+        let mut events = Vec::new();
+        eliminate_player(&mut state, PlayerId(0), &mut events);
+
+        // (a) the prompt must still be a zone choice, NOT collapsed to Priority;
+        // (b) rebound to a different LIVING player; (c) every payload field is
+        // byte-for-byte what was parked.
+        match &state.waiting_for {
+            WaitingFor::ChooseFromZoneChoice {
+                player,
+                cards,
+                count,
+                up_to,
+                constraint: c,
+                source_id,
+            } => {
+                assert!(
+                    players::is_alive(&state, *player),
+                    "redirected chooser must be a living player"
+                );
+                assert_ne!(
+                    *player,
+                    PlayerId(0),
+                    "chooser must be rebound away from the departed player"
+                );
+                assert_eq!(*player, PlayerId(1), "CR 800.4h: next player in turn order");
+                assert_eq!(cards, &vec![c1, c2], "offered cards preserved verbatim");
+                assert_eq!(*count, 2, "count preserved");
+                assert!(*up_to, "up_to preserved");
+                assert_eq!(c, &constraint, "constraint preserved");
+                assert_eq!(*source_id, source, "source preserved");
+            }
+            other => {
+                panic!("prompt collapsed to {other:?} instead of redirecting the departed chooser")
+            }
+        }
+
+        // (d) pruning (which ran BEFORE the redirect) must not have disturbed the
+        // still-living future queue or the accumulation flag.
+        let pending = state
+            .pending_per_player_zone_choice
+            .as_ref()
+            .expect("per-player iteration state must survive the departure");
+        assert_eq!(
+            pending.remaining_players,
+            vec![PlayerId(1), PlayerId(2)],
+            "surviving future-queue entries must be intact after pruning"
+        );
+        assert!(
+            !pending.accumulated,
+            "the accumulation flag must be untouched"
+        );
     }
 }
