@@ -6,9 +6,9 @@ use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
 use crate::types::ability::PlayerFilter;
-use nom::character::complete::{digit1, one_of};
-use nom::combinator::{all_consuming, opt, recognize};
-use nom::sequence::{delimited, pair};
+use nom::character::complete::{alphanumeric1, char, digit1, one_of};
+use nom::combinator::{all_consuming, map_res, not, opt, peek, recognize};
+use nom::sequence::{delimited, pair, terminated};
 
 /// Lower a parsed rule-static predicate into the runtime static mode.
 pub(crate) fn lower_rule_static(
@@ -39,6 +39,8 @@ pub(crate) fn lower_rule_static(
                 who: ProhibitionScope::AllPlayers,
                 source_filter: TargetFilter::SelfRef,
                 exemption: ActivationExemption::None,
+                // CR 606.2: not kind-narrowed — blocks any activated ability.
+                kind: None,
             })
             .affected(affected)
             .description(description.to_string())
@@ -54,9 +56,11 @@ pub(crate) fn lower_rule_static(
         RuleStaticPredicate::MustBlock => StaticDefinition::new(StaticMode::MustBlock)
             .affected(affected)
             .description(description.to_string()),
-        RuleStaticPredicate::MustBeBlocked => StaticDefinition::new(StaticMode::MustBeBlocked)
-            .affected(affected)
-            .description(description.to_string()),
+        RuleStaticPredicate::MustBeBlocked => {
+            StaticDefinition::new(StaticMode::MustBeBlocked { by: None })
+                .affected(affected)
+                .description(description.to_string())
+        }
         RuleStaticPredicate::Goaded => StaticDefinition::new(StaticMode::Goaded)
             .affected(affected)
             .description(description.to_string()),
@@ -120,6 +124,10 @@ pub(crate) fn rule_static_affected_is_player_scope(affected: &TargetFilter) -> b
             | TargetFilter::OriginalController
             | TargetFilter::ScopedPlayer
             | TargetFilter::SpecificPlayer { .. }
+            // CR 607.2d / CR 607.2m (by analogy): "players who last chose <anchor>"
+            // is a player-scope subject for rule statics (Two Streams Facility's
+            // land-drop grant).
+            | TargetFilter::PlayerWhoChoseLabel { .. }
             | TargetFilter::SourceChosenPlayer
             | TargetFilter::ParentTargetController
             | TargetFilter::ParentTargetOwner
@@ -279,6 +287,28 @@ pub(crate) fn try_parse_core_type_descriptor(descriptor_lower: &str) -> Option<T
 /// to their parent type instead of defaulting everything to Creature.
 pub(crate) fn typed_filter_for_subtype(subtype: &str) -> TypedFilter {
     use crate::types::ability::TypeFilter;
+    // CR 205.4a + CR 205.3m: a compound "<supertype> <subtype>" descriptor
+    // ("Legendary Human", "Snow Elf") peels its leading supertype word into a
+    // `HasSupertype` property so the remainder resolves to the REAL subtype —
+    // rather than fabricating a zero-match `Subtype("Legendary Human")` (General's
+    // Enforcer "Legendary Humans you control", Kashi-Tribe Elite "Legendary
+    // Snakes you control").
+    if let Some((supertype, rest)) = split_leading_supertype(subtype) {
+        let mut filter = typed_filter_for_subtype(rest);
+        filter
+            .properties
+            .push(FilterProp::HasSupertype { value: supertype });
+        return filter;
+    }
+    // CR 110.5a + CR 506.3: a bare battlefield descriptor ("Untapped", "Tapped",
+    // "Attacking", …) used as a whole creature descriptor names a status the
+    // creature HAS (CR 110.5a: "status is not a characteristic") or a combat role
+    // it's in (CR 506.3), not a creature subtype — resolve it to a typed FilterProp
+    // instead of fabricating a zero-match `Subtype("Untapped")` (Builder's
+    // Blessing / Castle "Untapped creatures you control get +0/+2").
+    if let Some(filter) = bare_status_creature_filter(subtype) {
+        return filter;
+    }
     if let Some(core_type) = infer_core_type_for_subtype(subtype) {
         let type_filter = match core_type {
             crate::types::card_type::CoreType::Artifact => TypeFilter::Artifact,
@@ -290,6 +320,41 @@ pub(crate) fn typed_filter_for_subtype(subtype: &str) -> TypedFilter {
     } else {
         TypedFilter::creature().subtype(subtype.to_string())
     }
+}
+
+/// CR 110.5a + CR 506.3: Recognize a bare battlefield descriptor ("untapped",
+/// "tapped", "attacking", "blocking", "transformed", "suspected") used as a whole
+/// creature descriptor and resolve it to a creature filter carrying the matching
+/// `FilterProp`. These name a permanent's status (CR 110.5, "not a characteristic"
+/// per CR 110.5a) or its combat role (CR 506.3), never a creature subtype.
+/// Reuses the `parse_combat_status_prefix`
+/// allowlist (appending a space to satisfy its prefix-boundary rule, then
+/// requiring the whole word be consumed) so "Untapped creatures you control"
+/// filters on `FilterProp::Untapped` rather than a zero-match `Subtype("Untapped")`.
+fn bare_status_creature_filter(descriptor: &str) -> Option<TypedFilter> {
+    let with_space = format!("{} ", descriptor.to_lowercase());
+    let (prop, consumed) = crate::parser::oracle_target::parse_combat_status_prefix(&with_space)?;
+    (consumed == with_space.len()).then(|| TypedFilter::creature().properties(vec![prop]))
+}
+
+/// CR 205.4a: Peel a leading supertype word off a compound "<supertype>
+/// <subtype>" subject descriptor ("Legendary Human", "Snow Elf"), returning the
+/// supertype and the original-case remainder. Returns `None` for a bare
+/// supertype (no following subtype) or a descriptor with no leading supertype,
+/// so a plain subtype falls through to the subtype path unchanged.
+fn split_leading_supertype(descriptor: &str) -> Option<(Supertype, &str)> {
+    let lower = descriptor.to_lowercase();
+    // Consume the supertype word AND its separating space atomically: a bare
+    // supertype (no following subtype) fails the trailing ` ` and declines here,
+    // so a plain subtype falls through to the subtype path unchanged.
+    let (rest_lower, supertype) = terminated(
+        nom_target::parse_supertype_word,
+        tag::<_, _, OracleError<'_>>(" "),
+    )
+    .parse(&lower)
+    .ok()?;
+    let rest = descriptor[descriptor.len() - rest_lower.len()..].trim();
+    (!rest.is_empty()).then_some((supertype, rest))
 }
 
 pub(crate) fn is_capitalized_words(s: &str) -> bool {
@@ -462,46 +527,119 @@ pub(crate) fn parse_attached_condition_run(input: &str) -> OracleResult<'_, Stat
 /// `StaticMode`). Simple lines return a length-1 vec; unparsed lines an empty
 /// vec.
 ///
-/// CR 509.1c: Recognize a "must be blocked by <filter> if able" lure conjunct.
+/// CR 509.1c: Capture the inner "<quality>" of a filtered "must be blocked by
+/// <quality> if able" lure conjunct.
 ///
-/// The BARE form ("must be blocked if able" → `StaticMode::MustBeBlocked`) is
-/// already modeled by `try_split_and_must_attack_block`. The FILTERED form
-/// ("must be blocked by a Dalek if able", "must be blocked by an Eldrazi if
-/// able") requires the typed `MustBeBlocked { by: <filter> }` requirement that
-/// has not yet been parameterized (/add-engine-variant Stage-2
-/// REFUSE_WITH_REFACTOR, ~80 sites). This combinator detects ONLY the filtered
-/// form — the leading `tag("by ")` after "must be blocked " excludes the bare
-/// form — so it can be surfaced as an `Effect::Unimplemented` residual rather
-/// than silently dropped.
-pub(crate) fn parse_must_be_blocked_by_filter_lure(input: &str) -> OracleResult<'_, &str> {
-    recognize((
-        tag("must be blocked by "),
-        take_until(" if able"),
-        tag(" if able"),
-    ))
-    .parse(input)
+/// The BARE form ("must be blocked if able" → `StaticMode::MustBeBlocked { by:
+/// None }`) is modeled by `try_split_and_must_attack_block` /
+/// `RuleStaticPredicate::MustBeBlocked`. The FILTERED form ("must be blocked by
+/// a Dalek if able", "must be blocked by an Eldrazi if able") lowers to the
+/// parameterized `StaticMode::MustBeBlocked { by: Some(filter) }`. This
+/// combinator captures ONLY the filtered form — the `tag("must be blocked by ")`
+/// requires the "by " that the bare form lacks — and returns the inner quality
+/// span; the caller parses it into a `TargetFilter`. The successful combinator
+/// parse IS the detector (no `contains`/`find` dispatch).
+pub(crate) fn parse_must_be_blocked_by_quality(input: &str) -> OracleResult<'_, &str> {
+    let (rest, _) = tag("must be blocked by ").parse(input)?;
+    let (after, inner) = take_until(" if able").parse(rest)?;
+    let (after, _) = tag(" if able").parse(after)?;
+    Ok((after, inner))
 }
 
-/// Scan the lowercase predicate for a filtered "must be blocked by … if able"
-/// lure conjunct at any word boundary and, when present, return the matched
-/// conjunct span (from "must" through "if able"). The successful combinator parse
-/// IS the detector — `scan_at_word_boundaries` tries the combinator at each word
-/// start, so there is no `contains`/`find` dispatch. Returns `None` when only the
-/// bare (already-modeled) form or no lure is present.
-fn extract_must_be_blocked_by_filter_lure(predicate: &str) -> Option<String> {
+/// CR 509.1c + CR 105.4: Lower a captured "<quality>" span (e.g.
+/// "a Dalek", "an Eldrazi", "a creature of the chosen color") to the blocker
+/// `TargetFilter`. Composes the SAME quality combinators `CantBeBlockedBy` uses
+/// (`parse_chosen_qualifier_subject`, then `parse_type_phrase`). Returns `None`
+/// when the quality fails to constrain the blocker at all — either
+/// `TargetFilter::Any` or the empty `Typed` filter `parse_type_phrase` yields for
+/// an UNRECOGNIZED noun — so an unparseable requirement is never silently
+/// weakened to "any blocker satisfies".
+fn must_be_blocked_quality_to_filter(quality: &str) -> Option<TargetFilter> {
+    // Operate on the lowercase quality (mirrors the `CantBeBlockedBy` path, whose
+    // `filter_text` is a slice of the already-lowercased predicate). `TextPair`
+    // requires `lower` to be the lowercase of `original`, so pair them honestly
+    // even when the caller passes mixed-case input (e.g. a direct unit test).
+    let quality_lower = quality.to_lowercase();
+    let quality_tp = TextPair::new(quality, &quality_lower);
+    let filter = parse_chosen_qualifier_subject(&quality_tp).unwrap_or_else(|| {
+        let (f, _) = parse_type_phrase(&quality_lower);
+        f
+    });
+    filter_constrains_blocker(&filter).then_some(filter)
+}
+
+/// CR 509.1c: Does `filter` actually narrow the set of legal blockers? An
+/// unconstrained filter — `TargetFilter::Any`, or an empty `Typed` carrying no
+/// type, property, or controller constraint (what `parse_type_phrase` returns for
+/// an unrecognized noun like "a splorf") — matches every blocker and therefore
+/// expresses no quality requirement. Lowering such a filter into a
+/// `MustBeBlocked { by }` would silently degrade "must be blocked by <X>" to
+/// "must be blocked by anything"; rejecting it lets callers surface the gap.
+fn filter_constrains_blocker(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Any => false,
+        TargetFilter::Typed(typed) => {
+            !typed.type_filters.is_empty()
+                || !typed.properties.is_empty()
+                || typed.controller.is_some()
+        }
+        _ => true,
+    }
+}
+
+/// CR 509.1c: Parse a filtered "must be blocked by <quality> if able" span
+/// anchored at the start of `input` → the blocker `TargetFilter`. Used by the
+/// conditional attached-grant path (Ace's Baseball Bat) where the residual
+/// conjunct is already isolated. Returns `None` for the bare form or an
+/// unrecognized quality.
+pub(crate) fn parse_must_be_blocked_by_filter(input: &str) -> Option<TargetFilter> {
+    let (_, quality) = parse_must_be_blocked_by_quality(input).ok()?;
+    must_be_blocked_quality_to_filter(quality)
+}
+
+/// CR 509.1c: Classification of a scanned "must be blocked by <quality> if able"
+/// conjunct. Distinguishes an ABSENT conjunct (no `Some`) from a PRESENT one,
+/// and within present, whether the quality is recognized vs. unrecognized — so
+/// the un-gated attached-grant path can surface an `Unimplemented` residual for
+/// an unrecognized quality instead of silently dropping the block requirement.
+pub(crate) enum MustBeBlockedByConjunct {
+    /// The quality lowered to a recognized blocker `TargetFilter`.
+    Recognized(TargetFilter),
+    /// The conjunct is present but its quality is unrecognized (would weaken to
+    /// `TargetFilter::Any`). Carries the reconstructed conjunct text so the
+    /// requirement can be surfaced as an `Unimplemented` residual diagnostic —
+    /// never silently dropped.
+    Unrecognized(String),
+}
+
+/// Scan the predicate for a filtered "must be blocked by <quality> if able"
+/// conjunct at any word boundary and classify it. The successful combinator
+/// parse IS the detector — `scan_at_word_boundaries` tries
+/// `parse_must_be_blocked_by_quality` at each word start, so there is no
+/// `contains`/`find` dispatch. Returns `None` when only the bare form or no lure
+/// is present.
+pub(crate) fn extract_must_be_blocked_by_conjunct(
+    predicate: &str,
+) -> Option<MustBeBlockedByConjunct> {
     let lower = predicate.to_lowercase();
-    nom_primitives::scan_at_word_boundaries(&lower, parse_must_be_blocked_by_filter_lure)
-        .map(|span| span.trim().to_string())
+    let quality =
+        nom_primitives::scan_at_word_boundaries(&lower, parse_must_be_blocked_by_quality)?;
+    Some(match must_be_blocked_quality_to_filter(quality) {
+        Some(filter) => MustBeBlockedByConjunct::Recognized(filter),
+        None => {
+            MustBeBlockedByConjunct::Unrecognized(format!("must be blocked by {quality} if able"))
+        }
+    })
 }
 
-/// CR 509.1c: Build an `Effect::Unimplemented` residual static for an unmodeled
-/// effect-conjunct inside an attached-subject grant (the filtered "must be
-/// blocked by … if able" lure). The residual rides in a `GrantAbility`
-/// modification so coverage flags the card (`is_static_supported`) and the
-/// swallow check defers (`any_ability_has_unimplemented`) — the single honest
-/// signal that the conjunct is a known gap. See
-/// `try_parse_inverted_attached_combat_grant` for the full deferral rationale.
-pub(crate) fn unimplemented_conjunct_residual(
+/// CR 509.1c: Build the sibling `Effect::Unimplemented` residual for an attached
+/// grant conjunct the typed static modes can't model. Carried inside a
+/// `GrantAbility` continuous modification so coverage flags the gap (stable
+/// category key `"attached_grant_unmodeled_conjunct"`) and the swallow check
+/// defers, rather than silently dropping the requirement. Shared by the gated
+/// (`try_parse_inverted_attached_combat_grant`) and un-gated attached-grant
+/// paths so both surface unrecognized conjuncts identically.
+pub(crate) fn attached_grant_unmodeled_conjunct_residual(
     affected: TargetFilter,
     residual_text: &str,
 ) -> StaticDefinition {
@@ -683,7 +821,17 @@ pub(crate) fn parse_enchanted_equipped_predicate(
     }
 
     // CR 509.1b: "can't be blocked" on enchanted/equipped creature
-    let (body_tp, suffix_condition) = if let Some((body_tp, _)) = pred_tp.split_around(" unless ") {
+    //
+    // Only peel a trailing static-grant " unless " rider (Heroic Defiance:
+    // "gets +3/+3 unless it shares a color…") when the split point sits OUTSIDE a
+    // quoted/granted ability. A granted ability's own inner "unless" (e.g. Sunken
+    // Field's "Counter target spell unless its controller pays {1}") must stay
+    // with the quoted text — the body has balanced double quotes iff the split is
+    // outside any "...".
+    let unless_split = pred_tp
+        .split_around(" unless ")
+        .filter(|(body, _)| body.original.chars().filter(|&c| c == '"').count() % 2 == 0);
+    let (body_tp, suffix_condition) = if let Some((body_tp, _)) = unless_split {
         (
             body_tp,
             super::shared::parse_unless_static_condition(&pred_tp),
@@ -787,21 +935,44 @@ pub(crate) fn parse_enchanted_equipped_predicate(
     // is NEVER split. ---
     {
         let mut defs = Vec::new();
-        if let Some(def) = parse_continuous_gets_has(predicate, affected.clone(), description) {
+        // CR 611.3a: parse the grant from the unless/as-long-as-stripped body and
+        // attach any trailing `suffix_condition` (Heroic Defiance: "gets +3/+3
+        // unless it shares a color with the most common color among all
+        // permanents"), rather than parsing the whole predicate and dropping it.
+        if let Some(mut def) =
+            parse_continuous_gets_has(body_tp.original, affected.clone(), description)
+        {
+            if let Some(condition) = &suffix_condition {
+                def.condition = Some(condition.clone());
+            }
             defs.push(def);
         }
         // CR 509.1c: "<grant> and must be blocked by <filter> if able"
         // (Slayer's Cleaver: "Equipped creature gets +3/+1 and must be blocked
         // by an Eldrazi if able."). `parse_continuous_modifications` models the
-        // P/T/keyword grant but silently drops the filtered lure conjunct (the
-        // bare "must be blocked if able" form is handled by
-        // `try_split_and_must_attack_block`; the typed by-filter requirement is
-        // the deferred /add-engine-variant Stage-2 work). Surface the dropped
-        // conjunct as an `Effect::Unimplemented` residual so it is a visible
-        // coverage gap, not a silent drop, even when the predicate has no
-        // continuous grant sibling.
-        if let Some(residual_text) = extract_must_be_blocked_by_filter_lure(predicate) {
-            defs.push(unimplemented_conjunct_residual(affected, &residual_text));
+        // P/T/keyword grant; this branch models the filtered blocking
+        // requirement as the typed `MustBeBlocked { by: Some(filter) }` static
+        // (unconditional — this non-conditional path has no "as long as" gate).
+        match extract_must_be_blocked_by_conjunct(predicate) {
+            Some(MustBeBlockedByConjunct::Recognized(filter)) => {
+                defs.push(
+                    StaticDefinition::new(StaticMode::MustBeBlocked { by: Some(filter) })
+                        .affected(affected.clone())
+                        .description(description.to_string()),
+                );
+            }
+            // CR 509.1c: the lure conjunct is present but its quality is
+            // unrecognized (would weaken to `TargetFilter::Any`). Surface an
+            // `Unimplemented` residual so coverage flags the gap — mirroring the
+            // gated path (`try_parse_inverted_attached_combat_grant`) — instead
+            // of silently dropping the blocking requirement.
+            Some(MustBeBlockedByConjunct::Unrecognized(residual)) => {
+                defs.push(attached_grant_unmodeled_conjunct_residual(
+                    affected.clone(),
+                    &residual,
+                ));
+            }
+            None => {}
         }
         defs
     }
@@ -929,32 +1100,101 @@ pub(crate) fn remove_trailing_quote_connector(text: &mut String) {
 /// Returns AddDynamicPower + AddDynamicToughness modifications if found.
 /// CR 613.4c: Parse a variable P/T modifier pattern like "+x/+x", "-x/-0", "+0/-x".
 /// Returns (power_sign, power_is_x, toughness_sign, toughness_is_x) and remaining text.
+/// CR 613.4c: parse a variable P/T grant body "±P/±T" where each axis is either
+/// the variable X (dynamic — returned as `None`) or a fixed integer magnitude
+/// (returned as `Some(n)`, `n >= 0`). Accepting a fixed magnitude alongside X is
+/// what lets a MIXED grant like Cranial Ram "+X/+1" parse: previously each axis
+/// was restricted to `x`/`0`, so the fixed `+1` failed `digit`-matching and the
+/// whole pattern was rejected, dropping the equip static. The sign is returned
+/// separately per axis so the caller applies it uniformly to the dynamic
+/// One axis of a variable P/T grant: a fixed integer magnitude, the primary
+/// variable `x`, or the secondary variable `y`. `y` is meaningful only on a
+/// "+X/+Y" pump whose two axes bind to different quantities (Aspect of Wolf);
+/// the caller must accept a distinct `y` axis only when a paired
+/// "where X is <A>, and Y is <B>" binding was structurally parsed — otherwise
+/// the pattern is left unsupported (Snowblind's `-X/-Y`, whose X/Y are defined
+/// by later conditional sentences, must NOT synthesize a cost-X static).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtAxisMag {
+    Fixed(i32),
+    VarX,
+    VarY,
+}
+
+/// Parsed axes of a variable P/T grant: `(p_sign, p_mag, t_sign, t_mag)`.
+type VariablePtAxes = (i32, PtAxisMag, i32, PtAxisMag);
+
 pub(crate) fn parse_variable_pt_pattern(
     input: &str,
-) -> nom::IResult<&str, (i32, bool, i32, bool), OracleError<'_>> {
-    let (rest, p_sign) = alt((value(-1i32, tag("-")), value(1i32, tag("+")))).parse(input)?;
-    let (rest, p_is_x) = alt((value(true, tag("x")), value(false, tag("0")))).parse(rest)?;
+) -> nom::IResult<&str, VariablePtAxes, OracleError<'_>> {
+    fn axis(input: &str) -> nom::IResult<&str, (i32, PtAxisMag), OracleError<'_>> {
+        let (rest, sign) = alt((value(-1i32, tag("-")), value(1i32, tag("+")))).parse(input)?;
+        let (rest, mag) = alt((
+            value(PtAxisMag::VarX, tag("x")),
+            value(PtAxisMag::VarY, tag("y")),
+            map_res(digit1, |d: &str| d.parse::<i32>().map(PtAxisMag::Fixed)),
+        ))
+        .parse(rest)?;
+        Ok((rest, (sign, mag)))
+    }
+    let (rest, (p_sign, p_mag)) = axis(input)?;
     let (rest, _) = tag("/").parse(rest)?;
-    let (rest, t_sign) = alt((value(-1i32, tag("-")), value(1i32, tag("+")))).parse(rest)?;
-    let (rest, t_is_x) = alt((value(true, tag("x")), value(false, tag("0")))).parse(rest)?;
-    Ok((rest, (p_sign, p_is_x, t_sign, t_is_x)))
+    let (rest, (t_sign, t_mag)) = axis(rest)?;
+    Ok((rest, (p_sign, p_mag, t_sign, t_mag)))
 }
 
 pub(crate) fn parse_fixed_pt_in_text(lower: &str) -> Option<(i32, i32)> {
+    // CR 613.4c: Layer 7c additive P/T grant — "gets/has +N/+M". The copula
+    // ("has"/"have") is accepted alongside "gets"/"get" so equip/anthem lines
+    // that phrase the grant as "Equipped creature has +2/+2 and has …"
+    // (Tinfoil Helm) resolve to the same additive modification as "gets +2/+2".
     nom_primitives::scan_at_word_boundaries(lower, |input| {
         let (rest, _) = alt((
             tag::<_, _, OracleError<'_>>("gets "),
             tag::<_, _, OracleError<'_>>("get "),
+            tag::<_, _, OracleError<'_>>("has "),
+            tag::<_, _, OracleError<'_>>("have "),
         ))
         .parse(input)?;
+        // sign-required: "protection"/"flying"/etc. after "has " fail here.
         let (rest, pt) = nom_primitives::parse_pt_modifier.parse(rest)?;
+        // CR 122.1a + CR 613.4c: a "+N/+M counter" is a counter placement, NOT a
+        // static P/T grant — exclude it so counter-placement lines (e.g. Melira,
+        // Sylvok Outcast "can't have -1/-1 counters put on them") do not misfire
+        // into an anthem. This counter-suffix guard is the load-bearing exclusion:
+        // `scan_at_word_boundaries` retries at every word, so a front "can't have"
+        // lookahead would be positionally ineffective; the suffix guard here is
+        // what actually rejects the counter-placement class.
+        peek(not(preceded(
+            space0,
+            alt((tag("counters"), tag("counter"))),
+        )))
+        .parse(rest)?;
         Ok((rest, pt))
     })
 }
 
-pub(crate) fn parse_legendary_supertype_grant(lower: &str) -> Option<()> {
+/// CR 205.4a + CR 205.4b: recognize a "... is <supertype>" grant riding on an
+/// attached-subject predicate body and return the granted supertype. Supertypes
+/// are additive (CR 205.4b) and are never card types. Generalizes the former
+/// legendary-only recognizer to every CR 205.4a supertype via
+/// [`nom_target::parse_supertype_word`] (Legendary/Basic/Snow), so Glittering
+/// Frost ("Enchanted land is snow.") and In Bolas's Clutches ("Enchanted
+/// permanent is legendary.") both flow through this ONE seam:
+/// `parse_continuous_modifications` pushes `AddSupertype { supertype }` for the
+/// returned supertype.
+///
+/// Scans at word boundaries so the grant is still found when it is one conjunct
+/// of a compound aura predicate ("... is legendary, gets +1/+1, and has
+/// flying"). `parse_supertype_word` consumes no trailing boundary by contract,
+/// so the `peek(not(alphanumeric1))` guard rejects a longer word that merely
+/// starts with a supertype (e.g. "snow" in "snowman").
+pub(crate) fn parse_supertype_grant(lower: &str) -> Option<Supertype> {
     nom_primitives::scan_at_word_boundaries(lower, |input| {
-        value((), tag::<_, _, OracleError<'_>>("is legendary")).parse(input)
+        let (rest, _) = tag::<_, _, OracleError<'_>>("is ").parse(input)?;
+        let (rest, supertype) = nom_target::parse_supertype_word(rest)?;
+        peek(not(alphanumeric1::<_, OracleError<'_>>)).parse(rest)?;
+        Ok((rest, supertype))
     })
 }
 
@@ -1175,7 +1415,10 @@ pub(crate) fn parse_quoted_ability(text: &str) -> AbilityDefinition {
             });
         // CR 702.142b: Tag as Boast for meta-reference effects.
         def.ability_tag = Some(AbilityTag::Boast);
-        def.description = Some(format!("Boast \u{2014} {}", rest_original));
+        def.description = Some(format!(
+            "Boast \u{2014} {}",
+            sanitize_granting_placeholder(rest_original)
+        ));
         return def;
     }
 
@@ -1224,14 +1467,28 @@ pub(crate) fn parse_quoted_ability(text: &str) -> AbilityDefinition {
             parse_effect_chain_with_context(&effect_text, AbilityKind::Activated, &mut ctx);
         def.cost = Some(cost);
         def.activation_restrictions.extend(constraints.restrictions);
-        def.description = Some(text.to_string());
+        // CR 601.2f: Fold a trailing self-referential "This ability costs {X}
+        // less to activate, where X is ~'s power" node into `cost_reduction`
+        // (the same AST-level extractor standalone activated abilities use). The
+        // reduction's `Power{Source}` is host-referential (the equipped
+        // creature), an untouched third channel — no interaction with the
+        // GrantingObject cost/effect rewrite. Enables The Dominion Bracelet.
+        crate::parser::oracle::extract_cost_reduction_from_chain(&mut def);
+        def.description = Some(sanitize_granting_placeholder(text));
         def
     } else {
         // No cost separator — treat as spell-like ability text
         let mut def = parse_effect_chain(text, AbilityKind::Spell);
-        def.description = Some(text.to_string());
+        def.description = Some(sanitize_granting_placeholder(text));
         def
     }
+}
+
+/// CR 201.5a: Descriptions render the granter self-reference as `~` (matching
+/// pre-fix display); the `GRANTING_SELF_PLACEHOLDER` marker is a parse-time
+/// signal only and must never leak the raw private-use char into stored text.
+fn sanitize_granting_placeholder(text: &str) -> String {
+    text.replace(crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER, "~")
 }
 
 /// True when `trimmed_prefix` is a bracketed planeswalker loyalty cost (`[+N]`,
@@ -1301,11 +1558,37 @@ pub(crate) fn is_text_based_cost_prefix(lower_prefix: &str) -> bool {
 /// no boundary is present. Mirrors the keyword recognition in
 /// `extract_keyword_clause` but in the inverse direction (returns the
 /// pre-boundary span instead of the post-boundary one).
+/// Peel a trailing grant conjunct off a dynamic "for each <count>" clause so the
+/// count itself parses cleanly. Strips a trailing keyword grant (" and has
+/// flying") and — CR 205.1b — a trailing type-addition (" and is an Avatar in
+/// addition to its other types"). The peeled clause is recovered separately by
+/// the caller (`extract_keyword_clause` / `parse_additive_type_clause_modifications`
+/// over the full description); without this the count parse fails on the tail and
+/// the whole dynamic pump collapses to a fixed +N/+M (Avatar Destiny, Machinist's
+/// Arsenal). The type-addition arm is guarded on the "in addition to" marker so a
+/// genuine "<count> and is <...>" count phrase is never mis-truncated.
 pub(crate) fn strip_trailing_keyword_clause(clause: &str) -> &str {
     for needle in [" and gains ", " and gain ", " and has ", " and have "] {
         if let Some(pos) = clause.find(needle) {
             return &clause[..pos];
         }
+    }
+    // CR 205.1b: peel a trailing type-addition (" and is an Avatar in addition
+    // to its other types"), guarded on the "in addition to " tail so a genuine
+    // "<count> and is <...>" count phrase is never mis-truncated. Mirrors the
+    // type-addition grammar in `type_change.rs`: scan word boundaries for the
+    // "and is " verb boundary whose remainder reaches " in addition to ", and
+    // return the span preceding it. `clause` is already lowercase (caller passes
+    // `after_for_each.lower`), so tags match directly.
+    if let Some((before, _)) = nom_primitives::scan_split_at_phrase(clause, |i| {
+        (
+            tag::<_, _, OracleError<'_>>("and is "),
+            take_until::<_, _, OracleError<'_>>(" in addition to "),
+            tag::<_, _, OracleError<'_>>(" in addition to "),
+        )
+            .parse(i)
+    }) {
+        return before.trim_end();
     }
     clause
 }
@@ -1365,6 +1648,26 @@ pub(crate) fn extract_lose_keyword_clause(text: &str) -> Option<&str> {
     None
 }
 
+/// Parse a leading P/T pair from Oracle text, returning values and remainder.
+///
+/// CR 613.4b: Layer 7b base power/toughness literals after "with base power
+/// and toughness". Composes the signed [`nom_primitives::parse_pt_modifier`]
+/// path and an unsigned `N/N` path so trailing clause text (e.g. "and loses
+/// all abilities") is left in the nom remainder for downstream parsers.
+pub(crate) fn parse_pt_mod_with_remainder(input: &str) -> OracleResult<'_, (i32, i32)> {
+    let input = input.trim();
+    alt((
+        nom_primitives::parse_pt_modifier,
+        (
+            nom_primitives::parse_number,
+            char('/'),
+            nom_primitives::parse_number,
+        )
+            .map(|(power, _, toughness)| (power as i32, toughness as i32)),
+    ))
+    .parse(input)
+}
+
 /// Parse a P/T modifier like "+2/+3", "-1/-1", "+3/-2" from Oracle text.
 ///
 /// Delegates to the shared nom P/T combinator for signed P/T values.
@@ -1372,6 +1675,20 @@ pub(crate) fn extract_lose_keyword_clause(text: &str) -> Option<&str> {
 /// nom combinator doesn't handle (it requires explicit +/- signs).
 pub(crate) fn parse_pt_mod(text: &str) -> Option<(i32, i32)> {
     let text = text.trim();
+    // CR 613.4c: consume an optional "an additional " qualifier ("gets an
+    // additional +N/+M" — Taste for Mayhem, Divine Sacrament, Patriarch's Desire,
+    // Strange Augmentation). It marks a second Layer 7c grant stacked on the base
+    // modification but carries no P/T semantics of its own, so the underlying
+    // +N/+M is parsed identically (the enclosing gate is attached separately). The
+    // cheap "an" guard keeps the common no-qualifier call off the lowercase
+    // allocation path.
+    let text = match text.get(..2) {
+        Some(head) if head.eq_ignore_ascii_case("an") => {
+            let lower = text.to_lowercase();
+            nom_tag_lower(text, &lower, "an additional ").unwrap_or(text)
+        }
+        _ => text,
+    };
     // Try the nom combinator first — handles +N/+M, -N/-M, +N/-M patterns.
     if let Ok((_, (p, t))) = nom_primitives::parse_pt_modifier.parse(text) {
         return Some((p, t));
@@ -1450,7 +1767,7 @@ pub(crate) fn map_keyword(text: &str) -> Option<Keyword> {
         Ok(Keyword::Unknown(_)) => {
             // Fall through to Oracle-format parser for parameterized keywords
             // like "protection from red" that use spaces instead of colons.
-            super::oracle_keyword::parse_keyword_from_oracle(word)
+            super::oracle_keyword::parse_granted_keyword_fragment(word)
         }
         Ok(kw) => Some(kw),
         Err(_) => None, // Infallible, but satisfy the compiler
@@ -1640,27 +1957,73 @@ pub(crate) fn inject_keyword_kind_filter_prop(
 }
 
 /// CR 601.2f: Classification of a cost-modifier subject against the
-/// "the first <qualifier> spell <timing> costs …" template.
+/// "the <ordinal> <qualifier> spell <timing> costs …" template.
 ///
 /// Three outcomes, kept as a typed enum rather than an `Option` so the caller
-/// can tell "not a first-spell line" apart from "a first-spell line whose
+/// can tell "not an Nth-spell line" apart from "an Nth-spell line whose
 /// qualifier we can't yet represent." The latter MUST decline the whole cost
 /// static — emitting a filterless, gateless reducer would silently drop both
-/// the printed "first … each turn" once-per-turn restriction and the qualifier
-/// (e.g. "kicked"), reducing every spell the controller casts.
-pub(crate) enum FirstQualifiedSpell {
-    /// The subject is not a "the first … spell <timing> costs …" line; the
+/// the printed "<ordinal> … each turn" once-per-turn restriction and the
+/// qualifier (e.g. "kicked"), reducing every spell the controller casts.
+pub(crate) enum NthQualifiedSpell {
+    /// The subject is not a "the <ordinal> … spell <timing> costs …" line; the
     /// caller proceeds with its ordinary cost-modifier parsing.
     NotApplicable,
-    /// A representable first-spell subject: the qualifying spell filter and the
-    /// timing window over which "first" is measured.
-    Supported(TargetFilter, NthEventTimingKind),
-    /// The "the first … spell <timing>" shape is present, but the qualifier or
+    /// A representable Nth-spell subject: the qualifying spell filter, the timing
+    /// window over which the ordinal is measured, and the 1-based ordinal `N`
+    /// ("first" → 1, "second" → 2, …). The gate is
+    /// `SpellsCastThisTurn(filter) == N - 1` (see [`nth_qualified_spell_condition`]).
+    Supported {
+        filter: TargetFilter,
+        timing: NthEventTimingKind,
+        ordinal: u32,
+    },
+    /// The "the <ordinal> … spell <timing>" shape is present, but the qualifier or
     /// timing window can't be lowered to a spell filter + once-per-turn gate
     /// (e.g. "the first kicked spell you cast each turn" — kicker-paid state is
     /// not a representable spell-cost filter, or an opponent-/their-turn window
     /// with no static condition). The caller must decline the cost static.
     UnsupportedQualifier,
+}
+
+/// CR 601.2f: Parse the leading "the <ordinal> " of an
+/// "the <ordinal> <qualifier> spell <timing> costs/has …" subject, returning the
+/// 1-based ordinal (`"first"` → 1, `"second"` → 2, …) and the remaining subject.
+///
+/// Parameterizes what was a hardcoded `"the first "` prefix so every printed
+/// ordinal — not just the first — is covered (Highspire Bell-Ringer, Uthros
+/// Psionicist, Monk Class, Raging Battle Mouse, and Alisaie Leveilleur all print
+/// "the second spell you cast each turn costs …"). The ordinal threads into
+/// [`nth_qualified_spell_condition`] as the `SpellsCastThisTurn == N - 1` gate.
+fn parse_spell_ordinal_prefix(subject: &str) -> Option<(u32, &str)> {
+    preceded(
+        tag::<_, _, OracleError<'_>>("the "),
+        terminated(parse_ordinal_word, tag(" ")),
+    )
+    .parse(subject)
+    .ok()
+    .map(|(rest, ordinal)| (ordinal, rest))
+}
+
+/// Map an English ordinal word to its 1-based value. Only "first"/"second" occur
+/// on printed once-per-turn spell-cost modifiers today; the higher ordinals are
+/// included so the whole ordinal class stays covered without a follow-up edit.
+/// The trailing `" "` guard in [`parse_spell_ordinal_prefix`] enforces a word
+/// boundary, so "firstborn" / "seconds" never partial-match.
+fn parse_ordinal_word(i: &str) -> OracleResult<'_, u32> {
+    alt((
+        value(1u32, tag("first")),
+        value(2, tag("second")),
+        value(3, tag("third")),
+        value(4, tag("fourth")),
+        value(5, tag("fifth")),
+        value(6, tag("sixth")),
+        value(7, tag("seventh")),
+        value(8, tag("eighth")),
+        value(9, tag("ninth")),
+        value(10, tag("tenth")),
+    ))
+    .parse(i)
 }
 
 /// CR 601.2f + CR 107.3: Parse a "first qualified spell <timing> costs less"
@@ -1687,13 +2050,13 @@ pub(crate) enum FirstQualifiedSpell {
 ///   - "The first non-Lemur creature spell with flying you cast during each of
 ///     your turns costs {1} less to cast."
 ///
-/// Returns [`FirstQualifiedSpell::UnsupportedQualifier`] when the
-/// "the first … spell <timing>" shape is present but the qualifier/timing can't
-/// be represented (e.g. "the first kicked spell you cast each turn"), so the
-/// caller declines the static instead of emitting a broad reducer.
-pub(crate) fn parse_first_qualified_spell_filter(lower: &str) -> FirstQualifiedSpell {
-    let Some(after_prefix) = nom_tag_lower(lower, lower, "the first ") else {
-        return FirstQualifiedSpell::NotApplicable;
+/// Returns [`NthQualifiedSpell::UnsupportedQualifier`] when the
+/// "the <ordinal> … spell <timing>" shape is present but the qualifier/timing
+/// can't be represented (e.g. "the first kicked spell you cast each turn"), so
+/// the caller declines the static instead of emitting a broad reducer.
+pub(crate) fn parse_nth_qualified_spell_filter(lower: &str) -> NthQualifiedSpell {
+    let Some((ordinal, after_prefix)) = parse_spell_ordinal_prefix(lower) else {
+        return NthQualifiedSpell::NotApplicable;
     };
 
     // Split the subject at the cast infix that separates the pre-spell
@@ -1701,7 +2064,7 @@ pub(crate) fn parse_first_qualified_spell_filter(lower: &str) -> FirstQualifiedS
     // ("with {X} in its mana cost each turn cost[s] ..."). CR templating always
     // places the caster phrase between the spell noun and any post-spell modifier.
     let Some((pre, post)) = split_first_spell_cast_region(after_prefix) else {
-        return FirstQualifiedSpell::NotApplicable;
+        return NthQualifiedSpell::NotApplicable;
     };
 
     // Scan the post-caster region for the timing phrase. Everything before
@@ -1712,7 +2075,7 @@ pub(crate) fn parse_first_qualified_spell_filter(lower: &str) -> FirstQualifiedS
     // phrase means this is some other "the first … you cast" construction, not
     // the per-turn first-spell cost template.
     let Some((timing, post_modifier_text)) = split_first_spell_timing(post.trim()) else {
-        return FirstQualifiedSpell::NotApplicable;
+        return NthQualifiedSpell::NotApplicable;
     };
 
     // From here the "the first … spell <timing> costs …" shape is confirmed, so
@@ -1728,7 +2091,7 @@ pub(crate) fn parse_first_qualified_spell_filter(lower: &str) -> FirstQualifiedS
         timing,
         NthEventTimingKind::Unrestricted | NthEventTimingKind::Restricted(PlayerFilter::Controller)
     ) {
-        return FirstQualifiedSpell::UnsupportedQualifier;
+        return NthQualifiedSpell::UnsupportedQualifier;
     }
 
     // Pre-spell type/keyword qualifier (strip a bare trailing "spell" noun so a
@@ -1781,7 +2144,7 @@ pub(crate) fn parse_first_qualified_spell_filter(lower: &str) -> FirstQualifiedS
         } else {
             // Unrecognized pre-spell qualifier — decline rather than emit a cost
             // reduction that ignores the printed restriction.
-            return FirstQualifiedSpell::UnsupportedQualifier;
+            return NthQualifiedSpell::UnsupportedQualifier;
         }
     };
 
@@ -1793,7 +2156,7 @@ pub(crate) fn parse_first_qualified_spell_filter(lower: &str) -> FirstQualifiedS
     } else {
         match super::oracle_trigger::parse_post_spell_modifier(post_modifier_text) {
             Some(filter) => Some(filter),
-            None => return FirstQualifiedSpell::UnsupportedQualifier,
+            None => return NthQualifiedSpell::UnsupportedQualifier,
         }
     };
 
@@ -1804,14 +2167,18 @@ pub(crate) fn parse_first_qualified_spell_filter(lower: &str) -> FirstQualifiedS
             filters: vec![a, b],
         },
     };
-    FirstQualifiedSpell::Supported(filter, timing)
+    NthQualifiedSpell::Supported {
+        filter,
+        timing,
+        ordinal,
+    }
 }
 
-/// CR 601.2f: Audit that a "the first … spell <timing> has [keyword]" subject is
-/// FULLY represented by `parse_first_qualified_spell_filter` — i.e. the text
+/// CR 601.2f: Audit that a "the <ordinal> … spell <timing> has [keyword]" subject
+/// is FULLY represented by `parse_nth_qualified_spell_filter` — i.e. the text
 /// AFTER the timing phrase is empty.
 ///
-/// `parse_first_qualified_spell_filter` discards everything after the timing
+/// `parse_nth_qualified_spell_filter` discards everything after the timing
 /// phrase (the cost-modification verb on the cost-reducer path, "costs {1} less
 /// …"). On the keyword-grant path the grant verb was already split off by the
 /// caller, so a clean subject must terminate at the timing phrase. Any trailing
@@ -1823,9 +2190,9 @@ pub(crate) fn parse_first_qualified_spell_filter(lower: &str) -> FirstQualifiedS
 /// Lives next to the parser whose discard it audits. Called ONLY from the
 /// keyword-grant arm — the cost-modifier consumer legitimately expects trailing
 /// cost-verb text, so this guard must NOT move into the shared
-/// `parse_first_qualified_spell_filter`.
-pub(crate) fn first_qualified_spell_subject_fully_consumed(subject: &str) -> bool {
-    let Some(after_prefix) = nom_tag_lower(subject, subject, "the first ") else {
+/// `parse_nth_qualified_spell_filter`.
+pub(crate) fn nth_qualified_spell_subject_fully_consumed(subject: &str) -> bool {
+    let Some((_ordinal, after_prefix)) = parse_spell_ordinal_prefix(subject) else {
         return false;
     };
     let Some((_, post)) = split_first_spell_cast_region(after_prefix) else {
@@ -1892,16 +2259,20 @@ fn split_first_spell_timing(text: &str) -> Option<(NthEventTimingKind, &str)> {
     Some((timing, before.trim_end()))
 }
 
-/// CR 601.2f + CR 107.3: Build the "first qualified spell <timing>" gate.
-/// The reduction applies only while no matching spell has yet been cast this
-/// turn (`SpellsCastThisTurn(filter) == 0`). The timing axis adds a turn-owner
-/// restriction only for the "during each of your turns" form; "each turn" allows
-/// the first qualifying spell on any player's turn.
-pub(crate) fn first_qualified_spell_condition(
+/// CR 601.2f + CR 107.3: Build the "the <ordinal> qualified spell <timing>" gate.
+/// The 1-based `ordinal` (`"first"` → 1, `"second"` → 2, …) lowers to
+/// `SpellsCastThisTurn(filter) == ordinal - 1`: the reduction applies precisely
+/// while exactly `ordinal - 1` matching spells have already been cast this turn,
+/// so the spell now being cast is the Nth (the currently-casting spell is not yet
+/// counted, matching the merged `first == 0` behavior). The timing axis adds a
+/// turn-owner restriction only for the "during each of your turns" form; "each
+/// turn" allows the Nth qualifying spell on any player's turn.
+pub(crate) fn nth_qualified_spell_condition(
     filter: &TargetFilter,
     timing: &NthEventTimingKind,
+    ordinal: u32,
 ) -> StaticCondition {
-    let first_this_turn = StaticCondition::QuantityComparison {
+    let nth_this_turn = StaticCondition::QuantityComparison {
         lhs: QuantityExpr::Ref {
             qty: QuantityRef::SpellsCastThisTurn {
                 scope: CountScope::Controller,
@@ -1909,17 +2280,19 @@ pub(crate) fn first_qualified_spell_condition(
             },
         },
         comparator: Comparator::EQ,
-        rhs: QuantityExpr::Fixed { value: 0 },
+        rhs: QuantityExpr::Fixed {
+            value: ordinal as i32 - 1,
+        },
     };
 
     match timing {
-        // "each turn" — no turn-ownership restriction (CR 601.2: the first
+        // "each turn" — no turn-ownership restriction (CR 601.2: the Nth
         // qualifying spell of the turn regardless of whose turn it is).
-        NthEventTimingKind::Unrestricted => first_this_turn,
+        NthEventTimingKind::Unrestricted => nth_this_turn,
         // "during each of your turns" — additionally gate on the controller's
         // turn (CR 102.1 active-player reading for a cost static).
         NthEventTimingKind::Restricted(PlayerFilter::Controller) => StaticCondition::And {
-            conditions: vec![StaticCondition::DuringYourTurn, first_this_turn],
+            conditions: vec![StaticCondition::DuringYourTurn, nth_this_turn],
         },
         // Other player-scoped turn windows have no representable `StaticCondition`
         // for a cost static; the caller declines these via the filter parser.

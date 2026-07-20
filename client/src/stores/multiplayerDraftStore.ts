@@ -23,9 +23,10 @@ import type {
 } from "../adapter/draft-adapter";
 import type { EngineAdapter, GameEvent, GameLogEntry, MatchScore, SubmitResult } from "../adapter/types";
 import type { DraftMatchLaunch, DraftPauseReason } from "../network/draftProtocol";
+import type { AISeatBinding } from "../game/controllers/aiController";
 import { createGameLoopController, type GameLoopController } from "../game/controllers/gameLoopController";
 import { processRemoteUpdate } from "../game/dispatch";
-import { legalResultState, useGameStore } from "./gameStore";
+import { useGameStore } from "./gameStore";
 import {
   DraftPodHostAdapter,
   type DraftPodHostConfig,
@@ -272,40 +273,48 @@ function disposeMatchController(): void {
   activeMatchController = null;
 }
 
+/** The engine-side AI seat for a Bot draft match (the local player is game
+ *  player 0, the bot is 1). Single authority shared by the live game-loop
+ *  controller and the Resolve All batch drain, so the drain can never play
+ *  the bot at a different difficulty than the controller driving it. */
+export const DRAFT_BOT_AI_SEAT: AISeatBinding = { playerId: 1, difficulty: "Medium" };
+
 async function installMatchRuntime(
   gameId: string,
   adapter: EngineAdapter,
   initResult: SubmitResult,
   controllerMode: "ai" | "online",
 ): Promise<void> {
-  const state = await adapter.getState();
-  const legalResult = await adapter.getLegalActions();
+  // Fetched after this match's engine is up, so the snapshot is
+  // newest-by-construction under the global seq counter: it always passes the
+  // commit gate, and it inherently drops any commit still in flight from the
+  // previous game of a Bo3 (whose stamps are strictly lower).
+  const snapshot = await adapter.getSnapshot();
   const initLogEntries: GameLogEntry[] = (initResult.log_entries ?? []).map((entry, i) => ({
     ...entry,
     seq: i,
   }));
 
-  useGameStore.setState({
-    gameId,
-    gameMode: "draft-match",
-    adapter,
-    gameState: state,
-    waitingFor: state.waiting_for,
-    ...legalResultState(legalResult),
-    events: [] as GameEvent[],
-    eventHistory: [] as GameEvent[],
-    logHistory: initLogEntries,
-    nextLogSeq: initLogEntries.length,
-    stateHistory: [],
-    turnCheckpoints: [],
-    lobbyProgress: null,
+  useGameStore.getState().commitEngineSnapshot(snapshot, {
+    extraState: {
+      gameId,
+      gameMode: "draft-match",
+      adapter,
+      events: [] as GameEvent[],
+      eventHistory: [] as GameEvent[],
+      logHistory: initLogEntries,
+      nextLogSeq: initLogEntries.length,
+      stateHistory: [],
+      turnCheckpoints: [],
+      lobbyProgress: null,
+    },
   });
 
   disposeMatchController();
   activeMatchController = createGameLoopController({
     mode: controllerMode,
-    difficulty: "Medium",
-    aiSeats: controllerMode === "ai" ? [{ playerId: 1, difficulty: "Medium" }] : undefined,
+    difficulty: DRAFT_BOT_AI_SEAT.difficulty,
+    aiSeats: controllerMode === "ai" ? [DRAFT_BOT_AI_SEAT] : undefined,
     playerCount: 2,
   });
   activeMatchController.start();
@@ -389,7 +398,14 @@ function activePhaseForDraftViewStatus(status: DraftPlayerView["status"]): Activ
   }
 }
 
-/** Dispose the active match adapter (P2PHostAdapter or P2PGuestAdapter). */
+/**
+ * Dispose the active match adapter (P2PHostAdapter or P2PGuestAdapter).
+ *
+ * Documented exemption from the `commitEngineSnapshot` single-writer invariant:
+ * this is a teardown clear, not a live-game commit. It has no snapshot to gate
+ * on, and any subsequent live commit arrives newest-by-construction (a fresh
+ * post-init fetch), so it cannot be resurrected by a stale pair.
+ */
 function disposeMatchAdapter(set: SetFn): void {
   const state = useMultiplayerDraftStore.getState();
   disposeMatchController();
@@ -635,10 +651,10 @@ export const useMultiplayerDraftStore = create<
             resolveRoomFull();
           }
           if (event.type === "stateChanged") {
-            void processRemoteUpdate(event.state, event.events, event.legalResult);
+            void processRemoteUpdate(event.snapshot, event.events, event.logEntries);
           }
           if (event.type === "stateChanged") {
-            const wf = event.state?.waiting_for;
+            const wf = event.snapshot.state?.waiting_for;
             if (!wf) return;
 
             if (wf.type === "GameOver") {
@@ -708,10 +724,10 @@ export const useMultiplayerDraftStore = create<
 
         matchAdapter.onEvent((event) => {
           if (event.type === "stateChanged") {
-            void processRemoteUpdate(event.state, event.events, event.legalResult);
+            void processRemoteUpdate(event.snapshot, event.events, event.logEntries);
           }
           if (event.type === "stateChanged") {
-            const wf = event.state?.waiting_for;
+            const wf = event.snapshot.state?.waiting_for;
             if (!wf) return;
 
             if (wf.type === "GameOver") {

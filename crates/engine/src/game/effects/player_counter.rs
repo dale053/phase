@@ -170,6 +170,7 @@ pub fn resolve(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::GivePlayerCounter,
         source_id: ability.source_id,
+        subject: None,
     });
 
     Ok(())
@@ -224,6 +225,7 @@ pub fn resolve_lose_all(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::LoseAllPlayerCounters,
         source_id: ability.source_id,
+        subject: None,
     });
 
     Ok(())
@@ -298,6 +300,8 @@ mod tests {
             target_chooser: None,
             source_id: ObjectId(1),
             source_incarnation: None,
+            trigger_source: None,
+            trigger_definition_ref: None,
             targets: vec![],
             kind: AbilityKind::Spell,
             sub_ability: None,
@@ -312,15 +316,19 @@ mod tests {
             target_constraints: Vec::new(),
             target_choice_timing: crate::types::ability::TargetChoiceTiming::Stack,
             description: None,
+            selected_mode_labels: Vec::new(),
             player_scope: None,
             starting_with: None,
             chosen_x: None,
             cost_paid_object: None,
+            cost_paid_object_ids: Vec::new(),
             effect_context_object: None,
+            amassed_army_object: None,
             ability_index: None,
             may_trigger_origin: None,
             repeat_for: None,
             min_x_value: 0,
+            announced_x: None,
             cant_be_copied: false,
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
@@ -329,9 +337,11 @@ mod tests {
             target_selection_mode: crate::types::ability::TargetSelectionMode::Chosen,
             chosen_players: Vec::new(),
             repeat_until: None,
+            replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
             modal: None,
             mode_abilities: vec![],
+            parent_target_missing_reason: None,
         }
     }
 
@@ -482,6 +492,8 @@ mod tests {
             target_chooser: None,
             source_id: ObjectId(1),
             source_incarnation: None,
+            trigger_source: None,
+            trigger_definition_ref: None,
             targets: vec![],
             kind: AbilityKind::Spell,
             sub_ability: None,
@@ -496,15 +508,19 @@ mod tests {
             target_constraints: Vec::new(),
             target_choice_timing: crate::types::ability::TargetChoiceTiming::Stack,
             description: None,
+            selected_mode_labels: Vec::new(),
             player_scope: None,
             starting_with: None,
             chosen_x: None,
             cost_paid_object: None,
+            cost_paid_object_ids: Vec::new(),
             effect_context_object: None,
+            amassed_army_object: None,
             ability_index: None,
             may_trigger_origin: None,
             repeat_for: None,
             min_x_value: 0,
+            announced_x: None,
             cant_be_copied: false,
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
@@ -513,9 +529,11 @@ mod tests {
             target_selection_mode: crate::types::ability::TargetSelectionMode::Chosen,
             chosen_players: Vec::new(),
             repeat_until: None,
+            replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
             modal: None,
             mode_abilities: vec![],
+            parent_target_missing_reason: None,
         }
     }
 

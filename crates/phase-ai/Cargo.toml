@@ -9,6 +9,7 @@ engine = { path = "../engine" }
 serde = { workspace = true }
 serde_json = "1"
 rand = "0.9"
+rand_chacha = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 web-time = "1"
@@ -16,6 +17,9 @@ rayon = { version = "1", optional = true }
 
 [features]
 tune = ["rayon"]
+# Scenario-backed benchmark binaries are opt-in: build them with
+# `cargo check -p phase-ai --features scenario-benches --bin combat-priority-bench --bin attack-scaling-bench`.
+scenario-benches = ["engine/test-support"]
 
 [[bin]]
 name = "ai-duel"
@@ -43,8 +47,27 @@ path = "src/bin/ai_gate.rs"
 test = false
 
 [[bin]]
+name = "ai-perf-gate"
+path = "src/bin/ai_perf_gate.rs"
+test = false
+
+[[bin]]
 name = "legal-actions-bench"
 path = "src/bin/legal_actions_bench.rs"
 test = false
 
+[[bin]]
+name = "combat-priority-bench"
+path = "src/bin/combat_priority_bench.rs"
+required-features = ["scenario-benches"]
+test = false
+
+[[bin]]
+name = "attack-scaling-bench"
+path = "src/bin/attack_scaling_bench.rs"
+required-features = ["scenario-benches"]
+test = false
+
 [dev-dependencies]
+# cfg(test) modules place objects with the raw zone API (sealed in production builds).
+engine = { path = "../engine", features = ["test-support"] }

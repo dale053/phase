@@ -60,18 +60,21 @@ pub(crate) fn target_filter_has_pitch_bound_x(filter: &TargetFilter) -> bool {
         | TargetFilter::Any
         | TargetFilter::Player
         | TargetFilter::Controller
+        | TargetFilter::Opponent
         | TargetFilter::SelfRef
         | TargetFilter::SourceOrPaired
         | TargetFilter::StackAbility { .. }
         | TargetFilter::StackSpell
         | TargetFilter::SpecificObject { .. }
         | TargetFilter::SpecificPlayer { .. }
+        | TargetFilter::PlayerWhoChoseLabel { .. }
         | TargetFilter::Neighbor { .. }
         | TargetFilter::ScopedPlayer
         | TargetFilter::AttachedTo
         | TargetFilter::LastCreated
         | TargetFilter::LastRevealed
         | TargetFilter::CostPaidObject
+        | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::TriggeringSpellController
@@ -87,13 +90,19 @@ pub(crate) fn target_filter_has_pitch_bound_x(filter: &TargetFilter) -> bool {
         | TargetFilter::SourceChosenPlayer
         | TargetFilter::OriginalController
         | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
+        | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::DefendingPlayer
         | TargetFilter::HasChosenName
-        | TargetFilter::ChosenDamageSource
+        | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
         | TargetFilter::Owner
+        // CR 201.5a: a granter self-ref carries no pitch-bound X.
+        | TargetFilter::GrantingObject
+        // CR 608.2c: source-relative object ref carries no pitch-bound X.
+        | TargetFilter::OriginalSource
         | TargetFilter::AllPlayers => false,
     }
 }
@@ -132,18 +141,21 @@ pub(crate) fn relax_pitch_bound_x_filter(filter: &TargetFilter) -> TargetFilter 
         | TargetFilter::Any
         | TargetFilter::Player
         | TargetFilter::Controller
+        | TargetFilter::Opponent
         | TargetFilter::SelfRef
         | TargetFilter::SourceOrPaired
         | TargetFilter::StackAbility { .. }
         | TargetFilter::StackSpell
         | TargetFilter::SpecificObject { .. }
         | TargetFilter::SpecificPlayer { .. }
+        | TargetFilter::PlayerWhoChoseLabel { .. }
         | TargetFilter::Neighbor { .. }
         | TargetFilter::ScopedPlayer
         | TargetFilter::AttachedTo
         | TargetFilter::LastCreated
         | TargetFilter::LastRevealed
         | TargetFilter::CostPaidObject
+        | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::TriggeringSpellController
@@ -159,13 +171,19 @@ pub(crate) fn relax_pitch_bound_x_filter(filter: &TargetFilter) -> TargetFilter 
         | TargetFilter::SourceChosenPlayer
         | TargetFilter::OriginalController
         | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
+        | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::DefendingPlayer
         | TargetFilter::HasChosenName
-        | TargetFilter::ChosenDamageSource
+        | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
         | TargetFilter::Owner
+        // CR 201.5a: no pitch-bound X constraint to relax.
+        | TargetFilter::GrantingObject
+        // CR 608.2c: source-relative object ref — nothing to relax.
+        | TargetFilter::OriginalSource
         | TargetFilter::AllPlayers => filter.clone(),
     }
 }
@@ -518,6 +536,18 @@ impl AbilityCost {
                         .any(|subtype| subtype == "Equipment")
                     && obj.attached_to.is_some()
             }),
+            // CR 701.3d + CR 601.2b: An unattach-from cost is payable iff the
+            // source controls >= `count` battlefield attachments matching `filter`
+            // currently attached to it. The generic eligibility count uses `n = 0`
+            // (no mana-value floor); the divided-damage MV>=N narrowing lives in
+            // the interactive detour (`find_eligible_unattach_for_cost_targets`).
+            AbilityCost::UnattachFrom { filter, count } => {
+                super::casting::find_eligible_unattach_for_cost_targets(
+                    state, player, source, filter, 0,
+                )
+                .len()
+                    >= *count as usize
+            }
             // CR 701.13b: A player can mill fewer than N cards if their library
             // has fewer than N; the cost is always payable.
             AbilityCost::Mill { .. } => true,
@@ -552,10 +582,25 @@ impl AbilityCost {
                     }
                 }
             }
-            AbilityCost::Behold { count, filter, .. } => {
-                super::casting_costs::eligible_behold_choices(state, player, source, filter).len()
-                    >= *count as usize
-            }
+            AbilityCost::Behold {
+                count,
+                filter,
+                type_choice,
+                ..
+            } => match type_choice {
+                // Fixed-quality behold: >= count candidates of the fixed filter.
+                None => {
+                    super::casting_costs::eligible_behold_choices(state, player, source, filter)
+                        .len()
+                        >= *count as usize
+                }
+                // CR 601.2h: pre-choice behold — payable iff SOME creature type is
+                // feasible (∃ a type with >= count beholdable creatures of it).
+                Some(_) => !super::filter::feasible_behold_creature_types(
+                    state, player, source, filter, *count,
+                )
+                .is_empty(),
+            },
             // CR 601.2b: Every sub-cost must be payable. When the composite
             // includes {T}, the source is committed to the tap cost and must be
             // excluded from any TapCreatures eligibility count — it will be
@@ -609,6 +654,11 @@ impl AbilityCost {
             // the activation-time 601.2b gate doesn't reject the wrapper
             // unseen — actual payability is decided post-expansion.
             AbilityCost::PerCounter { .. } => true,
+            // CR 118.9 + CR 601.2g: a borrowed keyword cost resolves to a concrete
+            // `ManaCost` at cast time; like `Mana`/`ManaDynamic`, mana
+            // affordability is decided by the separate mana-payment step, not this
+            // choice-of-object gate.
+            AbilityCost::KeywordCostOfCastSpell { .. } => true,
         }
     }
 }

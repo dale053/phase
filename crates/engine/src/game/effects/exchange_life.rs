@@ -52,6 +52,7 @@ pub fn resolve(
         events.push(GameEvent::EffectResolved {
             kind: resolved_kind,
             source_id: ability.source_id,
+            subject: None,
         });
         return Ok(());
     };
@@ -69,6 +70,7 @@ pub fn resolve(
         events.push(GameEvent::EffectResolved {
             kind: resolved_kind,
             source_id: ability.source_id,
+            subject: None,
         });
         return Ok(());
     };
@@ -92,6 +94,7 @@ pub fn resolve(
         events.push(GameEvent::EffectResolved {
             kind: resolved_kind,
             source_id: ability.source_id,
+            subject: None,
         });
         return Ok(());
     }
@@ -136,6 +139,7 @@ pub fn resolve(
     events.push(GameEvent::EffectResolved {
         kind: resolved_kind,
         source_id: ability.source_id,
+        subject: None,
     });
     Ok(())
 }
@@ -269,6 +273,13 @@ mod tests {
                     TypedFilter::default().controller(ControllerRef::You),
                 )),
             );
+
+        // Flush after installing the CantGainLife static so the `StaticModePresence`
+        // index (consulted by `check_static_ability` via `player_has_cant_gain_life`)
+        // reflects it. In production a static entering the battlefield always triggers a
+        // layers flush; this test mutates `static_definitions` directly, so it must flush
+        // to reproduce the production invariant.
+        evaluate_layers(&mut state);
 
         let ability = ResolvedAbility::new(
             Effect::ExchangeLifeWithStat {

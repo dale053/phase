@@ -268,6 +268,8 @@ mod tests {
                 }),
                 chooser: PlayerScope::Controller,
                 chosen_pile_effect: Box::new(sacrifice_effect),
+                pile_source: engine::types::ability::PileSource::Battlefield,
+                unchosen_pile_effect: None,
             },
         );
         main_ability.sub_ability = None;
@@ -329,6 +331,7 @@ mod tests {
             config,
             context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         }
     }
 

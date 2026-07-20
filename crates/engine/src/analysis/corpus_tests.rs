@@ -19,29 +19,31 @@
 //! (`drive_damage_loop_certificate` plus the negatives) exercise the same pipeline
 //! without the export. Reverting either `detect_loop` gate flips an assertion.
 //!
-//! Corpus card-availability over all 53 rows
+//! Corpus card-availability over all 54 rows
 //! (`corpus_cards_present_and_implementation_status_matches_gating`): every card
 //! present, and every non-gated combo fully modeled (no top-level `Unimplemented`).
 //! Skips gracefully when the gitignored export is absent.
 //!
-//! Corpus table (`corpus::CORPUS`) + shape/partition-lock meta-tests: all 53 rows
+//! Corpus table (`corpus::CORPUS`) + shape/partition-lock meta-tests: all 54 rows
 //! partitioned into driven ∪ gated ∪ deferred. The `combo-verify` CLI
 //! ([`corpus::drive_row`]) classifies each via the same drivers;
 //! `drive_row_classifies_corpus_via_shared_pipeline` and the `classify_status`
 //! revert-probe pin that dispatch.
 
 use crate::analysis::corpus;
-use crate::analysis::resource::ResourceAxis;
-use crate::analysis::{detect_loop, LoopCertificate, LoopProbe, WinKind};
+use crate::analysis::resource::{CounterClass, ObjectClass, ResourceAxis};
+use crate::analysis::{detect_loop, BoardDelta, LoopCertificate, LoopProbe, WinKind};
 use crate::database::CardDatabase;
-use crate::game::scenario::{GameScenario, P0, P1};
+use crate::game::derived_views::derive_views;
+use crate::game::scenario::{GameRunner, GameScenario, P0, P1};
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter, TargetRef,
 };
 use crate::types::actions::GameAction;
-use crate::types::game_state::{CastPaymentMode, GameState, WaitingFor};
+use crate::types::game_state::{CastPaymentMode, GameState, LoopDetectionMode, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaType;
+use crate::types::match_config::MatchConfig;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 
@@ -56,13 +58,13 @@ fn card_db() -> &'static CardDatabase {
 // ===========================================================================
 
 /// META-TEST: lock the corpus shape so an accidental row deletion or miscount
-/// fails loudly. 53 rows total (3 driving + 50 corpus), exactly 4 card-gated.
+/// fails loudly. 54 rows total (3 driving + 51 corpus), exactly 4 card-gated.
 #[test]
 fn corpus_table_shape_is_locked() {
     assert_eq!(
         corpus::corpus_len(),
-        53,
-        "corpus must hold all 3 driving + 50 combos"
+        54,
+        "corpus must hold all 3 driving + 51 combos"
     );
     let gated = (0..corpus::corpus_len())
         .filter(|&i| corpus::row(i).gated_on.is_some())
@@ -85,13 +87,13 @@ fn corpus_table_shape_is_locked() {
             | WinKind::Advantage => {}
         }
     }
-    // 49 of 53 are testable today (gated count is the complement).
+    // 50 of 54 are testable today (gated count is the complement).
     let testable = corpus::corpus_len() - gated;
-    assert_eq!(testable, 49, "49 corpus combos are testable once driven");
+    assert_eq!(testable, 50, "50 corpus combos are testable once driven");
 }
 
 /// META-TEST: the corpus is a clean partition — every row is exactly one of
-/// {driven, gated, deferred}, pairwise disjoint, covering all 53. The driven set
+/// {driven, gated, deferred}, pairwise disjoint, covering all 54. The driven set
 /// is `corpus::DRIVERS`, gated is `gated_on.is_some()`, deferred is
 /// `deferral.is_some()`; a driven/gated row must NOT also carry a deferral bucket.
 #[test]
@@ -106,7 +108,7 @@ fn corpus_partition_is_locked() {
         .filter(|&i| corpus::row(i).deferral.is_some())
         .collect();
 
-    assert_eq!(driven.len(), 12, "12 driven rows");
+    assert_eq!(driven.len(), 13, "13 driven rows");
     assert_eq!(gated.len(), 4, "4 gated rows");
     assert_eq!(deferred.len(), 37, "37 deferred rows");
 
@@ -129,7 +131,7 @@ fn corpus_partition_is_locked() {
         n,
         "driven ∪ gated ∪ deferred must cover every one of the {n} rows"
     );
-    assert_eq!(n, 53);
+    assert_eq!(n, 54);
 
     // Exclusivity: a driven or gated row must not also declare a deferral bucket.
     for &i in driven.iter().chain(gated.iter()) {
@@ -159,7 +161,7 @@ fn face_has_unimplemented(face: &crate::types::card::CardFace) -> bool {
             .any(|t| t.execute.as_deref().is_some_and(ability_unimpl))
 }
 
-/// ACCEPTANCE OVER THE WHOLE CORPUS (all 53 rows): every card of every combo is
+/// ACCEPTANCE OVER THE WHOLE CORPUS (all 54 rows): every card of every combo is
 /// present in the real card-data export, and its implementation status matches
 /// the row's `gated_on` — a non-gated combo has zero `Effect::Unimplemented`
 /// across all its cards, while a gated combo legitimately contains an unmodeled
@@ -223,8 +225,8 @@ fn confirmed_drivers_match_expected() {
 
 /// The shared CLI dispatch ([`corpus::drive_row`]) classifies each status class
 /// through the REAL pipeline. NOTE: these are ARRAY indices; the gated rows are
-/// 2 / 21 / 38 / 51 (Doc Aurlock / Professor Onyx / Animate Dead / Grindstone) —
-/// NOT the ComboRow doc-comment's FEASIBILITY numbering (array idx 49 is a
+/// 2 / 21 / 39 / 52 (Doc Aurlock / Professor Onyx / Animate Dead / Grindstone) —
+/// NOT the ComboRow doc-comment's FEASIBILITY numbering (array idx 50 is a
 /// CONFIRMED driver, Spike Feeder + Archangel, not a gated row).
 #[test]
 fn drive_row_classifies_corpus_via_shared_pipeline() {
@@ -255,12 +257,23 @@ fn drive_row_classifies_corpus_via_shared_pipeline() {
         }
     }
 
+    // Confirmed (finite pre-cast shortcut): the route ends in ordinary priority,
+    // but its classified combo family remains drain / LethalDamage.
+    match corpus::drive_row(db, 22).status {
+        corpus::RowStatus::Confirmed { win_kind, .. } => {
+            assert_eq!(win_kind, WinKind::LethalDamage)
+        }
+        other => panic!(
+            "idx 22 (Witherbloom Apprentice + Chain of Smog) must be Confirmed via the finite pre-cast route, got {other:?}"
+        ),
+    }
+
     // Gated: never Failed — gated is expected. (ARRAY indices, see the note above.)
     for (idx, card) in [
         (2usize, "Doc Aurlock, Grizzled Genius"),
         (21, "Professor Onyx"),
-        (38, "Animate Dead"),
-        (51, "Grindstone"),
+        (39, "Animate Dead"),
+        (52, "Grindstone"),
     ] {
         match corpus::drive_row(db, idx).status {
             corpus::RowStatus::Gated { card: c } => assert_eq!(c, card),
@@ -269,11 +282,11 @@ fn drive_row_classifies_corpus_via_shared_pipeline() {
     }
 
     // Deferred: a non-driven testable row reports its structural bucket, never Failed.
-    match corpus::drive_row(db, 22).status {
+    match corpus::drive_row(db, 23).status {
         corpus::RowStatus::Deferred { bucket } => {
             assert_eq!(bucket, corpus::DeferralBucket::ObjectReentry)
         }
-        other => panic!("idx 22 (Kiki-Jiki) must be Deferred(ObjectReentry), got {other:?}"),
+        other => panic!("idx 23 (Kiki-Jiki) must be Deferred(ObjectReentry), got {other:?}"),
     }
 }
 
@@ -291,6 +304,7 @@ fn classify_status_compares_against_spec_not_rubber_stamp() {
         unbounded: vec![ResourceAxis::DamageDealt(P1)],
         win_kind: WinKind::LethalDamage,
         mandatory: false,
+        residual_board_delta: BoardDelta::default(),
     };
     assert!(
         matches!(
@@ -305,6 +319,7 @@ fn classify_status_compares_against_spec_not_rubber_stamp() {
         unbounded: vec![ResourceAxis::TokensCreated],
         win_kind: WinKind::Advantage,
         mandatory: false,
+        residual_board_delta: BoardDelta::default(),
     };
     assert!(
         matches!(
@@ -329,6 +344,7 @@ fn classify_status_compares_against_spec_not_rubber_stamp() {
         unbounded: vec![ResourceAxis::Mana(ManaType::Green)],
         win_kind: WinKind::Advantage,
         mandatory: false,
+        residual_board_delta: BoardDelta::default(),
     };
     assert!(
         matches!(
@@ -435,7 +451,7 @@ fn drive_combo_02_grim_power() {
 fn drive_combo_47_spike_archangel() {
     let cert = corpus::drive_offline_spike_archangel(card_db())
         .expect("Spike Feeder + Archangel must confirm infinite counters + life");
-    assert_combo(49, &cert);
+    assert_combo(50, &cert);
 }
 
 /// #7 BLOOM TENDER + FREED FROM THE REAL — infinite mana.
@@ -468,6 +484,189 @@ fn drive_combo_d2_kilo_freed_relic() {
     let cert = corpus::drive_offline_kilo_freed_relic(card_db())
         .expect("Kilo + Freed + Relic must confirm infinite proliferate triggers");
     assert_combo(1, &cert);
+}
+
+/// PR-7 #8 (offline acceptance): a REAL Pentad Prism seeded with ≥1 charge counter,
+/// under the Kilo/Freed/Relic proliferate engine, is certified as an infinite
+/// preserved-`Generic` charge-counter growth loop — `WinKind::Advantage` (CR 104.4b:
+/// an optional loop is never a draw) naming the counter axis
+/// `Counter(Other, Other)` (Pentad is a non-creature artifact ⇒ `ObjectClass::Other`;
+/// charge is a `Generic` counter ⇒ `CounterClass::Other`, CR 122.1).
+///
+/// A2 (measured, not assumed): the cert being `Some` proves `detect_loop`'s
+/// recurrence gate matched — the constant-depth `loop_states_equal_modulo_resources`
+/// FAILS on the growing charge (Generic is preserved), so this certification depends
+/// on the new `loop_states_cover_modulo_counter_growth` disjunct. Reverting that
+/// disjunct flips this `expect` to a panic (no cert).
+#[test]
+fn drive_pentad_prism_charge_growth_certificate() {
+    let cert = corpus::drive_offline_pentad_prism(card_db()).expect(
+        "Pentad Prism (seeded ≥1 charge) under the proliferate engine must confirm an \
+         infinite charge-counter growth loop",
+    );
+    assert_eq!(
+        cert.win_kind,
+        WinKind::Advantage,
+        "a charge-counter growth loop is a CR 104.4b optional advantage engine, not a win"
+    );
+    assert!(
+        cert.covers(&[ResourceAxis::Counter(
+            CounterClass::Other,
+            ObjectClass::Other
+        )]),
+        "certificate must name the unbounded charge counter axis (got {:?})",
+        cert.unbounded
+    );
+}
+
+/// PR-7 #5 (Sunburst 0-charge dead-loop CONTROL, paired with #8): a Pentad Prism
+/// seeded with ZERO charge counters (a generic-mana Sunburst cast ⇒ 0 charge) has no
+/// counter for proliferate to grow, so the cycle degrades to the pure Kilo proliferate
+/// loop — the cert is still `Some` (certified via the constant-depth equality path on
+/// the identical board) but carries NO counter axis. The seed is thus load-bearing:
+/// #8's `Counter(Other, Other)` axis appears ONLY because a charge counter was present
+/// to grow.
+#[test]
+fn drive_pentad_prism_zero_charge_has_no_counter_axis() {
+    let cert = corpus::drive_offline_pentad_prism_seeded(card_db(), 0).expect(
+        "a 0-charge Pentad still rides the pure Kilo proliferate loop (board identical) \
+         and must confirm via the equality path",
+    );
+    assert!(
+        !cert
+            .unbounded
+            .iter()
+            .any(|a| matches!(a, ResourceAxis::Counter(..))),
+        "a 0-charge Pentad has no counter to grow ⇒ the cert must NOT name a counter axis \
+         (got {:?})",
+        cert.unbounded
+    );
+}
+
+/// PR-7 54th (offline acceptance): a REAL Walking Ballista seeded with ≥1 +1/+1
+/// counter, under the Kilo/Freed/Relic proliferate engine, is certified as an
+/// infinite-DAMAGE loop — `WinKind::LethalDamage` (CR 704.5a / CR 120.3a: each ping is
+/// 1 life loss on the opponent) naming the `DamageDealt(P1)` axis. The +1/+1 counter is
+/// MONOTONE (CR 122.1a), so `project_object_for_loop` strips it and the EXISTING
+/// constant-depth gate-1 (`loop_states_equal_modulo_resources`) covers the growth — no
+/// new predicate (contrast the 53rd Pentad's non-monotone `Generic` charge).
+///
+/// DISCRIMINATION: the paired X=0 control below (same driver, only the seed differs)
+/// loses the damage axis, so this `covers` is not vacuously "any cert". The `expect`
+/// flips to a panic if `detect_loop`'s recurrence gate is reverted; the `win_kind` /
+/// `covers` assertions flip if `classify_win_kind`'s damage branch is dropped
+/// (Advantage) — proving the ping actually reached the opponent (a mis-answered
+/// `TargetSelection` prompt would leave no `DamageDealt(P1)` axis and fail `covers`).
+#[test]
+fn drive_kilo_freed_relic_ballista_certificate() {
+    let cert = corpus::drive_offline_kilo_freed_relic_ballista(card_db(), 2).expect(
+        "Walking Ballista (seeded ≥1 +1/+1) under the proliferate engine must confirm an \
+         infinite damage loop: board identical modulo the monotone +1/+1, +1 damage/cycle",
+    );
+    assert_eq!(
+        cert.win_kind,
+        WinKind::LethalDamage,
+        "a +1 damage/cycle ping on the opponent is an unbounded CR 704.5a lethal-damage loop"
+    );
+    assert!(
+        cert.covers(&[ResourceAxis::DamageDealt(P1)]),
+        "certificate must name unbounded damage to the opponent (got {:?})",
+        cert.unbounded
+    );
+    assert!(
+        !cert.mandatory,
+        "an activated-ability loop is optional (CR 602.1), so mandatory == false"
+    );
+}
+
+/// PR-7 54th (X=0 dead-loop CONTROL, paired with the acceptance above): a Walking
+/// Ballista seeded with ZERO +1/+1 counters is a 0/0 that dies to the SBA (CR 704.5f)
+/// with no counter to remove, so the ping activation is rejected and the cycle degrades
+/// to the pure Kilo/Freed/Relic proliferate loop — the cert is still `Some` (board
+/// identical) but names NO damage axis and classifies `Advantage`. The seed is thus
+/// load-bearing: the acceptance's `LethalDamage` + `DamageDealt(P1)` appear ONLY because
+/// a +1/+1 counter was present to remove (mirrors
+/// `drive_pentad_prism_zero_charge_has_no_counter_axis`). This also pins the corrected
+/// wiring: `drive_ballista_ping` would `.expect()`-panic on the dead activation, whereas
+/// the driver's `activate_and_resolve` degrades gracefully.
+#[test]
+fn drive_kilo_freed_relic_ballista_x0_no_damage_axis() {
+    let cert = corpus::drive_offline_kilo_freed_relic_ballista(card_db(), 0).expect(
+        "a 0-counter Ballista still rides the pure Kilo proliferate loop (board identical) \
+         and must confirm via the equality path",
+    );
+    assert_eq!(
+        cert.win_kind,
+        WinKind::Advantage,
+        "with a dead Ballista the only unbounded axis is the proliferate trigger — an \
+         advantage engine, not a lethal win"
+    );
+    assert!(
+        !cert
+            .unbounded
+            .iter()
+            .any(|a| matches!(a, ResourceAxis::DamageDealt(_))),
+        "a 0-counter Ballista deals no damage ⇒ the cert must NOT name a damage axis \
+         (got {:?})",
+        cert.unbounded
+    );
+}
+
+/// PR-7 "One-Ring" (offline acceptance): a REAL The One Ring on the OPPONENT (P1),
+/// seeded ≥1 burden, under the Kilo/Freed/Relic proliferate engine, certifies an
+/// infinite preserved-`Generic` burden-growth loop — `WinKind::Advantage`
+/// (CR 104.4b) naming `Counter(Other, Other)`.
+///
+/// A2 (analytic non-vacuity, not asserted directly): the cert being `Some` proves
+/// the recurrence gate matched; the constant-depth `loop_states_equal_modulo_resources`
+/// FAILS on the growing burden (Generic is preserved), so this rides the
+/// `loop_states_cover_modulo_counter_growth` disjunct. The RUNNABLE discriminator is
+/// the seed=0 control below (Counter axis appears ONLY with seeded burden). Do NOT
+/// overclaim "no burden ⇒ no cert": the loop stays `Some` via `Trigger(Proliferate)`.
+#[test]
+fn one_ring_burden_growth_certificate() {
+    let cert = corpus::drive_offline_kilo_freed_relic_one_ring(card_db(), 1).expect(
+        "The One Ring (seeded ≥1 burden) under the proliferate engine must confirm an \
+         infinite burden-counter growth loop",
+    );
+    assert_eq!(
+        cert.win_kind,
+        WinKind::Advantage,
+        "a burden-counter growth loop is a CR 104.4b optional advantage engine, not a win"
+    );
+    assert!(
+        cert.covers(&[ResourceAxis::Counter(
+            CounterClass::Other,
+            ObjectClass::Other
+        )]),
+        "certificate must name the unbounded burden counter axis (got {:?})",
+        cert.unbounded
+    );
+    assert!(
+        !cert.mandatory,
+        "an activated-ability loop is optional (CR 602.1), so mandatory == false"
+    );
+}
+
+/// PR-7 "One-Ring" (seed=0 CONTROL, paired): a 0-burden Ring has no counter for
+/// proliferate to grow, so the cycle degrades to the pure Kilo loop — cert still
+/// `Some` (equality path, board identical) but names NO counter axis. The seed is
+/// thus load-bearing: the `Counter(Other, Other)` axis appears ONLY because burden
+/// was present to grow (mirrors `drive_pentad_prism_zero_charge_has_no_counter_axis`).
+#[test]
+fn one_ring_zero_burden_has_no_counter_axis() {
+    let cert = corpus::drive_offline_kilo_freed_relic_one_ring(card_db(), 0).expect(
+        "a 0-burden Ring still rides the pure Kilo proliferate loop (board identical) \
+         and must confirm via the equality path",
+    );
+    assert!(
+        !cert
+            .unbounded
+            .iter()
+            .any(|a| matches!(a, ResourceAxis::Counter(..))),
+        "a 0-burden Ring has no counter to grow ⇒ cert must NOT name a counter axis (got {:?})",
+        cert.unbounded
+    );
 }
 
 /// #10 PRIEST OF TITANIA + UMBRAL MANTLE — infinite green mana.
@@ -563,6 +762,7 @@ fn pinger_scenario(amount: i32) -> (GameScenario, ObjectId) {
             amount: QuantityExpr::Fixed { value: amount },
             target: TargetFilter::Any,
             damage_source: None,
+            excess: None,
         },
     );
     let pinger = scenario
@@ -764,12 +964,12 @@ fn drive_drain_idx18_wins_live() {
     // SHORTCUT, not a real CR 704.5a death), while the controller P0 gained.
     let last = trace.last().expect("at least one beat");
     assert!(
-        last.p1_life > 100 && last.p1_life < 200,
+        last.min_opponent_life() > 100 && last.min_opponent_life() < 200,
         "P1 must have drained but still be at high life when shortcut-eliminated (got {})",
-        last.p1_life
+        last.min_opponent_life()
     );
     assert!(
-        last.p0_life >= 41,
+        last.lives[0] >= 41,
         "controller P0 gained life across the cascade"
     );
 }
@@ -807,6 +1007,40 @@ fn drive_drain_idx17_targeted_wins_live() {
     assert!(
         board.runner.state().players[1].life < 200,
         "the auto-resolved target must be the opponent P1 (its life drained)"
+    );
+}
+
+/// Issue #4787: Bloodthirsty Conqueror + Enduring Tenacity is the reported
+/// targeted drain/refill loop. It is structurally close to idx17 (Sanguine Bond +
+/// Exquisite Blood), but the report names this concrete card pair, so keep a
+/// direct live witness pinned to the actual parsed cards.
+#[test]
+fn drive_bloodthirsty_conqueror_enduring_tenacity_wins_live() {
+    let Some(mut board) = corpus::build_drain_board(
+        card_db(),
+        &["Bloodthirsty Conqueror", "Enduring Tenacity"],
+        200,
+    ) else {
+        return; // export absent: skip
+    };
+    corpus::seed_lifegain_cascade(&mut board);
+    let trace = corpus::drive_pass_priority(&mut board, 40);
+    assert!(
+        trace.iter().all(|t| !matches!(
+            t.wf,
+            WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. }
+        )),
+        "Enduring Tenacity's targeted trigger must auto-resolve to the sole opponent"
+    );
+    let (beat, winner) = corpus::first_gameover_beat(&trace)
+        .expect("Bloodthirsty Conqueror + Enduring Tenacity must win LIVE via the persisted ring");
+    assert_eq!(
+        winner, P0,
+        "the single non-falling player (P0) must be the winner"
+    );
+    assert!(
+        beat <= 12,
+        "the live win must fire from the ring, not the natural 704.5a death; got beat {beat}"
     );
 }
 
@@ -915,6 +1149,544 @@ fn drive_drain_idx18_victim_with_out_is_not_eliminated() {
     assert!(
         corpus::first_gameover_beat(&trace).is_none(),
         "P1 holds a loop-ending action — the §9 gate must refuse the shortcut (no GameOver)"
+    );
+}
+
+/// G2 (multi-trigger ring-survival MECHANISM). Two DISTINGUISHABLE "whenever you gain
+/// life" drainers — Marauding Blight-Priest (fixed: each opponent loses 1) and Vito,
+/// Thorn of the Dusk Rose (dynamic: target opponent loses that much) — plus Bloodthirsty
+/// Conqueror (the refiller: whenever an opponent loses life, you gain that much). Each
+/// life-gain fires BOTH drainers simultaneously, so CR 603.3b forces a real
+/// `OrderTriggers` window every cycle (the two abilities are order-dependent, so no
+/// auto-ordering short-circuit). This drives the loop through that window and asserts
+/// the `loop_detect_ring` SURVIVES it and accrues >= 2 samples.
+///
+/// SCOPE: the committed assertions are the ring-survival MECHANISM — the loop-detect
+/// ring survives a multi-trigger `OrderTriggers` beat (CR 603.3b) so CR 732.2a detection
+/// can accrue samples. NOTE (measured, both seam edits present): this mixed
+/// untargeted+targeted fixture ALSO reaches end-to-end `GameOver { winner: Some(P0) }` at
+/// beat 10 (Vito's targeted trigger auto-resolves forced-unique in 2p, so the untargeted
+/// Blight-Priest -> Conqueror drain carries the loop and the CR 732.2a shortcut fires;
+/// detection is via the COVER path — the cascade is super-critical, so the ring tops out at
+/// exactly `max_ring == 2`). That win is deliberately NOT asserted here: `max_ring == 2`
+/// sits at the current 2-sample detection edge, so a min-samples tightening would flip the
+/// `GameOver` for a reason unrelated to ring-survival — the wrong granularity for a
+/// ring-survival test. Ring survival is the robust invariant; the robust E2E multi-trigger
+/// detection witness = the 52nd/G1 (non-edge).
+///
+/// REVERT-FAIL (measured, both seams load-bearing): reverting EDIT A (the SEAM1
+/// `!matches!(wf, OrderTriggers)` clear guard) alone, or EDIT B (the SEAM2
+/// `GameAction::OrderTriggers` clear exemption) alone, drops `max_ring` from 2 to 1 (and
+/// the end-to-end `GameOver` from `Some(P0)` to `None`) — the ring is wiped on the
+/// OrderTriggers beat and never accrues 2 samples.
+#[test]
+fn drive_multi_trigger_ring_survives_order_triggers_beat() {
+    const FIXTURE: &[&str] = &[
+        "Marauding Blight-Priest",
+        "Vito, Thorn of the Dusk Rose",
+        "Bloodthirsty Conqueror",
+    ];
+    let Some(mut board) = corpus::build_drain_board(card_db(), FIXTURE, 200) else {
+        return; // export absent (CI / fresh checkout): skip, never fail spuriously
+    };
+    corpus::seed_lifegain_cascade(&mut board);
+    let trace = corpus::drive_with_trigger_ordering(&mut board, 60);
+    // NON-VACUITY: the two distinguishable drainers must actually force a real
+    // OrderTriggers window — otherwise the ring-survival assertion is meaningless.
+    assert!(
+        trace
+            .iter()
+            .any(|t| matches!(t.wf, WaitingFor::OrderTriggers { .. })),
+        "the two distinguishable 'whenever you gain life' drainers must force a real \
+         OrderTriggers beat (CR 603.3b)"
+    );
+    // RING SURVIVAL (the discriminating signal): the ring survives the OrderTriggers
+    // beat and accrues >= 2 Priority{active} samples across the cascade.
+    let max_ring = trace.iter().map(|t| t.ring_len).max().unwrap_or(0);
+    assert!(
+        max_ring >= 2,
+        "the loop-detect ring must survive the OrderTriggers beat and reach >= 2 samples \
+         (got {max_ring})"
+    );
+}
+
+/// G2 non-regression + driver-equivalence: idx18 (Marauding Blight-Priest + Bloodthirsty
+/// Conqueror) is the SINGLE-trigger drain path — only Blight-Priest triggers on life
+/// gain, so no simultaneous-trigger group and no `OrderTriggers` window ever forms.
+/// Driving it through the new trigger-ordering driver must therefore behave exactly like
+/// `drive_pass_priority`: ZERO OrderTriggers beats, and it still wins LIVE via the ring.
+#[test]
+fn drive_drain_idx18_single_trigger_has_no_order_beat() {
+    let Some(mut board) = corpus::build_drain_board(card_db(), corpus::row(18).cards, 200) else {
+        return; // export absent: skip
+    };
+    corpus::seed_lifegain_cascade(&mut board);
+    let trace = corpus::drive_with_trigger_ordering(&mut board, 40);
+    assert!(
+        trace
+            .iter()
+            .all(|t| !matches!(t.wf, WaitingFor::OrderTriggers { .. })),
+        "idx18 is single-trigger — no OrderTriggers window must ever form"
+    );
+    let (_, winner) = corpus::first_gameover_beat(&trace)
+        .expect("idx18 still wins LIVE under the trigger-ordering driver (single-trigger path)");
+    assert_eq!(winner, P0);
+}
+
+/// G2 false-positive control: the SAME two distinguishable drainers WITHOUT the refiller
+/// (drop Bloodthirsty Conqueror). The seed life-gain still fires both drainers → a real
+/// OrderTriggers beat occurs — but with no refill the cascade is FINITE (P1 loses a
+/// couple of life from 200 and stops). The surviving ring must NOT manufacture a false
+/// loop: no `GameOver` fires within the window.
+#[test]
+fn drive_multi_trigger_no_refiller_is_finite() {
+    const FIXTURE_NO_REFILL: &[&str] = &["Marauding Blight-Priest", "Vito, Thorn of the Dusk Rose"];
+    let Some(mut board) = corpus::build_drain_board(card_db(), FIXTURE_NO_REFILL, 200) else {
+        return; // export absent: skip
+    };
+    corpus::seed_lifegain_cascade(&mut board);
+    let trace = corpus::drive_with_trigger_ordering(&mut board, 60);
+    // Reach-guard: the OrderTriggers window still forms (both drainers fire off the seed
+    // gain) — so the finite-ness assertion below is exercised past the OrderTriggers beat,
+    // not vacuous on a board that never triggered.
+    assert!(
+        trace
+            .iter()
+            .any(|t| matches!(t.wf, WaitingFor::OrderTriggers { .. })),
+        "both drainers must fire off the seed gain, forcing an OrderTriggers beat"
+    );
+    assert!(
+        corpus::first_gameover_beat(&trace).is_none(),
+        "with no refiller the cascade is finite — the surviving ring must not manufacture \
+         a false loop/GameOver"
+    );
+}
+
+// ===========================================================================
+// Combo-detector OPT-IN gate (PR #4603): `GameState::loop_detection`.
+// The live detector (ring sampler + reconcile-seam shortcut + `∞` producer) is
+// gated behind a user-controllable toggle, default OFF. These tests pin the gate
+// end-to-end on the SAME idx18 drain loop the tests above drive: ON wins + marks
+// `∞`; OFF restores exact pre-detector behavior (no shortcut, no `∞`, no ring).
+// ===========================================================================
+
+/// PR6-GATE-1 (LIVE PRODUCER): with the detector ON, the idx18 drain loop both wins
+/// LIVE (CR 704.5a via the §3 shortcut) AND marks `GameState::unbounded_resources`
+/// for the winner, so `derive_views` projects ≥1 `∞` HUD row. This is the maintainer's
+/// requested live producer — before this fix the only writer of `unbounded_resources`
+/// was the debug `SetInfiniteMana` toggle.
+///
+/// REVERT-FAIL: delete the `mark_unbounded_loop(winner, …)` call at the §3 site ⇒
+/// `unbounded_resources` stays empty ⇒ both the map and the `∞`-row assertions flip.
+#[test]
+fn pr6_gate_on_drain_marks_unbounded_resources() {
+    let Some(mut board) = corpus::build_drain_board(card_db(), corpus::row(18).cards, 200) else {
+        return; // export absent: skip
+    };
+    // build_drain_board opts the detector ON; assert that precondition explicitly so
+    // a future change to the harness default cannot silently make this test vacuous.
+    assert!(
+        board.runner.state().loop_detection.is_on(),
+        "the live-detector harness must run with loop_detection ON"
+    );
+    corpus::seed_lifegain_cascade(&mut board);
+    let trace = corpus::drive_pass_priority(&mut board, 40);
+    let (_, winner) = corpus::first_gameover_beat(&trace)
+        .expect("idx18 must win LIVE with the detector ON (§3 shortcut)");
+    assert_eq!(winner, P0, "the non-falling player wins");
+
+    let state = board.runner.state();
+    // The live producer recorded the confirmed loop's unbounded axes for the winner.
+    let winner_axes = state
+        .unbounded_resources
+        .get(&winner)
+        .expect("the live producer must mark unbounded_resources for the winning controller");
+    assert!(
+        !winner_axes.is_empty(),
+        "the producer must name ≥1 unbounded axis for the confirmed drain loop"
+    );
+    // The `∞` HUD projection sees it: derive_views emits ≥1 row attributed to the winner.
+    let views = derive_views(state, None);
+    assert!(
+        views
+            .unbounded_resources
+            .iter()
+            .any(|row| row.player == winner),
+        "derive_views must project an ∞ row for the winner (got {:?})",
+        views.unbounded_resources
+    );
+}
+
+/// PR6-GATE-2 (OFF == PRE-FEATURE + PERF GATE): the SAME idx18 drain loop with the
+/// detector OFF must behave exactly as it did before the combo-detector existed —
+/// (a) NO early `GameOver` (the natural ~400-beat CR 704.5a death is far outside the
+/// 40-beat window), (b) NO `∞` marked, and (c) the loop-detection ring is NEVER
+/// populated (proving the per-resolution `normalize_for_loop` sampling cost is gated
+/// off in the default configuration).
+///
+/// REVERT-FAIL:
+///  - remove the `is_on()` guard at the §2 ring sampler ⇒ the ring populates ⇒ the
+///    `ring stays empty` assertion flips.
+///  - (the §3 shortcut guard is pinned separately by PR6-GATE-3 below.)
+#[test]
+fn pr6_gate_off_drain_is_pre_feature() {
+    let Some(mut board) = corpus::build_drain_board(card_db(), corpus::row(18).cards, 200) else {
+        return; // export absent: skip
+    };
+    // Opt the detector OFF (the engine default; build_drain_board flips it ON).
+    board.runner.state_mut().loop_detection = LoopDetectionMode::Off;
+    corpus::seed_lifegain_cascade(&mut board);
+    let trace = corpus::drive_pass_priority(&mut board, 40);
+    assert!(
+        corpus::first_gameover_beat(&trace).is_none(),
+        "with the detector OFF the loop must NOT be shortcut to a win (pre-feature behavior)"
+    );
+    assert!(
+        board.runner.state().unbounded_resources.is_empty(),
+        "OFF must never mark ∞ (the detector producer is gated; the debug toggle is untouched)"
+    );
+    assert!(
+        trace.iter().all(|t| t.ring_len == 0),
+        "OFF must never populate the loop-detection ring (the sampler's per-resolution clone is gated)"
+    );
+}
+
+/// PR6-GATE-3 (SHORTCUT GUARD, flag A/B from an identical pre-state): drive the idx18
+/// loop ON until the exact pre-win state (populated ring, detector ON), then re-apply
+/// the SINGLE winning beat twice from clones that differ ONLY in `loop_detection`:
+/// ON ends the game, OFF does not. Because the two probes share a byte-identical
+/// populated ring and differ only in the flag, this isolates the §3 shortcut gate from
+/// the §2 sampler gate (which PR6-GATE-2 covers).
+///
+/// REVERT-FAIL: remove the `&& state.loop_detection.is_on()` conjunct at the §3
+/// shortcut ⇒ the OFF probe also ends the game ⇒ the `OFF must not GameOver` flips.
+#[test]
+fn pr6_gate_shortcut_guard_isolated_by_flag() {
+    let Some(mut board) = corpus::build_drain_board(card_db(), corpus::row(18).cards, 200) else {
+        return; // export absent: skip
+    };
+    corpus::seed_lifegain_cascade(&mut board);
+    // Capture the state from the beat immediately BEFORE the ON drive's GameOver — the
+    // exact populated-ring state whose next `PassPriority` fires the §3 shortcut.
+    let mut pre_win: Option<GameState> = None;
+    for _ in 0..40 {
+        if matches!(
+            board.runner.state().waiting_for,
+            WaitingFor::GameOver { .. }
+        ) {
+            break;
+        }
+        let snapshot = board.runner.state().clone();
+        if board.runner.act(GameAction::PassPriority).is_err() {
+            break;
+        }
+        if matches!(
+            board.runner.state().waiting_for,
+            WaitingFor::GameOver { .. }
+        ) {
+            pre_win = Some(snapshot);
+            break;
+        }
+    }
+    let pre = pre_win.expect("idx18 ON must reach a §3-shortcut GameOver within 40 beats");
+    assert!(
+        !pre.loop_detect_ring.is_empty() && pre.loop_detection.is_on(),
+        "the captured pre-win state must carry a populated ring with the detector ON"
+    );
+
+    // ON probe: re-applying the winning beat from a clone ends the game (deterministic).
+    let on_res = GameRunner::from_state(pre.clone())
+        .act(GameAction::PassPriority)
+        .expect("re-applying the winning beat must dispatch");
+    assert!(
+        matches!(on_res.waiting_for, WaitingFor::GameOver { winner: Some(_) }),
+        "with loop_detection ON, the captured beat shortcuts the loop to a win"
+    );
+
+    // OFF probe: same pre-state and same populated ring, only the flag flipped (set
+    // directly on the clone so the ring is RETAINED — this isolates the §3 shortcut
+    // flag gate, which is all this probe exercises).
+    let mut off_state = pre;
+    off_state.loop_detection = LoopDetectionMode::Off;
+    assert!(
+        !off_state.loop_detect_ring.is_empty(),
+        "the OFF probe must keep the populated ring so only the flag differs"
+    );
+    let off_res = GameRunner::from_state(off_state)
+        .act(GameAction::PassPriority)
+        .expect("re-applying the winning beat must dispatch");
+    assert!(
+        !matches!(off_res.waiting_for, WaitingFor::GameOver { .. }),
+        "with loop_detection OFF, the SAME populated-ring beat must NOT shortcut the game — \
+         only the §3 flag gate differs between the two probes"
+    );
+}
+
+/// PR6-GATE-4 (CONFIG PROVENANCE + IMMUTABILITY): the combo-detector opt-in is a
+/// match-creation setting on `MatchConfig`, projected onto the runtime
+/// `GameState::loop_detection` flag by `set_match_config`, and IMMUTABLE during play.
+/// The mid-game `SetLoopDetection` action was REMOVED as a security fix — previously
+/// any networked seat could flip the whole table's game-ending detector mid-match
+/// (PR #4603 review). There is now no `GameAction` that mutates the flag.
+///
+/// REVERT-FAIL: delete the `self.loop_detection = config.loop_detection` line in
+/// `GameState::set_match_config` ⇒ the ON-projection assertion flips (the detector can
+/// never be enabled), proving the projection is the sole provenance.
+#[test]
+fn pr6_gate_config_provenance_and_immutability() {
+    let mut state = GameScenario::new().build().state().clone();
+
+    // Default config leaves the detector OFF (pre-feature; opt-in invariant #4603).
+    state.set_match_config(MatchConfig::default());
+    assert_eq!(
+        state.loop_detection,
+        LoopDetectionMode::Off,
+        "default MatchConfig must leave the detector OFF"
+    );
+
+    // Opting in via config projects ON onto the runtime gate.
+    state.set_match_config(MatchConfig {
+        loop_detection: LoopDetectionMode::On,
+        ..MatchConfig::default()
+    });
+    assert!(
+        state.loop_detection.is_on(),
+        "set_match_config must project MatchConfig.loop_detection onto the runtime flag"
+    );
+
+    // Immutability: no `GameAction` mutates the flag, so driving a beat leaves it at
+    // the value set at creation. (PassPriority may be a no-op/illegal from this state;
+    // either way the flag must be invariant.)
+    let before = state.loop_detection;
+    let mut runner = GameRunner::from_state(state);
+    let _ = runner.act(GameAction::PassPriority);
+    assert_eq!(
+        runner.state().loop_detection,
+        before,
+        "loop_detection is immutable during play (set only at creation by set_match_config)"
+    );
+}
+
+/// PR6-GATE-5 (LOOP-EQUALITY EXCLUSION): `loop_detection` is control state, excluded
+/// from `impl PartialEq for GameState` (and therefore from `loop_states_equal`), like
+/// `unbounded_resources`. Two states identical except for the flag must compare EQUAL,
+/// or CR 732.2a loop detection / AI-search dedup would see spurious differences.
+///
+/// REVERT-FAIL: add `&& self.loop_detection == other.loop_detection` to the manual
+/// `PartialEq` ⇒ `a == b` becomes false ⇒ both assertions flip.
+#[test]
+fn pr6_gate_loop_detection_excluded_from_equality() {
+    let base = GameScenario::new().build().state().clone();
+    let mut a = base.clone();
+    let mut b = base;
+    a.loop_detection = LoopDetectionMode::On;
+    b.loop_detection = LoopDetectionMode::Off;
+    assert_ne!(
+        a.loop_detection, b.loop_detection,
+        "fixture must actually differ in loop_detection"
+    );
+    assert_eq!(
+        a, b,
+        "manual PartialEq must EXCLUDE loop_detection (control state)"
+    );
+    assert!(
+        crate::types::game_state::loop_states_equal(&a, &b),
+        "CR 732.2a loop_states_equal must EXCLUDE loop_detection"
+    );
+}
+
+/// PR6-GATE-6 (SERDE BACK-COMPAT): a serialized `GameState` predating this field must
+/// deserialize with `loop_detection == Off` (the `#[serde(default)]`), so existing
+/// wire/saved states load as pre-feature. Non-vacuous: dropping `#[serde(default)]`
+/// makes the deserialize fail.
+#[test]
+fn pr6_gate_loop_detection_serde_defaults_off() {
+    let state = GameScenario::new().build().state().clone();
+    let mut json = serde_json::to_value(&state).expect("serialize");
+    // Simulate a pre-field wire state by removing the key.
+    json.as_object_mut()
+        .expect("state serializes as an object")
+        .remove("loop_detection");
+    let restored: GameState = serde_json::from_value(json).expect("deserialize without the field");
+    assert_eq!(
+        restored.loop_detection,
+        LoopDetectionMode::Off,
+        "a state without `loop_detection` must default to Off (pre-feature)"
+    );
+}
+
+/// MP-B (CR 104.2a last-standing): a 4-player table where P0 runs an UNTARGETED
+/// "whenever you gain life, each opponent loses life" drain (Marauding Blight-Priest +
+/// Bloodthirsty Conqueror), all three opponents at 1 life. One drain cycle takes all
+/// three to 0; the CR 704.5a state-based actions eliminate them in ONE simultaneous
+/// batch and CR 104.2a leaves P0 the sole survivor → `GameOver { winner: Some(P0) }`.
+/// This is the NATURAL win (real SBA deaths), not the 2-player §3 shortcut (gated off
+/// at >2 living) — the production path the commander audit validated as safe.
+///
+/// DISCRIMINATION (the audit's revert-probe, run inline): swapping to a TARGETED
+/// "target opponent loses life" drain (Sanguine Bond) drains only ONE chosen opponent
+/// per cycle, so it cannot eliminate all three at once — it stops for an opponent
+/// choice and never reaches a GameOver. If the untargeted assertion were vacuous, this
+/// contrast (same life totals, different drain shape) would not diverge.
+#[test]
+fn mp_each_opponent_drain_natural_win_continues_to_sole_survivor() {
+    let db = card_db();
+    let Some(mut board) = corpus::build_drain_board_n(
+        db,
+        &["Marauding Blight-Priest", "Bloodthirsty Conqueror"],
+        4,
+        &[1, 1, 1],
+        40,
+    ) else {
+        return; // export absent (CI / fresh checkout): skip, never fail spuriously
+    };
+    corpus::seed_lifegain_cascade(&mut board);
+    let trace = corpus::drive_pass_priority(&mut board, 40);
+    let (_, winner) = corpus::first_gameover_beat(&trace)
+        .expect("untargeted each-opponent drain must eliminate every opponent → a winner");
+    assert_eq!(winner, P0, "the sole surviving player P0 wins (CR 104.2a)");
+    let eliminated: Vec<bool> = board
+        .runner
+        .state()
+        .players
+        .iter()
+        .map(|p| p.is_eliminated)
+        .collect();
+    assert_eq!(
+        eliminated,
+        vec![false, true, true, true],
+        "all three opponents eliminated in one simultaneous SBA batch; P0 survives"
+    );
+
+    // DISCRIMINATION: a targeted single-opponent drain at the same life totals cannot
+    // auto-eliminate the whole table — it stops for an opponent choice, no auto-win.
+    let Some(mut targeted) =
+        corpus::build_drain_board_n(db, &["Sanguine Bond", "Exquisite Blood"], 4, &[1, 1, 1], 40)
+    else {
+        return;
+    };
+    corpus::seed_lifegain_cascade(&mut targeted);
+    let ttrace = corpus::drive_pass_priority(&mut targeted, 40);
+    assert!(
+        corpus::first_gameover_beat(&ttrace).is_none(),
+        "a targeted single-opponent drain cannot auto-eliminate all opponents — no auto-win"
+    );
+}
+
+/// MP-D (CR 601/608 targeted resolution): a 4-player table where P0 runs a TARGETED
+/// "whenever you gain life, target opponent loses that much life" drain (Sanguine Bond +
+/// Exquisite Blood) with THREE legal opponents. `auto_select_targets` refuses to choose
+/// among 2+ legal targets, so the trigger STOPS at a target-selection window — it never
+/// silently auto-resolves into a game-ending drain. This is why the targeted shape is
+/// safe in multiplayer: a human (or AI) must pick the victim each iteration.
+///
+/// DISCRIMINATION: the SAME cards with a SINGLE legal opponent (2-player) auto-resolve
+/// to the sole target with no selection window. So the stop is caused by 2+ legal
+/// opponents, not by the card — proving the assertion is not vacuous.
+#[test]
+fn mp_targeted_drain_stops_for_opponent_choice() {
+    let db = card_db();
+    let Some(mut board) = corpus::build_drain_board_n(
+        db,
+        &["Sanguine Bond", "Exquisite Blood"],
+        4,
+        &[20, 20, 20],
+        40,
+    ) else {
+        return; // export absent: skip
+    };
+    corpus::seed_lifegain_cascade(&mut board);
+    let trace = corpus::drive_pass_priority(&mut board, 30);
+    assert!(
+        corpus::first_gameover_beat(&trace).is_none(),
+        "a targeted drain with 3 legal opponents must not auto-resolve to a GameOver"
+    );
+    let last = trace.last().expect("at least one beat");
+    match &last.wf {
+        WaitingFor::TriggerTargetSelection { target_slots, .. } => {
+            assert_eq!(
+                target_slots[0].legal_targets.len(),
+                3,
+                "all three opponents are legal targets (got {:?})",
+                target_slots[0].legal_targets
+            );
+        }
+        other => panic!("expected a target-selection stop, got {other:?}"),
+    }
+
+    // DISCRIMINATION: with a SINGLE legal opponent (2-player), the trigger auto-resolves
+    // to the sole target — no selection window ever appears.
+    let Some(mut duel) =
+        corpus::build_drain_board_n(db, &["Sanguine Bond", "Exquisite Blood"], 2, &[20], 40)
+    else {
+        return;
+    };
+    corpus::seed_lifegain_cascade(&mut duel);
+    let dtrace = corpus::drive_pass_priority(&mut duel, 30);
+    assert!(
+        dtrace
+            .iter()
+            .all(|t| !matches!(t.wf, WaitingFor::TriggerTargetSelection { .. })),
+        "with a single legal opponent the targeted drain auto-resolves — no selection stop"
+    );
+}
+
+/// MP-A (CR 104.4b mandatory DRAW): the live mandatory-loop draw gate fires
+/// `GameOver { winner: None }` when a mandatory iteration repeats a prior NORMALIZED
+/// state — a cycle that made NO net progress. That decision hinges on the exact
+/// predicate `loop_states_equal(normalize_for_loop(a), normalize_for_loop(b))` (the
+/// engine `apply`-loop CR 104.4b block). At a 4-player (Commander, no range-of-influence)
+/// table a true net-ZERO unbreakable loop is a WHOLE-GAME DRAW — never a single winner:
+/// every seat is alive and no resource changed, so the repeat must compare EQUAL (→ the
+/// gate draws) AND no faller can be named (→ not a win). The complementary net-PROGRESS
+/// cycle (one opponent's life fell) must NOT compare equal (→ the gate does not fire and
+/// the game continues — no wrongful draw of a still-advancing loop).
+///
+/// Scope: this pins the 4-player correctness of the draw gate's equality predicate and
+/// the no-false-winner guarantee. A full live auto-resolve of a net-zero loop to
+/// `GameOver{winner:None}` needs a specific net-zero mandatory combo, which the
+/// committed card fixture does not contain (every corpus loop is net-progress).
+///
+/// REVERT-FAIL: the net-progress half — were `loop_states_equal` to ignore life totals,
+/// the faller state would compare EQUAL and a still-progressing loop would wrongly draw;
+/// the `assert!(!loop_states_equal(...))` flips.
+#[test]
+fn mp_unbreakable_net_zero_mandatory_loop_whole_game_draw() {
+    let base = GameState::new(crate::types::format::FormatConfig::standard(), 4, 7);
+    assert_eq!(
+        base.players.iter().filter(|p| !p.is_eliminated).count(),
+        4,
+        "fixture sanity: four living players (no range-of-influence)"
+    );
+
+    // NET-ZERO repeat ⇒ byte-identical normalized state ⇒ the CR 104.4b gate draws.
+    assert!(
+        crate::types::game_state::loop_states_equal(
+            &base.normalize_for_loop(),
+            &base.normalize_for_loop(),
+        ),
+        "a net-zero 4-player repeat must compare EQUAL — the gate then draws (winner:None)"
+    );
+    // A net-zero cycle has no life faller ⇒ no player is named a winner (it is a draw).
+    let zero = crate::analysis::resource::ResourceVector::default();
+    assert_eq!(
+        crate::analysis::loop_check::live_mandatory_loop_winner(&base, &base, &zero),
+        None,
+        "a net-zero loop is a draw, never a single winner — no faller to lose"
+    );
+
+    // NET-PROGRESS contrast (the revert-probe): one opponent's life fell, so the cycle
+    // did NOT return to the same state — the equality is FALSE and the draw gate must
+    // not fire.
+    let mut progressed = base.clone();
+    progressed.players[1].life -= 1;
+    assert!(
+        !crate::types::game_state::loop_states_equal(
+            &base.normalize_for_loop(),
+            &progressed.normalize_for_loop(),
+        ),
+        "a net-progress repeat (an opponent's life fell) must NOT compare equal — \
+         the draw gate must not fire on a still-advancing loop"
     );
 }
 

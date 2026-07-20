@@ -52,6 +52,42 @@ fn entries_to_count_map(entries: &[DeckEntry]) -> HashMap<String, u32> {
     map
 }
 
+/// Restores the single companion promoted from a normal-format sideboard to
+/// the editable current partition before a BetweenGames sideboard submission.
+/// Registered sideboards remain immutable: legal post-board swaps are kept in
+/// `current_main`/`current_sideboard` and only the revealed companion copy is
+/// returned (CR 400.11a).
+fn restore_revealed_sideboard_companions(state: &mut GameState) {
+    if state.format_config.format.uses_commander() {
+        return;
+    }
+
+    for pool in &mut state.deck_pools {
+        let Some(companion) = state
+            .players
+            .iter()
+            .find(|player| player.id == pool.player)
+            .and_then(|player| player.companion.as_ref())
+        else {
+            continue;
+        };
+        let name = &companion.card.card.name;
+        if !pool
+            .registered_sideboard
+            .iter()
+            .any(|entry| entry.card.name == *name)
+        {
+            continue;
+        }
+        let sideboard = std::sync::Arc::make_mut(&mut pool.current_sideboard);
+        if let Some(entry) = sideboard.iter_mut().find(|entry| entry.card.name == *name) {
+            entry.count += 1;
+        } else {
+            sideboard.push(companion.card.clone());
+        }
+    }
+}
+
 fn counts_to_entries(
     counts: &[DeckCardCount],
     card_faces: &HashMap<String, crate::types::card::CardFace>,
@@ -79,6 +115,7 @@ fn build_card_face_map(pool: &PlayerDeckPool) -> HashMap<String, crate::types::c
         .iter()
         .chain(pool.registered_sideboard.iter())
         .chain(pool.registered_commander.iter())
+        .chain(pool.registered_companion.iter())
     {
         faces
             .entry(entry.card.name.clone())
@@ -114,6 +151,9 @@ fn deck_payload_from_current_pools(state: &GameState) -> Result<DeckPayload, Str
             main_deck: (*p.current_main).clone(),
             sideboard: (*p.current_sideboard).clone(),
             commander: (*p.current_commander).clone(),
+            // Dedicated companions are rebuilt from their registered external
+            // slot, never from the consumed current offer.
+            companion: (*p.registered_companion).clone(),
             attraction_deck: Vec::new(),
             planar_deck: Vec::new(),
             scheme_deck: (*p.registered_scheme_deck).clone(),
@@ -134,6 +174,7 @@ fn deck_payload_from_current_pools(state: &GameState) -> Result<DeckPayload, Str
             main_deck: (*p0.current_main).clone(),
             sideboard: (*p0.current_sideboard).clone(),
             commander: (*p0.current_commander).clone(),
+            companion: (*p0.registered_companion).clone(),
             attraction_deck: Vec::new(),
             planar_deck: (*p0.registered_planar_deck).clone(),
             scheme_deck: (*p0.registered_scheme_deck).clone(),
@@ -146,6 +187,7 @@ fn deck_payload_from_current_pools(state: &GameState) -> Result<DeckPayload, Str
             main_deck: (*p1.current_main).clone(),
             sideboard: (*p1.current_sideboard).clone(),
             commander: (*p1.current_commander).clone(),
+            companion: (*p1.registered_companion).clone(),
             attraction_deck: Vec::new(),
             planar_deck: Vec::new(),
             scheme_deck: (*p1.registered_scheme_deck).clone(),
@@ -209,6 +251,7 @@ pub fn handle_game_over_transition(state: &mut GameState) {
     state.match_phase = MatchPhase::BetweenGames;
     state.game_number = state.game_number.saturating_add(1);
     state.sideboard_submitted.clear();
+    restore_revealed_sideboard_companions(state);
     state.next_game_chooser = if let Some(archenemy) = archenemy {
         Some(archenemy)
     } else {
@@ -310,7 +353,13 @@ fn restart_between_games_with_starting_player(
         state.players.len() as u8,
         state.rng_seed.wrapping_add(state.game_number as u64 + 1),
     );
-    next_state.match_config = state.match_config;
+    // CR 732.2a: the between-games rebuild is a fresh `GameState::new` (loop_detection
+    // defaults Off), so adopt the match config through the single authority — a raw
+    // `next_state.match_config = …` would copy the struct but leave the runtime
+    // `loop_detection` flag at the default, silently dropping the opt-in for game 2/3 of
+    // a Bo3 (and archenemy restarts). `set_match_config` projects it, keeping the
+    // detector setting consistent and immutable across every game of the match (#4603).
+    next_state.set_match_config(state.match_config);
     next_state.match_phase = MatchPhase::InGame;
     next_state.match_score = state.match_score;
     next_state.game_number = state.game_number;
@@ -639,6 +688,106 @@ mod tests {
         assert!(!state.players[0].hand.is_empty());
         assert!(!state.players[1].hand.is_empty());
         assert!(!matches!(choose.waiting_for, WaitingFor::GameOver { .. }));
+    }
+
+    /// CR 732.2a opt-in persistence across the ENGINE between-games rebuild. A Bo3 match
+    /// created with the detector On (projected onto `loop_detection` by `set_match_config`)
+    /// must KEEP it On after `restart_between_games_with_starting_player` builds a fresh
+    /// `GameState::new` for game 2. This guards the engine `match_flow` rebuild — distinct
+    /// from the server-core `rebuild_pregame_state` path — which a raw `match_config = …`
+    /// assignment silently drops, because a fresh `GameState::new` defaults the runtime
+    /// `loop_detection` flag to Off (#4603 opt-in/immutability invariant).
+    ///
+    /// REVERT-FAIL: change the rebuild back to `next_state.match_config = state.match_config;`
+    /// ⇒ `next_state.loop_detection` stays at the `GameState::new` default Off and the
+    /// post-restart `On` assertion fails (the opt-in vanishes for game 2/3 of the match).
+    #[test]
+    fn bo3_restart_preserves_loop_detection_opt_in() {
+        use crate::types::game_state::LoopDetectionMode;
+        use crate::types::match_config::MatchConfig;
+
+        let mut state = GameState::new_two_player(17);
+        state.set_match_config(MatchConfig {
+            match_type: MatchType::Bo3,
+            loop_detection: LoopDetectionMode::On,
+        });
+        // Creation-time projection holds for game 1.
+        assert_eq!(state.loop_detection, LoopDetectionMode::On);
+
+        let payload = DeckPayload {
+            player: PlayerDeckPayload {
+                main_deck: vec![entry("P0", 7)],
+                sideboard: vec![entry("P0SB", 1)],
+                commander: vec![],
+                ..Default::default()
+            },
+            opponent: PlayerDeckPayload {
+                main_deck: vec![entry("P1", 7)],
+                sideboard: vec![entry("P1SB", 1)],
+                commander: vec![],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        load_deck_into_state(&mut state, &payload);
+        let _ = start_game(&mut state);
+
+        // Drive to the between-games rebuild for game 2.
+        state.match_phase = MatchPhase::BetweenGames;
+        state.match_score = crate::types::match_config::MatchScore {
+            p0_wins: 1,
+            p1_wins: 0,
+            draws: 0,
+        };
+        state.game_number = 2;
+        state.next_game_chooser = Some(PlayerId(1));
+        state.sideboard_submitted.clear();
+        state.waiting_for = WaitingFor::BetweenGamesSideboard {
+            player: PlayerId(0),
+            game_number: 2,
+            score: state.match_score,
+        };
+
+        apply_as_current(
+            &mut state,
+            GameAction::SubmitSideboard {
+                main: vec![DeckCardCount {
+                    name: "P0".to_string(),
+                    count: 7,
+                }],
+                sideboard: vec![DeckCardCount {
+                    name: "P0SB".to_string(),
+                    count: 1,
+                }],
+            },
+        )
+        .unwrap();
+        apply_as_current(
+            &mut state,
+            GameAction::SubmitSideboard {
+                main: vec![DeckCardCount {
+                    name: "P1".to_string(),
+                    count: 7,
+                }],
+                sideboard: vec![DeckCardCount {
+                    name: "P1SB".to_string(),
+                    count: 1,
+                }],
+            },
+        )
+        .unwrap();
+        apply_as_current(&mut state, GameAction::ChoosePlayDraw { play_first: true }).unwrap();
+
+        // Game 2 is live again...
+        assert_eq!(state.match_phase, MatchPhase::InGame);
+        assert_eq!(state.game_number, 2);
+        // ...and the detector opt-in survived the fresh-state rebuild.
+        assert_eq!(
+            state.loop_detection,
+            LoopDetectionMode::On,
+            "detector opt-in must persist across the engine between-games rebuild"
+        );
+        assert_eq!(state.match_config.loop_detection, LoopDetectionMode::On);
     }
 
     #[test]

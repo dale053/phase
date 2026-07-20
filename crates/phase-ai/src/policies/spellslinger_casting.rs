@@ -123,7 +123,8 @@ impl TacticalPolicy for SpellslingerCastingPolicy {
                 (core_types.contains(&CoreType::Instant) || core_types.contains(&CoreType::Sorcery))
                     && crate::features::control::is_card_draw_parts(abilities)
             };
-            let spell_is_payoff = is_cast_payoff_parts(triggers);
+            let spell_is_payoff =
+                is_cast_payoff_parts(triggers.iter().map(|entry| &entry.definition));
             if spell_is_cantrip && !spell_is_payoff {
                 delta += 0.4;
                 reason_kind = "spellslinger_cantrip_chain";
@@ -158,7 +159,8 @@ impl TacticalPolicy for SpellslingerCastingPolicy {
 
         // Cast-payoff creature: deploying the engine is the highest-priority play.
         // CR 603.1: triggered abilities fire after a spell is cast.
-        if (is_cast_payoff_parts(triggers) || has_prowess_parts(keywords))
+        if (is_cast_payoff_parts(triggers.iter().map(|entry| &entry.definition))
+            || has_prowess_parts(keywords))
             && features
                 .spellslinger_prowess
                 .payoff_names
@@ -178,8 +180,8 @@ impl TacticalPolicy for SpellslingerCastingPolicy {
         // same scope), but documenting the disjunction guards against future
         // tightening of `is_cast_payoff_parts` that would silently demote
         // nth-spell cards into the off-strategy bucket.
-        let is_payoff_card = is_cast_payoff_parts(triggers)
-            || is_nth_spell_payoff_parts(triggers)
+        let is_payoff_card = is_cast_payoff_parts(triggers.iter().map(|entry| &entry.definition))
+            || is_nth_spell_payoff_parts(triggers.iter().map(|entry| &entry.definition))
             || has_prowess_parts(keywords);
         if mv > 4 && !is_is && !is_payoff_card && delta == 0.0 {
             delta -= 0.4;
@@ -366,6 +368,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -409,6 +412,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -470,6 +474,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -527,6 +532,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -557,6 +563,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 3 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
         );
         let (context, config) = make_context(0.8);
@@ -570,6 +577,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -612,6 +620,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {
@@ -647,6 +656,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = SpellslingerCastingPolicy.verdict(&ctx);
         match verdict {

@@ -11,6 +11,12 @@ use crate::strategy_profile::StrategyProfile;
 /// cost of search quality on slow hardware. The same deadline gates expensive
 /// tactical projections so optional lookahead cannot dominate a move.
 ///
+/// Search runs iterative deepening (rung `0 -> max_depth-1`): this budget now
+/// bounds the *rungs* — the deepest fully-completed rung's scores are returned
+/// on expiry (rather than a single fixed-depth pass collapsing to a
+/// tactical-only score). Measurement mode pins the iteration ceiling and never
+/// consults the wall clock, preserving byte-determinism.
+///
 /// Measurement test and duel-suite runs call [`AiConfig::into_measurement`]
 /// to disable this wall-clock cap and remain bounded solely by node/depth
 /// budgets.
@@ -121,6 +127,19 @@ pub struct SearchConfig {
     /// runs still allow projections because they have no wall-clock deadline.
     /// Set to 0 to always run projections.
     pub projection_min_budget_ms: u128,
+    /// Number of determinized opponent-hidden-zone samples to average the
+    /// `score_candidates` ensemble over. `0` disables determinization entirely
+    /// (perfect-information search, byte-identical to the pre-feature path) — the
+    /// disabled sentinel, matching the `max_nodes`/`rollout_samples` numeric-knob
+    /// convention rather than a bool flag. `K > 0` replaces the opponent's real
+    /// hidden hand/library with K resampled plausible worlds and means the
+    /// per-action scores across them (§7 of the determinization plan). Every
+    /// shipped preset sets `0` (perfect-information search) as of the 2026-07-18
+    /// product decision — determinized sampling costs the difficulty ladder its
+    /// monotonicity when shipped. `K > 0` remains an experiment/measurement knob:
+    /// set it directly on `SearchConfig` after construction (as the `search.rs`
+    /// ensemble tests do) to exercise the retained machinery.
+    pub determinization_samples: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +202,7 @@ impl Default for SearchConfig {
             time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
             threat_awareness: ThreatAwareness::None,
             projection_min_budget_ms: 2000,
+            determinization_samples: 0,
         }
     }
 }
@@ -368,6 +388,63 @@ pub struct PolicyPenalties {
     /// Consumed by `EnergyPayoffPolicy`.
     #[serde(default = "default_energy_cast_bonus")]
     pub energy_cast_bonus: f64,
+    /// Penalty for a "wasted cast" the AI should avoid — a spell that whiffs or
+    /// backfires: a legendary duplicate the legend rule will immediately kill, an
+    /// ETB whose only target is illegal, or a creature-targeting spell with no
+    /// legal creature target (beneficial with no own creature, harmful
+    /// creature-only with no opponent creature, or bounce with no opponent
+    /// permanent). Consumed by `AntiSelfHarmPolicy`.
+    #[serde(default = "default_wasted_cast_penalty")]
+    pub wasted_cast_penalty: f64,
+    /// Bonus for untapping the AI's own tapped creature (frees a blocker /
+    /// re-enables a tapped attacker). Consumed by `AntiSelfHarmPolicy`.
+    #[serde(default = "default_untap_own_tapped_bonus")]
+    pub untap_own_tapped_bonus: f64,
+    /// Penalty for an untap effect that would untap an opponent's tapped creature
+    /// (hands them back a blocker/attacker). Consumed by `AntiSelfHarmPolicy`.
+    #[serde(default = "default_untap_opponent_tapped_penalty")]
+    pub untap_opponent_tapped_penalty: f64,
+    /// Penalty for targeting an already-untapped creature with an untap effect —
+    /// no state change, so the effect is wasted. Consumed by `AntiSelfHarmPolicy`.
+    #[serde(default = "default_untap_untapped_penalty")]
+    pub untap_untapped_penalty: f64,
+    /// Penalty for non-lethal removal aimed at a tapped opponent creature during
+    /// the pre-combat main phase — a tapped creature can't block, so there is no
+    /// urgency advantage over waiting. Consumed by `AntiSelfHarmPolicy`.
+    #[serde(default = "default_tapped_removal_no_urgency_penalty")]
+    pub tapped_removal_no_urgency_penalty: f64,
+    /// CR 119.4: Per-point cost of a self-inflicted pay-life activation cost,
+    /// before runtime life-pressure scaling. Mirrors the `player_impact`
+    /// GainLife/LoseLife weight (0.15). Consumed by `SelfCostValuePolicy`.
+    #[serde(default = "default_self_cost_pay_life_per_point")]
+    pub self_cost_pay_life_per_point: f64,
+    /// CR 701.9a: Per-card cost of a self-inflicted discard activation cost (one
+    /// card ≈ one unit of expected value). Consumed by `SelfCostValuePolicy`.
+    #[serde(default = "default_self_cost_discard_per_card")]
+    pub self_cost_discard_per_card: f64,
+    /// CR 701.13a: Per-card cost of exiling a card from the AI's own graveyard
+    /// as an activation cost — cheap unless the deck is graveyard-committed.
+    /// Consumed by `SelfCostValuePolicy`.
+    #[serde(default = "default_self_cost_exile_graveyard_per_card")]
+    pub self_cost_exile_graveyard_per_card: f64,
+    /// One card-equivalent of patience that cancels Cycling's generic activation
+    /// edge while leaving tactical payoffs free to justify cycling.
+    /// Consumed by `CyclingDisciplinePolicy`.
+    #[serde(default = "default_cycling_patience_penalty")]
+    pub cycling_patience_penalty: f64,
+    /// Stronger finite penalty for cycling away the sole land still needed by
+    /// the current deck plan. Consumed by `CyclingDisciplinePolicy`.
+    #[serde(default = "default_cycling_needed_land_penalty")]
+    pub cycling_needed_land_penalty: f64,
+    /// CR 732.2a / CR 104.2a: bonus for proposing an `UntilLethal` loop shortcut whose latched
+    /// `predicted_winner` IS the proposer — the crown ends the game in their favor, and the only
+    /// other outcome (`until_lethal_fallback`) restores the board a decline would have produced.
+    /// Game-deciding ⇒ the default lands in the `critical` band (5.0, 15.0]. Consumed by
+    /// `LoopShortcutPolicy`; fed through `PolicyVerdict::score`, which auto-bands and clamps to
+    /// `CRITICAL_MAX`. (The losing / no-crown cases are `PolicyVerdict::reject`s and take no
+    /// scalar.)
+    #[serde(default = "default_loop_shortcut_winning_declare_bonus")]
+    pub loop_shortcut_winning_declare_bonus: f64,
 }
 
 impl Default for PolicyPenalties {
@@ -421,8 +498,70 @@ impl Default for PolicyPenalties {
             etb_payoff_cast_bonus: default_etb_payoff_cast_bonus(),
             mill_cast_bonus: default_mill_cast_bonus(),
             energy_cast_bonus: default_energy_cast_bonus(),
+            wasted_cast_penalty: default_wasted_cast_penalty(),
+            untap_own_tapped_bonus: default_untap_own_tapped_bonus(),
+            untap_opponent_tapped_penalty: default_untap_opponent_tapped_penalty(),
+            untap_untapped_penalty: default_untap_untapped_penalty(),
+            tapped_removal_no_urgency_penalty: default_tapped_removal_no_urgency_penalty(),
+            self_cost_pay_life_per_point: default_self_cost_pay_life_per_point(),
+            self_cost_discard_per_card: default_self_cost_discard_per_card(),
+            self_cost_exile_graveyard_per_card: default_self_cost_exile_graveyard_per_card(),
+            cycling_patience_penalty: default_cycling_patience_penalty(),
+            cycling_needed_land_penalty: default_cycling_needed_land_penalty(),
+            loop_shortcut_winning_declare_bonus: default_loop_shortcut_winning_declare_bonus(),
         }
     }
+}
+
+fn default_wasted_cast_penalty() -> f64 {
+    -8.0
+}
+fn default_untap_own_tapped_bonus() -> f64 {
+    8.0
+}
+fn default_untap_opponent_tapped_penalty() -> f64 {
+    -20.0
+}
+fn default_untap_untapped_penalty() -> f64 {
+    -6.0
+}
+fn default_tapped_removal_no_urgency_penalty() -> f64 {
+    -5.0
+}
+fn default_self_cost_pay_life_per_point() -> f64 {
+    0.15
+}
+fn default_self_cost_discard_per_card() -> f64 {
+    1.0
+}
+fn default_self_cost_exile_graveyard_per_card() -> f64 {
+    0.15
+}
+
+fn default_cycling_patience_penalty() -> f64 {
+    -1.0
+}
+fn default_cycling_needed_land_penalty() -> f64 {
+    -2.0
+}
+
+/// 8.0 = mid-`critical` band. Sized for the HEURISTIC branch, which adds the tactical score RAW:
+/// it turns the measured 0.5-vs-0.4 coinflip on a GUARANTEED win into ~88% declare at VeryEasy
+/// (T = 4.0) and ~98% at Easy (T = 2.0). That is the branch where nothing else can differentiate
+/// the two candidates.
+///
+/// On the SEARCH branch (Medium and up) the score is multiplied by `tactical_weight`: 0.1 at a
+/// quiesced `LoopShortcut` node, or 0.35 if an opponent's object is on the stack (the offer is
+/// raised at a priority window, which does not imply an empty stack). So this becomes a
+/// +0.8..+2.8 move-ordering / tie-break nudge on top of the beam's own continuation value, which
+/// already sees the CR 104.2a crown. It is deliberately NOT sized to dominate that value, and
+/// deliberately NOT saturated to `CRITICAL_MAX`: a VeryEasy AI is allowed to miss a free win.
+///
+/// The symmetric losing case is a `Reject` (`-inf`), which is temperature- AND weight-IMMUNE
+/// (`-inf * 0.1 == -inf * 0.35 == -inf`; `exp(-inf / T) == 0` for every T > 0) — no difficulty
+/// ever throws the game away.
+fn default_loop_shortcut_winning_declare_bonus() -> f64 {
+    8.0
 }
 
 fn default_lethality_tapout_penalty() -> f64 {
@@ -615,6 +754,50 @@ pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[
         "energy_cast_bonus",
         "new EnergyPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
     ),
+    (
+        "wasted_cast_penalty",
+        "AntiSelfHarmPolicy magnitude lifted from a raw literal (value-preserving); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "untap_own_tapped_bonus",
+        "AntiSelfHarmPolicy magnitude lifted from a raw literal (value-preserving); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "untap_opponent_tapped_penalty",
+        "AntiSelfHarmPolicy magnitude lifted from a raw literal (value-preserving); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "untap_untapped_penalty",
+        "AntiSelfHarmPolicy magnitude lifted from a raw literal (value-preserving); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "tapped_removal_no_urgency_penalty",
+        "AntiSelfHarmPolicy magnitude lifted from a raw literal (value-preserving); awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "self_cost_pay_life_per_point",
+        "new SelfCostValuePolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "self_cost_discard_per_card",
+        "new SelfCostValuePolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "self_cost_exile_graveyard_per_card",
+        "new SelfCostValuePolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "cycling_patience_penalty",
+        "CyclingDisciplinePolicy one-card-equivalent value cancels the generic +1 activation prior; explicitly untuned pending broader paired-seed calibration",
+    ),
+    (
+        "cycling_needed_land_penalty",
+        "CyclingDisciplinePolicy sole-needed-land value occupies the finite strong band; explicitly untuned pending broader paired-seed calibration",
+    ),
+    (
+        "loop_shortcut_winning_declare_bonus",
+        "LoopShortcutPolicy band selector for a game-deciding CR 104.2a crown; deliberately kept OUT of the CMA-ES penalties vector — win-rate gradients from games that never reach a WaitingFor::LoopShortcut node would tune a win-detector into noise",
+    ),
 ];
 
 /// Full AI configuration combining difficulty, search, and evaluation settings.
@@ -668,6 +851,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
                 threat_awareness: ThreatAwareness::None,
                 projection_min_budget_ms: 0,
+                determinization_samples: 0,
             },
         ),
         AiDifficulty::Easy => (
@@ -691,6 +875,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
                 threat_awareness: ThreatAwareness::None,
                 projection_min_budget_ms: 0,
+                determinization_samples: 0,
             },
         ),
         AiDifficulty::Medium => (
@@ -714,6 +899,12 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
                 threat_awareness: ThreatAwareness::ArchetypeOnly,
                 projection_min_budget_ms: 2000,
+                // K=0: perfect-information search. Product decision 2026-07-18 —
+                // all search tiers ship the strength floor; determinized sampling
+                // (K>0) remains config-reachable for experiments/measurement but
+                // cost the ladder its monotonicity when shipped (see
+                // .agents/ai-strength/u1-all-tiers-cheat/PLAN.md).
+                determinization_samples: 0,
             },
         ),
         AiDifficulty::Hard => (
@@ -737,6 +928,12 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
                 threat_awareness: ThreatAwareness::Full,
                 projection_min_budget_ms: 2000,
+                // K=0: perfect-information search. Product decision 2026-07-18 —
+                // all search tiers ship the strength floor; determinized sampling
+                // (K>0) remains config-reachable for experiments/measurement but
+                // cost the ladder its monotonicity when shipped (see
+                // .agents/ai-strength/u1-all-tiers-cheat/PLAN.md).
+                determinization_samples: 0,
             },
         ),
         AiDifficulty::VeryHard => (
@@ -760,6 +957,12 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 time_budget_ms: AI_SEARCH_TIME_BUDGET_MS,
                 threat_awareness: ThreatAwareness::Full,
                 projection_min_budget_ms: 2000,
+                // K=0: perfect-information search. Product decision 2026-07-18 —
+                // all search tiers ship the strength floor; determinized sampling
+                // (K>0) remains config-reachable for experiments/measurement but
+                // cost the ladder its monotonicity when shipped (see
+                // .agents/ai-strength/u1-all-tiers-cheat/PLAN.md).
+                determinization_samples: 0,
             },
         ),
         AiDifficulty::CEDH => (
@@ -785,6 +988,12 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
                 // == AI_SEARCH_TIME_BUDGET_MS: projections only at turn start,
                 // before nodes consume the budget
                 projection_min_budget_ms: 1500,
+                // K=0: perfect-information search. Product decision 2026-07-18 —
+                // all search tiers ship the strength floor; determinized sampling
+                // (K>0) remains config-reachable for experiments/measurement but
+                // cost the ladder its monotonicity when shipped (see
+                // .agents/ai-strength/u1-all-tiers-cheat/PLAN.md).
+                determinization_samples: 0,
             },
         ),
     };
@@ -805,11 +1014,14 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
     };
 
     // WASM platform constraints: reduce search budgets. AI computation runs in
-    // a Web Worker so it does not block the UI thread. Wall-clock deadlines are
-    // intentionally absent — bounds are set by `max_depth` / `max_nodes` /
-    // `rollout_depth` instead, so AI quality is consistent regardless of host
-    // speed. Wall-clock capping was previously needed to hide a deep-clone
-    // perf regression; the Arc-share migration removed that cost.
+    // a Web Worker so it does not block the UI thread. Budgets are reduced via
+    // `max_depth` / `max_nodes` / `rollout_depth`. The wall-clock deadline
+    // remains live on WASM per `AI_SEARCH_TIME_BUDGET_MS` (the single source of
+    // truth, applied across all difficulties and platforms): it caps
+    // user-visible latency on slow browser hardware and is load-bearing for
+    // `can_afford_projection`'s projection throttle (`policies/context.rs`),
+    // which treats a missing deadline as "always affordable" and would otherwise
+    // run uncached ~1.5s multi-turn projections on every decision.
     if platform == Platform::Wasm {
         config.search.max_depth = config.search.max_depth.min(2);
         config.search.max_nodes = config.search.max_nodes * 2 / 3;
@@ -904,6 +1116,10 @@ mod tests {
         assert_eq!(config.search.max_depth, 2);
         assert_eq!(config.search.max_nodes, 24);
         assert_eq!(config.search.rollout_depth, 1);
+        // Every shipped preset is perfect-information search (K=0); Medium is no
+        // longer a special "floor" but the universal setting (product decision
+        // 2026-07-18).
+        assert_eq!(config.search.determinization_samples, 0);
     }
 
     #[test]
@@ -914,6 +1130,8 @@ mod tests {
         assert_eq!(config.search.max_depth, 3);
         assert_eq!(config.search.max_nodes, 48);
         assert_eq!(config.search.rollout_depth, 2);
+        // Hard ships perfect-information search (K=0) like every tier.
+        assert_eq!(config.search.determinization_samples, 0);
     }
 
     #[test]
@@ -925,6 +1143,7 @@ mod tests {
         assert_eq!(config.search.max_nodes, 64);
         assert_eq!(config.search.max_branching, 5);
         assert_eq!(config.search.rollout_samples, 2);
+        assert_eq!(config.search.determinization_samples, 0);
     }
 
     #[test]
@@ -935,6 +1154,33 @@ mod tests {
         assert!(wasm.search.max_depth <= 2);
         assert!(wasm.search.max_nodes < native.search.max_nodes);
         assert!(wasm.search.rollout_depth <= native.search.rollout_depth);
+        assert_eq!(wasm.search.determinization_samples, 0);
+    }
+
+    #[test]
+    fn all_search_tiers_ship_perfect_information() {
+        // Product decision 2026-07-18: every shipped preset is K=0 (perfect-info
+        // "strength floor") on every platform and player count. K>0 is an
+        // experiment/measurement knob only — the ensemble machinery is covered by
+        // search.rs ensemble tests, which set K manually.
+        for diff in [
+            AiDifficulty::VeryEasy,
+            AiDifficulty::Easy,
+            AiDifficulty::Medium,
+            AiDifficulty::Hard,
+            AiDifficulty::VeryHard,
+            AiDifficulty::CEDH,
+        ] {
+            for platform in [Platform::Native, Platform::Wasm] {
+                for players in [2u8, 4, 6] {
+                    let c = create_config_for_players(diff, platform, players);
+                    assert_eq!(
+                        c.search.determinization_samples, 0,
+                        "{diff:?}/{platform:?}/{players}p"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1096,6 +1342,7 @@ mod tests {
         ));
         assert_eq!(config.search.projection_min_budget_ms, 1500);
         assert_eq!(config.search.time_budget_ms, AI_SEARCH_TIME_BUDGET_MS);
+        assert_eq!(config.search.determinization_samples, 0);
     }
 
     #[test]
@@ -1148,6 +1395,26 @@ mod tests {
         let p = PolicyPenalties::default();
         assert_eq!(p.combo_progress_this_turn_bonus, 15.0);
         assert_eq!(p.combo_progress_next_turn_bonus, 5.0);
+    }
+
+    /// Value-identity guard for the `AntiSelfHarmPolicy` magnitudes migrated from
+    /// raw literals into config. Each default MUST equal the exact literal the
+    /// bespoke code used before the lift, so a mistyped port is caught here.
+    #[test]
+    fn policy_penalties_default_anti_self_harm_migrated_magnitudes() {
+        let p = PolicyPenalties::default();
+        assert_eq!(p.wasted_cast_penalty, -8.0);
+        assert_eq!(p.untap_own_tapped_bonus, 8.0);
+        assert_eq!(p.untap_opponent_tapped_penalty, -20.0);
+        assert_eq!(p.untap_untapped_penalty, -6.0);
+        assert_eq!(p.tapped_removal_no_urgency_penalty, -5.0);
+    }
+
+    #[test]
+    fn policy_penalties_default_cycling_discipline_magnitudes() {
+        let p = PolicyPenalties::default();
+        assert_eq!(p.cycling_patience_penalty, -1.0);
+        assert_eq!(p.cycling_needed_land_penalty, -2.0);
     }
 
     #[test]

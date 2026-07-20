@@ -1,4 +1,4 @@
-//! Shared combo-corpus harness: the 53-row acceptance corpus + the bespoke driver
+//! Shared combo-corpus harness: the 54-row acceptance corpus + the bespoke driver
 //! toolkit, parameterized on a `&CardDatabase` so BOTH the `#[cfg(test)]`
 //! acceptance suite (`corpus_tests`) and the `combo-verify` CLI drive ONE shared
 //! implementation. Gated `#[cfg(any(test, feature = "combo-verify"))]`, so it is
@@ -18,16 +18,18 @@ use crate::analysis::resource::ResourceAxis;
 use crate::analysis::{detect_loop, LoopCertificate, LoopProbe, WinKind};
 use crate::database::CardDatabase;
 use crate::game::scenario::{GameRunner, GameScenario, P0, P1};
+use crate::game::scenario_db::GameScenarioDbExt;
 use crate::types::ability::TargetRef;
-use crate::types::actions::GameAction;
+use crate::types::actions::{GameAction, PrecastCopyShortcutResponse};
 use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
-use crate::types::mana::ManaType;
+use crate::types::mana::{ManaType, ManaUnit};
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
+use crate::types::zones::Zone;
 
 // ===========================================================================
-// Data layer: the 53-row corpus.
+// Data layer: the 54-row corpus.
 // ===========================================================================
 
 /// One row of the acceptance corpus: a combo, its documented unbounded resource
@@ -103,7 +105,7 @@ pub enum DeferralBucket {
     Other,
 }
 
-/// The full 53-row acceptance corpus: 3 driving combos + the 50 card-disjoint
+/// The full 54-row acceptance corpus: 3 driving combos + the 51 card-disjoint
 /// corpus combos. The 4 `gated_on`-nonempty rows correspond to the cards with
 /// Unimplemented parts; the 37 `deferral`-nonempty rows are the non-driven,
 /// non-gated combos with a measured structural deferral reason.
@@ -292,6 +294,14 @@ pub(crate) const CORPUS: &[ComboRow] = &[
         family: ResourceFamily::Drain,
         win_kind: WinKind::LethalDamage,
         gated_on: Some("Professor Onyx"),
+        deferral: None,
+    },
+    ComboRow {
+        name: "Witherbloom Apprentice + Chain of Smog",
+        cards: &["Witherbloom Apprentice", "Chain of Smog"],
+        family: ResourceFamily::Drain,
+        win_kind: WinKind::LethalDamage,
+        gated_on: None,
         deferral: None,
     },
     ComboRow {
@@ -661,12 +671,15 @@ pub struct RowReport {
 /// `Offline` drives the combo's bespoke action cycle and classifies the offline
 /// [`detect_loop`] certificate; `LiveDrain` drives the two drain cascades through
 /// the per-beat `apply(PassPriority)` reducer and classifies the live `GameOver`.
+/// `PrecastShortcut` uses the separate finite reducer route, proving nonlethal
+/// priority, life drain, and copy lineage without requiring a `GameOver` endpoint.
 pub(crate) enum ComboDriver {
     Offline(fn(&CardDatabase) -> Option<LoopCertificate>),
     LiveDrain,
+    PrecastShortcut,
 }
 
-/// Static map `idx -> driver` for the 12 confirmable rows. The single source of
+/// Static map `idx -> driver` for the 13 confirmable rows. The single source of
 /// truth for "which rows are driven" (the `#[cfg(test)]` meta/partition tests read
 /// it, so adding a driver here is automatically reflected — no hand-listed index
 /// array to drift).
@@ -682,7 +695,8 @@ pub(crate) const DRIVERS: &[(usize, ComboDriver)] = &[
     (14, ComboDriver::Offline(drive_offline_marwyn_sword)),
     (17, ComboDriver::LiveDrain),
     (18, ComboDriver::LiveDrain),
-    (49, ComboDriver::Offline(drive_offline_spike_archangel)),
+    (22, ComboDriver::PrecastShortcut),
+    (50, ComboDriver::Offline(drive_offline_spike_archangel)),
 ];
 
 /// Number of rows in the corpus.
@@ -756,6 +770,62 @@ pub(crate) fn classify_live(row: &ComboRow, outcome: Option<(usize, PlayerId)>) 
     }
 }
 
+struct PrecastShortcutOutcome {
+    original_chain_id: ObjectId,
+    copy_lineage: Vec<(ObjectId, ObjectId)>,
+    drained_opponent: bool,
+    ended_at_nonlethal_priority: bool,
+}
+
+/// Classify the finite Witherbloom route without treating a nonlethal shortcut
+/// as a live `GameOver`. The pre-cast engine route proves one fixed, terminating
+/// copy lineage; the corpus records the combo's documented drain / lethal family
+/// while the runtime assertion keeps the actual driven state nonlethal.
+fn classify_precast_shortcut(row: &ComboRow, outcome: Option<PrecastShortcutOutcome>) -> RowStatus {
+    let Some(outcome) = outcome else {
+        return RowStatus::Failed {
+            detail: "pre-cast shortcut driver did not reach its finite route".to_string(),
+        };
+    };
+    let Some((first_original_id, _)) = outcome.copy_lineage.first() else {
+        return RowStatus::Failed {
+            detail: "pre-cast shortcut produced no copied-spell lineage".to_string(),
+        };
+    };
+    let lineage_is_exact = outcome.copy_lineage.len() == 3
+        && *first_original_id == outcome.original_chain_id
+        && outcome
+            .copy_lineage
+            .iter()
+            .enumerate()
+            .all(|(index, (original, copy))| {
+                *original
+                    == if index == 0 {
+                        outcome.original_chain_id
+                    } else {
+                        outcome.copy_lineage[index - 1].1
+                    }
+                    && original != copy
+            });
+    if outcome.drained_opponent
+        && outcome.ended_at_nonlethal_priority
+        && lineage_is_exact
+        && row.family == ResourceFamily::Drain
+        && row.win_kind == WinKind::LethalDamage
+    {
+        RowStatus::Confirmed {
+            unbounded: vec![ResourceAxis::Life(P1)],
+            win_kind: WinKind::LethalDamage,
+        }
+    } else {
+        RowStatus::Failed {
+            detail:
+                "pre-cast shortcut did not prove drain, nonlethal priority, and exact copy lineage"
+                    .to_string(),
+        }
+    }
+}
+
 /// THE shared entry point both the `#[cfg(test)]` tests and the CLI call. Pure
 /// dispatch (no game logic): gated → `Gated`; a driven row → run its driver and
 /// classify; otherwise → `Deferred` with the row's declared structural bucket.
@@ -767,6 +837,9 @@ pub fn drive_row(db: &CardDatabase, idx: usize) -> RowReport {
         match driver {
             ComboDriver::Offline(f) => classify_status(row, f(db)),
             ComboDriver::LiveDrain => classify_live(row, drive_live_drain(db, idx)),
+            ComboDriver::PrecastShortcut => {
+                classify_precast_shortcut(row, drive_precast_shortcut(db))
+            }
         }
     } else {
         match row.deferral {
@@ -784,6 +857,101 @@ pub fn drive_row(db: &CardDatabase, idx: usize) -> RowReport {
         expected_win_kind: row.win_kind,
         status,
     }
+}
+
+/// Drive the fixed, nonlethal Witherbloom Apprentice + Chain of Smog route
+/// through the actual cast and pre-cast reducer protocol. The test starts with
+/// enough life to make the engine's three-copy route finite and nonlethal; it
+/// never infers life totals in a consumer layer or waits for a `GameOver`.
+fn drive_precast_shortcut(db: &CardDatabase) -> Option<PrecastShortcutOutcome> {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_life(P1, 20);
+    scenario.add_real_card(P0, "Witherbloom Apprentice", Zone::Battlefield, db);
+    let chain = scenario.add_real_card(P0, "Chain of Smog", Zone::Hand, db);
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Colorless, ObjectId(9_900), false, Vec::new()),
+            ManaUnit::new(ManaType::Black, ObjectId(9_901), false, Vec::new()),
+        ],
+    );
+    let mut runner = scenario.build();
+    let chain_card_id = runner.state().objects.get(&chain)?.card_id;
+
+    runner
+        .act(GameAction::CastSpell {
+            object_id: chain,
+            card_id: chain_card_id,
+            targets: Vec::new(),
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        })
+        .ok()?;
+    for _ in 0..8 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TargetSelection { .. } => {
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Player(P0)),
+                    })
+                    .ok()?;
+            }
+            WaitingFor::ManaPayment { .. } => {
+                runner.act(GameAction::PassPriority).ok()?;
+            }
+            WaitingFor::PrecastCopyShortcutOffer { .. } => break,
+            _ => return None,
+        }
+    }
+
+    let epoch = match &runner.state().waiting_for {
+        WaitingFor::PrecastCopyShortcutOffer { epoch, .. } => *epoch,
+        _ => return None,
+    };
+    if runner.state().stack.len() != 2 {
+        return None;
+    }
+    runner
+        .act(GameAction::PrecastCopyShortcut {
+            epoch,
+            response: PrecastCopyShortcutResponse::Propose { route_id: epoch },
+        })
+        .ok()?;
+    let response_epoch = match &runner.state().waiting_for {
+        WaitingFor::RespondToPrecastCopyShortcut { player, epoch, .. } if *player == P1 => *epoch,
+        _ => return None,
+    };
+    let result = runner
+        .act(GameAction::PrecastCopyShortcut {
+            epoch: response_epoch,
+            response: PrecastCopyShortcutResponse::Accept,
+        })
+        .ok()?;
+    let copy_lineage = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            crate::types::events::GameEvent::SpellCopied {
+                original_id,
+                object_id,
+                ..
+            } => Some((*original_id, *object_id)),
+            _ => None,
+        })
+        .collect();
+    let opponent = runner
+        .state()
+        .players
+        .iter()
+        .find(|player| player.id == P1)?;
+    Some(PrecastShortcutOutcome {
+        original_chain_id: chain,
+        copy_lineage,
+        drained_opponent: opponent.life < 20,
+        ended_at_nonlethal_priority: !opponent.is_eliminated
+            && runner.state().stack.is_empty()
+            && matches!(&runner.state().waiting_for, WaitingFor::Priority { .. }),
+    })
 }
 
 // ===========================================================================
@@ -839,7 +1007,7 @@ pub(crate) struct ComboBoard {
 
 /// Build a board with the named permanents installed on P0's battlefield, a large
 /// finite mana pool floated (so mana-cost abilities can pay, while a mana-GAIN
-/// axis is still measurable — not `debug_infinite_mana`), and layers settled.
+/// axis is still measurable — not `unbounded_resources`), and layers settled.
 /// `None` if any name is missing from `db`. Auras are installed but NOT
 /// auto-attached (each driver attaches them to the correct host).
 pub(crate) fn build_board(db: &CardDatabase, cards: &[&str]) -> Option<ComboBoard> {
@@ -1154,6 +1322,16 @@ pub(crate) fn resolve_to_priority(probe: &mut LoopProbe, prefer_target: Option<T
                     break;
                 }
             }
+            // CR 701.34a: proliferate — choose EVERY eligible counter-bearer
+            // (maximal proliferate). A preserved-`Generic` growth loop (Pentad
+            // Prism charge / The One Ring burden) grows all its markers each cycle;
+            // selecting the full eligible set is the general, card-agnostic answer.
+            WaitingFor::ProliferateChoice { eligible, .. } => {
+                let targets = eligible.clone();
+                if probe.act(GameAction::SelectTargets { targets }).is_err() {
+                    break;
+                }
+            }
             _ => break,
         }
     }
@@ -1432,7 +1610,7 @@ pub(crate) fn drive_offline_grim_power(db: &CardDatabase) -> Option<LoopCertific
 /// removes a counter to gain 2 life; Archangel returns a counter to each creature.
 /// Board identical modulo counters; unbounded axes are counters + life.
 pub(crate) fn drive_offline_spike_archangel(db: &CardDatabase) -> Option<LoopCertificate> {
-    let mut board = build_board(db, CORPUS[49].cards)?;
+    let mut board = build_board(db, CORPUS[50].cards)?;
     let spike = board.ids[0];
     {
         // CR 122: Spike Feeder "enters with two +1/+1 counters" — seed them (the
@@ -1556,6 +1734,209 @@ pub(crate) fn drive_offline_kilo_freed_relic(db: &CardDatabase) -> Option<LoopCe
     })
 }
 
+/// PR-7 acceptance — PENTAD PRISM under the KILO + FREED + RELIC proliferate engine.
+/// The same mana-neutral proliferate loop as [`drive_offline_kilo_freed_relic`], but
+/// with a real Pentad Prism seeded with one charge counter on the board. Each cycle's
+/// proliferate (CR 701.34a) drives the preserved-`Generic` charge counter (CR 122.1)
+/// strictly upward by one; the board is otherwise identical, so the cycle is certified
+/// via `loop_states_cover_modulo_counter_growth` (the constant-depth equality path
+/// fails on the growing charge). Certificate classifies `WinKind::Advantage`
+/// (CR 104.4b optional loop), naming the counter axis `Counter(Other, Other)`.
+pub(crate) fn drive_offline_pentad_prism(db: &CardDatabase) -> Option<LoopCertificate> {
+    drive_offline_pentad_prism_seeded(db, 1)
+}
+
+/// Seeded core of [`drive_offline_pentad_prism`]. `seed_charge` is the number of charge
+/// counters directly placed on the installed Pentad Prism (Sunburst, CR 702.44a, only
+/// runs as an enters replacement for a CAST spell, so a directly-installed Pentad enters
+/// with zero). `seed_charge == 0` is the dead-loop CONTROL: proliferate finds no eligible
+/// counter to grow, so the cycle degrades to the pure Kilo proliferate loop (board
+/// identical, cert carries the proliferate trigger axis but NO counter axis).
+pub(crate) fn drive_offline_pentad_prism_seeded(
+    db: &CardDatabase,
+    seed_charge: u32,
+) -> Option<LoopCertificate> {
+    let mut board = build_board(db, CORPUS[1].cards)?;
+    let kilo = board.ids[0];
+    let freed = board.ids[1];
+    let relic = board.ids[2];
+    attach_aura(board.runner.state_mut(), freed, kilo);
+    let pentad = install_on_battlefield(board.runner.state_mut(), db, "Pentad Prism", P0)?;
+    {
+        let state = board.runner.state_mut();
+        if seed_charge > 0 {
+            if let Some(o) = state.objects.get_mut(&pentad) {
+                o.counters.insert(
+                    crate::types::counter::CounterType::Generic("charge".to_string()),
+                    seed_charge,
+                );
+            }
+        }
+        settle_layers(state);
+    }
+    let relic_tap_creature = board.runner.state().objects[&relic]
+        .abilities
+        .iter()
+        .position(|a| {
+            matches!(
+                a.cost,
+                Some(crate::types::ability::AbilityCost::TapCreatures { .. })
+            )
+        })?;
+    let freed_untap = ability_index_where(board.runner.state(), freed, is_untap_effect)?;
+    run_combo(board, |probe| {
+        // Tap Kilo via Relic's tap-a-creature cost (fires Kilo's proliferate trigger,
+        // which grows Pentad's charge), resolve, then untap Kilo via Freed.
+        activate_and_resolve(
+            probe,
+            relic,
+            relic_tap_creature,
+            Some(TargetRef::Object(kilo)),
+        );
+        activate_and_resolve(probe, freed, freed_untap, Some(TargetRef::Object(kilo)));
+    })
+}
+
+/// PR-7 54th — WALKING BALLISTA under the KILO + FREED + RELIC proliferate engine
+/// (mana-neutral). The 52nd/53rd/54th trilogy on one engine: 52nd poison, 53rd mana,
+/// 54th DAMAGE. Each cycle: Relic taps Kilo → Kilo's "becomes tapped: proliferate"
+/// grows Ballista's monotone +1/+1 counter (CR 701.34a / CR 122.1a); Freed untaps
+/// Kilo for {U} (mana net 0); Ballista removes a +1/+1 counter to deal 1 to the
+/// opponent (CR 120.3a). Proliferate runs BEFORE the ping so the count is ≥ seed at
+/// every intra-cycle frame (seed 1 → 2 → 1), keeping Ballista a live ≥1/1 (never a
+/// 0/0 that would die to CR 704.5f). Board identical modulo the monotone +1/+1
+/// (projected out, resource.rs:2481), +1 damage/cycle ⇒ `detect_loop` certifies
+/// `WinKind::LethalDamage`, naming `DamageDealt(P1)`.
+///
+/// `seed_counters == 0` is the X=0 dead-loop CONTROL: Ballista enters a 0/0 with no
+/// counter to remove, dies to the SBA (CR 704.5f) during the first activation, so the
+/// ping activation is rejected (`activate_and_resolve` returns `false`, a graceful
+/// no-op — NOT `drive_ballista_ping`, which `.expect()`s and would panic here) and the
+/// cycle degrades to the pure Kilo/Freed/Relic proliferate loop: a `Some` cert with
+/// `WinKind::Advantage` and NO damage axis. Standalone (not in `DRIVERS`, no `CORPUS`
+/// row) — mirrors `drive_offline_pentad_prism_seeded`; the Damage/`LethalDamage` family
+/// is already the corpus's row 0 (Heliod+Ballista), so no new row is warranted.
+pub(crate) fn drive_offline_kilo_freed_relic_ballista(
+    db: &CardDatabase,
+    seed_counters: u32,
+) -> Option<LoopCertificate> {
+    use crate::types::ability::{AbilityCost, Effect};
+
+    let mut board = build_board(db, CORPUS[1].cards)?;
+    let kilo = board.ids[0];
+    let freed = board.ids[1];
+    let relic = board.ids[2];
+    attach_aura(board.runner.state_mut(), freed, kilo);
+    let ballista = install_on_battlefield(board.runner.state_mut(), db, "Walking Ballista", P0)?;
+    {
+        let state = board.runner.state_mut();
+        if seed_counters > 0 {
+            if let Some(o) = state.objects.get_mut(&ballista) {
+                // CR 122.1a: +1/+1 counters (the X counters a cast Ballista enters with)
+                // set its P/T; seeded directly since a directly-installed permanent runs
+                // no enters replacement.
+                o.counters.insert(
+                    crate::types::counter::CounterType::Plus1Plus1,
+                    seed_counters,
+                );
+            }
+        }
+        settle_layers(state);
+    }
+    // Relic's "tap a creature: add mana" ability (the one that taps Kilo, firing its
+    // proliferate trigger) — found by its `TapCreatures` cost, not a literal index.
+    let relic_tap_creature = board.runner.state().objects[&relic]
+        .abilities
+        .iter()
+        .position(|a| matches!(a.cost, Some(AbilityCost::TapCreatures { .. })))?;
+    let freed_untap = ability_index_where(board.runner.state(), freed, is_untap_effect)?;
+    // Ballista's "Remove a +1/+1 counter: deal 1 to any target" ability, found by its
+    // deal-damage effect (a card-data re-parse that reorders abilities won't break it).
+    let ballista_ping = ability_index_where(board.runner.state(), ballista, |e| {
+        matches!(e, Effect::DealDamage { .. })
+    })?;
+    run_combo(board, |probe| {
+        // Tap Kilo via Relic (fires Kilo's proliferate trigger → grows Ballista +1),
+        // untap Kilo via Freed, then remove a +1/+1 counter to ping the opponent.
+        // The ping uses `activate_and_resolve` (bool-returning, `ChooseTarget`-shape
+        // target answer): at seed 0 the dead Ballista's activation is rejected and this
+        // degrades to the pure proliferate loop instead of panicking.
+        activate_and_resolve(
+            probe,
+            relic,
+            relic_tap_creature,
+            Some(TargetRef::Object(kilo)),
+        );
+        activate_and_resolve(probe, freed, freed_untap, Some(TargetRef::Object(kilo)));
+        activate_and_resolve(probe, ballista, ballista_ping, Some(TargetRef::Player(P1)));
+    })
+}
+
+/// PR-7 "One-Ring" — THE ONE RING under the KILO + FREED + RELIC proliferate
+/// engine (mana-neutral). Structural twin of `drive_offline_pentad_prism_seeded`:
+/// a REAL The One Ring (installed on the OPPONENT P1) is a passive proliferate
+/// target. Each cycle Relic taps Kilo → Kilo's "becomes tapped: proliferate"
+/// (CR 701.34a) grows the preserved `Generic("burden")` counter by one; Freed
+/// untaps Kilo for {U} (mana net 0). The board is otherwise identical, so the
+/// constant-depth `loop_states_equal_modulo_resources` FAILS on the growing
+/// burden and certification rides `loop_states_cover_modulo_counter_growth`.
+/// Certificate: `WinKind::Advantage` (CR 104.4b: an optional loop is not a draw;
+/// the burden is an eventual-payoff engine, not a direct win — loop_check.rs),
+/// naming `Counter(Other, Other)` (colorless artifact ⇒ ObjectClass::Other;
+/// Generic burden ⇒ CounterClass::Other; the axis carries no PlayerId, so P1
+/// ownership does not change it — resource.rs).
+///
+/// `seed_burden == 0` is the dead-loop CONTROL: no burden for proliferate to grow,
+/// so the cycle degrades to the pure Kilo/Freed/Relic proliferate loop — cert still
+/// `Some(Advantage)` (board identical, equality path) but names NO counter axis.
+/// Standalone (NOT in `DRIVERS`, no `CORPUS` row) — the Counter/Advantage family is
+/// already the 53rd Pentad row; no new row is warranted.
+pub(crate) fn drive_offline_kilo_freed_relic_one_ring(
+    db: &CardDatabase,
+    seed_burden: u32,
+) -> Option<LoopCertificate> {
+    use crate::types::ability::AbilityCost;
+
+    let mut board = build_board(db, CORPUS[1].cards)?; // Kilo/Freed/Relic on P0
+    let kilo = board.ids[0];
+    let freed = board.ids[1];
+    let relic = board.ids[2];
+    attach_aura(board.runner.state_mut(), freed, kilo);
+    // The One Ring on the OPPONENT P1's battlefield (passive proliferate target).
+    let ring = install_on_battlefield(board.runner.state_mut(), db, "The One Ring", P1)?;
+    {
+        let state = board.runner.state_mut();
+        if seed_burden > 0 {
+            if let Some(o) = state.objects.get_mut(&ring) {
+                // CR 122.1: burden is a Generic counter; seeded directly (a
+                // directly-installed permanent runs no enters replacement) — the
+                // established Pentad/Ballista driver idiom.
+                o.counters.insert(
+                    crate::types::counter::CounterType::Generic("burden".to_string()),
+                    seed_burden,
+                );
+            }
+        }
+        settle_layers(state);
+    }
+    let relic_tap_creature = board.runner.state().objects[&relic]
+        .abilities
+        .iter()
+        .position(|a| matches!(a.cost, Some(AbilityCost::TapCreatures { .. })))?;
+    let freed_untap = ability_index_where(board.runner.state(), freed, is_untap_effect)?;
+    run_combo(board, |probe| {
+        // Identical 2-step cycle to the Pentad driver; the Ring accrues burden
+        // passively from Kilo's proliferate (no active step on the Ring).
+        activate_and_resolve(
+            probe,
+            relic,
+            relic_tap_creature,
+            Some(TargetRef::Object(kilo)),
+        );
+        activate_and_resolve(probe, freed, freed_untap, Some(TargetRef::Object(kilo)));
+    })
+}
+
 /// #10 PRIEST OF TITANIA + UMBRAL MANTLE — infinite green mana. Priest taps for
 /// {G} per Elf; Umbral Mantle's "{3}, {Q}" pump untaps Priest. With ≥4 Elves one
 /// cycle is net mana-positive after the {3} untap cost (paid from green).
@@ -1621,28 +2002,41 @@ pub(crate) fn drive_offline_marwyn_sword(db: &CardDatabase) -> Option<LoopCertif
 // exercised end-to-end.
 // ===========================================================================
 
-/// Build a 2-player board with the named permanents installed on P0, P1 set to a
-/// high life total `victim_life` (so a natural CR 704.5a death cannot be the cause
-/// of any early `GameOver`), and the active player P0 at a clean `PreCombatMain`
-/// priority window. No mana is floated (the drain cascade is trigger-driven).
-/// Returns `None` if any name is missing.
-pub(crate) fn build_drain_board(
+/// Build an N-player board with the named permanents installed on P0, each opponent
+/// `PlayerId(i + 1)` set to `opponent_lives[i]`, the controller P0 at `controller_life`,
+/// and the active player P0 at a clean `PreCombatMain` priority window with the live
+/// detector opted ON. Generalizes [`build_drain_board`] to the multiplayer tables the
+/// combo-detector must stay safe on (CR 104.2a last-standing, CR 104.4b mandatory
+/// draw). `None` if any name is missing, or if `opponent_lives.len() + 1 != num_players`.
+pub(crate) fn build_drain_board_n(
     db: &CardDatabase,
     cards: &[&str],
-    victim_life: i32,
+    num_players: u8,
+    opponent_lives: &[i32],
+    controller_life: i32,
 ) -> Option<ComboBoard> {
     if cards.iter().any(|c| db.get_face_by_name(c).is_none()) {
         return None;
     }
-    let mut scenario = GameScenario::new();
+    if opponent_lives.len() + 1 != num_players as usize {
+        return None;
+    }
+    let mut scenario = GameScenario::new_n_player(num_players, 42);
     scenario.at_phase(Phase::PreCombatMain);
-    scenario.with_life(P0, 40);
-    scenario.with_life(P1, victim_life);
+    scenario.with_life(P0, controller_life);
+    for (i, &life) in opponent_lives.iter().enumerate() {
+        scenario.with_life(PlayerId(i as u8 + 1), life);
+    }
     let mut runner = scenario.build();
     {
         let state = runner.state_mut();
         state.active_player = P0;
         state.priority_player = P0;
+        // CR 732.2a: this harness exercises the live combo-detector, so it opts the
+        // (default-OFF) detector ON. Without this the reconcile-seam shortcut and the
+        // loop-detection ring sampler are both gated off and no drain cascade would be
+        // shortcut to its GameOver — see `GameState::loop_detection`.
+        state.loop_detection = crate::types::game_state::LoopDetectionMode::On;
     }
     let mut ids = Vec::new();
     {
@@ -1653,6 +2047,20 @@ pub(crate) fn build_drain_board(
         settle_layers(state);
     }
     Some(ComboBoard { runner, ids })
+}
+
+/// Build a 2-player board with the named permanents installed on P0, P1 set to a
+/// high life total `victim_life` (so a natural CR 704.5a death cannot be the cause
+/// of any early `GameOver`), and the active player P0 at a clean `PreCombatMain`
+/// priority window. No mana is floated (the drain cascade is trigger-driven).
+/// Returns `None` if any name is missing. Thin 2-player wrapper over
+/// [`build_drain_board_n`] (P0 at 40 life, the sole opponent at `victim_life`).
+pub(crate) fn build_drain_board(
+    db: &CardDatabase,
+    cards: &[&str],
+    victim_life: i32,
+) -> Option<ComboBoard> {
+    build_drain_board_n(db, cards, 2, &[victim_life], 40)
 }
 
 /// Seed a drain cascade by gaining P0 1 life through the real life-gain pipeline
@@ -1686,8 +2094,19 @@ pub(crate) struct BeatTrace {
     pub(crate) wf: WaitingFor,
     pub(crate) stack_len: usize,
     pub(crate) ring_len: usize,
-    pub(crate) p0_life: i32,
-    pub(crate) p1_life: i32,
+    /// Life total of every seat (index = `PlayerId`), snapshotted this beat. A `Vec`
+    /// (not `p0_life`/`p1_life`) so the multiplayer regressions read 3- and 4-player
+    /// tables without assuming a fixed count.
+    pub(crate) lives: Vec<i32>,
+}
+
+impl BeatTrace {
+    /// Lowest life among the opponents (every seat except the controller P0). Lets the
+    /// multiplayer drain regressions assert "an opponent is draining toward 0" without
+    /// hard-coding which seat or how many. `i32::MAX` if there are no opponents.
+    pub(crate) fn min_opponent_life(&self) -> i32 {
+        self.lives.iter().skip(1).copied().min().unwrap_or(i32::MAX)
+    }
 }
 
 /// Drive `runner.act(PassPriority)` up to `max_beats` times, recording one
@@ -1710,8 +2129,57 @@ pub(crate) fn drive_pass_priority(board: &mut ComboBoard, max_beats: usize) -> V
             wf: s.waiting_for.clone(),
             stack_len: s.stack.len(),
             ring_len: s.loop_detect_ring.len(),
-            p0_life: s.players[0].life,
-            p1_life: s.players[1].life,
+            lives: s.players.iter().map(|p| p.life).collect(),
+        });
+        if matches!(
+            board.runner.state().waiting_for,
+            WaitingFor::GameOver { .. }
+        ) {
+            break;
+        }
+    }
+    trace
+}
+
+/// Like [`drive_pass_priority`], but responds to a mandatory `WaitingFor::OrderTriggers`
+/// window with the identity `OrderTriggers` order instead of erroring (CR 603.3b — a
+/// mandatory simultaneous-trigger group never declines a trigger, so any legal
+/// permutation is sound); every other window still gets `PassPriority`. Records the same
+/// post-action [`BeatTrace`] per beat — the `OrderTriggers` window surfaces as the
+/// post-state of the beat that produced it (so `trace` reveals it) and terminal
+/// `GameOver` is recorded like `drive_pass_priority`, so [`first_gameover_beat`] works.
+/// `drive_pass_priority` errors out at an `OrderTriggers` window, so a self-refilling
+/// MULTI-trigger loop needs this driver instead.
+pub(crate) fn drive_with_trigger_ordering(
+    board: &mut ComboBoard,
+    max_beats: usize,
+) -> Vec<BeatTrace> {
+    let mut trace = Vec::new();
+    for beat in 1..=max_beats {
+        if matches!(
+            board.runner.state().waiting_for,
+            WaitingFor::GameOver { .. }
+        ) {
+            break;
+        }
+        // Respond to the CURRENT window: identity ordering at an OrderTriggers prompt,
+        // else pass. The owned `order` vec ends the state borrow before `act`.
+        let action = match &board.runner.state().waiting_for {
+            WaitingFor::OrderTriggers { triggers, .. } => GameAction::OrderTriggers {
+                order: (0..triggers.len()).collect(),
+            },
+            _ => GameAction::PassPriority,
+        };
+        if board.runner.act(action).is_err() {
+            break;
+        }
+        let s = board.runner.state();
+        trace.push(BeatTrace {
+            beat,
+            wf: s.waiting_for.clone(),
+            stack_len: s.stack.len(),
+            ring_len: s.loop_detect_ring.len(),
+            lives: s.players.iter().map(|p| p.life).collect(),
         });
         if matches!(
             board.runner.state().waiting_for,

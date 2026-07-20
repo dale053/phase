@@ -191,6 +191,8 @@ mod tests {
                 player: AI,
                 valid_attacker_ids: vec![],
                 valid_attack_targets: vec![],
+                valid_attack_targets_by_attacker: None,
+                attacker_constraints: Default::default(),
             },
             candidates: Vec::new(),
         }
@@ -343,6 +345,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = TokensWidePolicy.verdict(&ctx);
         match verdict {
@@ -369,6 +372,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = TokensWidePolicy.verdict(&ctx);
         match verdict {
@@ -409,6 +413,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = TokensWidePolicy.verdict(&ctx);
         match verdict {
@@ -443,6 +448,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = TokensWidePolicy.verdict(&ctx);
         match verdict {
@@ -472,6 +478,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict = TokensWidePolicy.verdict(&ctx);
         match verdict {

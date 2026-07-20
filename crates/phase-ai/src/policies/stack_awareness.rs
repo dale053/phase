@@ -383,6 +383,7 @@ mod tests {
                 target_slots: vec![TargetSelectionSlot {
                     legal_targets: vec![TargetRef::Object(target_id)],
                     optional: false,
+                    chooser: None,
                 }],
                 mode_labels: Vec::new(),
                 selection: Default::default(),
@@ -415,6 +416,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         StackAwarenessPolicy.score(&ctx)
     }
@@ -498,6 +500,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 3 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
             vec![TargetRef::Object(creature)],
         );
@@ -514,6 +517,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 2 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
             vec![TargetRef::Object(creature)],
         );
@@ -616,6 +620,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 5 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
         );
         let score = score_policy(&state, &decision, &candidate);

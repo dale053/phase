@@ -1,10 +1,12 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { GameObject, GameState } from "../../../adapter/types.ts";
+import type { GameObject } from "../../../adapter/types.ts";
 import { useCardImage } from "../../../hooks/useCardImage.ts";
 import { useGameStore } from "../../../stores/gameStore.ts";
 import { useUiStore } from "../../../stores/uiStore.ts";
+import { buildGameObject, buildObjectMap } from "../../../test/factories/gameObjectFactory.ts";
+import { buildGameState } from "../../../test/factories/gameStateFactory.ts";
 import { CardPreview } from "../CardPreview.tsx";
 
 vi.mock("../../../hooks/useCardImage.ts", () => ({
@@ -23,66 +25,23 @@ vi.mock("../../../hooks/useEngineCardData.ts", () => ({
 }));
 
 function battlefieldObject(overrides: Partial<GameObject> = {}): GameObject {
-  return {
+  return buildGameObject({
     id: 101,
     card_id: 1,
-    owner: 0,
-    controller: 0,
     zone: "Battlefield",
-    tapped: false,
-    face_down: false,
-    flipped: false,
-    transformed: false,
-    damage_marked: 0,
-    dealt_deathtouch_damage: false,
-    attached_to: null,
-    attachments: [],
-    counters: {},
     name: "Pithing Needle",
-    power: null,
-    toughness: null,
-    loyalty: null,
-    card_types: { supertypes: [], core_types: ["Artifact"], subtypes: [] },
     mana_cost: { type: "Cost", shards: [], generic: 1 },
-    keywords: [],
-    abilities: [],
-    trigger_definitions: [],
-    replacement_definitions: [],
-    static_definitions: [],
-    color: [],
-    base_power: null,
-    base_toughness: null,
-    base_keywords: [],
-    base_color: [],
-    timestamp: 1,
-    entered_battlefield_turn: 1,
     ...overrides,
-  };
+  });
 }
 
-function gameStateWithObject(object: GameObject): GameState {
-  return {
-    turn_number: 1,
-    active_player: 0,
-    phase: "PreCombatMain",
-    players: [],
-    priority_player: 0,
-    objects: { [String(object.id)]: object },
+function gameStateWithObject(object: GameObject) {
+  return buildGameState({
+    objects: buildObjectMap(object),
     next_object_id: 102,
     battlefield: [object.id],
-    stack: [],
-    exile: [],
-    rng_seed: 1,
-    combat: null,
-    waiting_for: { type: "Priority", data: { player: 0 } },
-    has_pending_cast: false,
-    lands_played_this_turn: 0,
-    max_lands_per_turn: 1,
-    priority_pass_count: 0,
-    pending_replacement: null,
-    layers_dirty: false,
     next_timestamp: 2,
-  } as GameState;
+  });
 }
 
 afterEach(() => {
@@ -201,5 +160,77 @@ describe("CardPreview chosen attributes", () => {
       }),
       tokenImageRef: object.token_image_ref,
     }));
+  });
+});
+
+// MAJOR-1 (CR 602.5): CardPreview is the SECOND `blocked_abilities` consumer and
+// had no coverage before this change. It renders every prohibiting source name via
+// preview.fromSource, joined, dropping ids absent from `objects`.
+describe("CardPreview blocked abilities", () => {
+  function inspectWith(object: GameObject, sources: GameObject[] = []) {
+    const gameState = buildGameState({
+      objects: buildObjectMap(object, ...sources),
+      next_object_id: 999,
+      battlefield: [object.id],
+      next_timestamp: 2,
+    });
+    useGameStore.setState({ gameState, spellCosts: {} });
+    useUiStore.setState({ inspectedObjectId: object.id, altHeld: false });
+    render(<CardPreview cardName="Grim Monolith" position={{ x: 20, y: 20 }} />);
+  }
+
+  it("renders both prohibiting source names when two sources block one ability", () => {
+    const object = battlefieldObject({
+      id: 101,
+      name: "Grim Monolith",
+      abilities: [
+        {
+          description: "{T}: draw",
+          effects: [],
+          targets: [],
+          cost: { type: "Tap" },
+          timing: "AnyTime",
+          kind: "Activated",
+        },
+      ],
+      blocked_abilities: [
+        { ability_index: 0, sources: [201, 202], type: "CantBeActivated" },
+      ],
+    });
+    inspectWith(object, [
+      buildGameObject({ id: 201, name: "Needle A" }),
+      buildGameObject({ id: 202, name: "Needle B" }),
+    ]);
+
+    expect(screen.getByText(/\(from Needle A, Needle B\)/)).toBeInTheDocument();
+  });
+
+  it("renders a single prohibiting source name", () => {
+    const object = battlefieldObject({
+      id: 101,
+      name: "Grim Monolith",
+      abilities: [],
+      blocked_abilities: [
+        { ability_index: 0, sources: [201], type: "CantBeActivated" },
+      ],
+    });
+    inspectWith(object, [buildGameObject({ id: 201, name: "Needle A" })]);
+
+    expect(screen.getByText(/\(from Needle A\)/)).toBeInTheDocument();
+  });
+
+  it("drops a departed source id and renders no fromSource span", () => {
+    const object = battlefieldObject({
+      id: 101,
+      name: "Grim Monolith",
+      abilities: [],
+      // source 999 is absent from `objects` — the departed-source guard drops it.
+      blocked_abilities: [
+        { ability_index: 0, sources: [999], type: "Prohibited" },
+      ],
+    });
+    inspectWith(object);
+
+    expect(screen.queryByText(/\(from/)).not.toBeInTheDocument();
   });
 });

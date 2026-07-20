@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { ChosenAttribute, GameObject, Keyword, ManaCost, Zone } from "../../adapter/types.ts";
+import type { AbilityBlockKind, ChosenAttribute, GameObject, Keyword, ManaCost, Zone } from "../../adapter/types.ts";
 import { collectObjectActions } from "../../viewmodel/cardActionChoice.ts";
-import { abilityLabel } from "../../viewmodel/costLabel.ts";
+import { abilityLabel, loyaltyBadge, stripLoyaltyCostPrefix } from "../../viewmodel/costLabel.ts";
 import { useCardImage } from "../../hooks/useCardImage.ts";
 import type { SourcePrinting } from "../../hooks/useCardImage.ts";
 import { useIsMobile } from "../../hooks/useIsMobile.ts";
@@ -14,7 +14,11 @@ import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { ManaCostPips } from "../mana/ManaCostPips.tsx";
 import { RichLabel } from "../mana/RichLabel.tsx";
+import { CardArtFallback } from "./CardArtFallback.tsx";
+import { ReportCardButton, type CardReportContext } from "./ReportCardButton.tsx";
 import { GameplayTooltip } from "../ui/GameplayTooltip.tsx";
+import { LoyaltyBadge } from "../ui/LoyaltyBadge.tsx";
+import { CounterTooltip } from "../ui/CounterTooltip.tsx";
 import { computePTDisplay, formatCounterType, formatTypeLine, toRoman } from "../../viewmodel/cardProps.ts";
 import {
   getKeywordDisplayText,
@@ -28,6 +32,17 @@ import {
   buildPTSources,
   formatPTDelta,
 } from "../../viewmodel/attribution.ts";
+
+/**
+ * CR 602.5: Maps an engine `AbilityBlockKind` to its i18n reason key. Pure
+ * display formatting — no game logic. Kept exhaustive so a new kind is a
+ * compile error until a key is added.
+ */
+const ABILITY_BLOCK_REASON_KEY: Record<AbilityBlockKind, string> = {
+  CantBeActivated: "abilityBlock.cantBeActivated",
+  CantActivateDuring: "abilityBlock.cantActivateDuring",
+  Prohibited: "abilityBlock.prohibited",
+};
 
 let lastPointerPosition: { x: number; y: number } | null = null;
 
@@ -127,6 +142,12 @@ function CardPreviewInner({
   const obj = useGameStore((s) =>
     inspectedObjectId != null ? s.gameState?.objects[inspectedObjectId] ?? null : null,
   );
+  // `card_report` context needs a live, participating game: `obj == null` (deck
+  // builder) has no zone and a possibly-stale `gameMode`, `gameId == null` means
+  // no game at all, and spectators don't report — building no context in these
+  // cases keeps both the event and the button's wrapper elements out entirely.
+  const gameId = useGameStore((s) => s.gameId);
+  const gameMode = useGameStore((s) => s.gameMode);
 
   // Auto-derive back face name from " // " separator when not explicitly provided
   // (e.g., deck builder passes "Delver of Secrets // Insectile Aberration" as cardName)
@@ -318,6 +339,29 @@ function CardPreviewInner({
     viewportWidth,
   ]);
 
+  // Identity + parse counts for the "report this card" button, carrying the
+  // DISPLAYED face (back face under Ctrl) so the report matches what the player
+  // sees. Undefined outside a live game (`obj == null` or `gameId == null`), so
+  // the button never renders in the deck builder. On mobile `showOtherFace` is
+  // always false, so this resolves to the front face there.
+  // No front-face fallback for the counts: if the back face's parse details
+  // haven't loaded, 0/0 ("no parse data") is honest — front-face counts under a
+  // back-face identity would corrupt the misparse-vs-known-gap triage columns.
+  const reportItems = showOtherFace ? backParseDetails : frontParseDetails;
+  const reportContext: CardReportContext | undefined =
+    obj != null && gameId !== null && gameMode !== "spectate"
+      ? {
+          oracleId:
+            (showOtherFace ? obj.back_face?.printed_ref?.oracle_id : obj.printed_ref?.oracle_id) ?? "",
+          faceName:
+            (showOtherFace ? obj.back_face?.printed_ref?.face_name : obj.printed_ref?.face_name) ?? "",
+          name: showOtherFace ? (obj.back_face?.printed_ref?.face_name ?? backFaceName ?? obj.name) : obj.name,
+          zone: obj.zone,
+          supported: (reportItems ?? []).filter((item) => item.supported).length,
+          total: (reportItems ?? []).length,
+        }
+      : undefined;
+
   // Mobile overlay mode: centered with backdrop
   if (isMobile) {
     return (
@@ -329,6 +373,7 @@ function CardPreviewInner({
         onDismiss={onDismiss ?? dismissPreview}
         sourcePrinting={sourcePrinting}
         layout={mobileLayout ?? "modal"}
+        report={reportContext}
       />
     );
   }
@@ -371,6 +416,7 @@ function CardPreviewInner({
           localizedTypeLine={showOtherFace ? engineBackFace?.localized_type_line : engineFrontFace?.localized_type_line}
           parseDetails={showOtherFace && backParseDetails ? backParseDetails : frontParseDetails}
           maxHeight={viewportHeight - margin * 2}
+          report={reportContext}
         />
       ) : (
         <CardImagePreview
@@ -405,6 +451,7 @@ function MobilePreviewOverlay({
   onDismiss,
   sourcePrinting,
   layout = "modal",
+  report,
 }: {
   cardName: string;
   backFaceName: string | null;
@@ -413,9 +460,12 @@ function MobilePreviewOverlay({
   onDismiss: () => void;
   sourcePrinting?: SourcePrinting;
   layout?: "modal" | "compact";
+  /** In-game report context; absent in the deck builder. Only the full modal
+   *  layout hosts the button — the compact peek dismisses on any tap. */
+  report?: CardReportContext;
 }) {
   const { t } = useTranslation("game");
-  const { src, isRotated, isFlip } = useCardImage(cardName, {
+  const { src, isLoading, isRotated, isFlip } = useCardImage(cardName, {
     size: "normal",
     faceIndex,
     isToken: obj?.display_source === "Token",
@@ -425,6 +475,20 @@ function MobilePreviewOverlay({
     faceName: obj?.printed_ref?.face_name,
     sourcePrinting,
   });
+
+  // Issue #6156 on the mobile path: both arms below used to gate the art on
+  // `src &&`, so an artless token (no official paper printing) opened an
+  // overlay containing nothing at all — the reported blank square, reproduced
+  // on phones. Track load failures too, so a resolved-but-404 URL degrades to
+  // the same named tile instead of the browser's broken-image glyph.
+  const [artError, setArtError] = useState(false);
+  useEffect(() => setArtError(false), [src]);
+  // `isLoading` is load-bearing, not decoration: `useCardImage` assigns `src`
+  // in a post-render effect, so `src` is null on EVERY first paint. Deriving
+  // the fallback from `!src` alone would flash the "no art" tile before every
+  // normal card's art — the same conflation this PR fixed on the board
+  // renderers. Only a settled lookup with no art gets the tile.
+  const showArtFallback = !isLoading && (!src || artError);
 
   // Mobile has no Ctrl key, so a Kamigawa flip card's 180° spin is a tap toggle
   // (desktop holds Ctrl). Only the full-screen modal layout can host the button —
@@ -461,12 +525,22 @@ function MobilePreviewOverlay({
         className="pointer-events-none fixed inset-0 z-[100] flex items-center justify-center p-4"
         data-card-preview
       >
-        {src && (
+        {showArtFallback ? (
+          <CardArtFallback
+            name={cardName}
+            className="pointer-events-auto aspect-[5/7] max-h-[60vh] max-w-[68vw] w-[68vw] rounded-xl border border-white/15 shadow-2xl"
+          />
+        ) : !src ? (
+          // Still resolving. The compact peek is a non-blocking overlay, so it
+          // stays empty rather than flashing a skeleton over the board.
+          null
+        ) : (
           <img
             src={src}
             alt={cardName}
             draggable={false}
             onPointerDown={onDismiss}
+            onError={() => setArtError(true)}
             className={
               isRotated
                 ? "pointer-events-auto max-h-[58vw] max-w-[80vh] rotate-90 rounded-xl border border-white/15 object-contain shadow-2xl"
@@ -486,32 +560,46 @@ function MobilePreviewOverlay({
       data-card-preview
       onPointerDown={onDismiss}
     >
-      {src && (
-        <div
-          className={isRotated
-            ? "relative h-[min(60vw,300px)] w-[min(84vw,420px)] max-h-[calc(100dvh-2rem)] max-w-full overflow-hidden rounded-lg shadow-2xl landscape:max-w-[45vw]"
-            : "relative max-h-[calc(100dvh-2rem)] max-w-full overflow-hidden rounded-lg shadow-2xl landscape:max-w-[45vw]"}
-          onPointerDown={(e) => e.stopPropagation()}
-        >
+      <div
+        className={isRotated
+          ? "relative h-[min(60vw,300px)] w-[min(84vw,420px)] max-h-[calc(100dvh-2rem)] max-w-full overflow-hidden rounded-lg shadow-2xl landscape:max-w-[45vw]"
+          : "relative max-h-[calc(100dvh-2rem)] max-w-full overflow-hidden rounded-lg shadow-2xl landscape:max-w-[45vw]"}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        {showArtFallback ? (
+          <CardArtFallback
+            name={cardName}
+            className="aspect-[5/7] max-h-[calc(100dvh-2rem)] w-[68vw] max-w-full rounded-lg"
+          />
+        ) : !src ? (
+          // Still resolving — skeleton, not the artless tile.
+          <div className="aspect-[5/7] max-h-[calc(100dvh-2rem)] w-[68vw] max-w-full animate-pulse rounded-lg bg-gray-700" />
+        ) : (
           <img
             src={src}
             alt={cardName}
             draggable={false}
+            onError={() => setArtError(true)}
             className={isRotated
               ? "absolute left-1/2 top-1/2 h-[min(84vw,420px)] w-[min(60vw,300px)] -translate-x-1/2 -translate-y-1/2 rotate-90 object-cover"
               : `max-h-[calc(100dvh-2rem)] max-w-full object-contain${isFlip ? " transition-transform duration-200" : ""}${flipped ? " rotate-180" : ""}`}
           />
-          {isFlip && (
-            <button
-              type="button"
-              onClick={() => setFlipped((f) => !f)}
-              className="pointer-events-auto absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full border border-white/20 bg-black/70 px-4 py-2 text-sm font-semibold text-white shadow-lg backdrop-blur active:bg-black/80"
-            >
-              ⟳ {t("preview.flip")}
-            </button>
-          )}
-        </div>
-      )}
+        )}
+        {isFlip && (
+          <button
+            type="button"
+            onClick={() => setFlipped((f) => !f)}
+            className="pointer-events-auto absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full border border-white/20 bg-black/70 px-4 py-2 text-sm font-semibold text-white shadow-lg backdrop-blur active:bg-black/80"
+          >
+            ⟳ {t("preview.flip")}
+          </button>
+        )}
+        {report && (
+          <div className="absolute bottom-3 left-3 rounded-full border border-white/20 bg-black/70 px-3 py-1.5 shadow-lg backdrop-blur">
+            <ReportCardButton key={report.oracleId || report.name} {...report} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -586,15 +674,27 @@ function CardImagePreview({
   // {1}{G}{G}). See cardImageLookup / back_face wiring.
   const effectiveCost = useGameStore((s) => obj ? s.spellCosts[String(obj.id)] : undefined);
   const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
-  const activateLabels = useMemo(() => {
+  const activateLabels = useMemo<ActivateLabel[]>(() => {
     if (!obj || obj.zone !== "Battlefield") return [];
-    return collectObjectActions(legalActionsByObject, obj.id)
-      .flatMap((action) => {
-        if (action.type !== "ActivateAbility") return [];
-        const ability = obj.abilities[action.data.ability_index];
-        return ability ? [abilityLabel(ability)] : [];
-      })
-      .filter((label, index, labels) => label && labels.indexOf(label) === index);
+    const seen = new Set<string>();
+    const result: ActivateLabel[] = [];
+    for (const action of collectObjectActions(legalActionsByObject, obj.id)) {
+      if (action.type !== "ActivateAbility") continue;
+      const ability = obj.abilities[action.data.ability_index];
+      if (!ability) continue;
+      const rawLabel = abilityLabel(ability);
+      if (!rawLabel || seen.has(rawLabel)) continue;
+      seen.add(rawLabel);
+      // CR 606.1: a Loyalty ability cost renders as a mana-font badge; strip
+      // the "[+2]"-style prefix so the cost isn't shown twice.
+      const loyalty = loyaltyBadge(ability.cost);
+      result.push({
+        rawLabel,
+        label: loyalty ? stripLoyaltyCostPrefix(rawLabel) : rawLabel,
+        loyalty,
+      });
+    }
+    return result;
   }, [legalActionsByObject, obj]);
   const castManaZones: Zone[] = ["Hand", "Command", "Exile", "Graveyard", "Library"];
   const showCastManaCost =
@@ -605,7 +705,11 @@ function CardImagePreview({
       ? (effectiveCost ?? obj?.mana_cost)
       : null;
 
-  if (isLoading || !src) {
+  // Only a genuinely in-flight lookup pulses. A finished lookup with no art
+  // (issue #6156) falls through to the named placeholder below — previously it
+  // was collapsed in here, which left this component's own placeholder dead
+  // code for artless tokens and pulsed forever in the hover preview.
+  if (isLoading) {
     return (
       <div
         className={`${frameClass} ${isRotated ? "" : "aspect-[5/7]"} rounded-[4%] border border-gray-600 bg-gray-700 shadow-2xl animate-pulse`}
@@ -616,9 +720,16 @@ function CardImagePreview({
   return (
     <div className={`${containerClass} border border-gray-600 overflow-hidden shadow-2xl ${showInfoPanel ? "rounded-t-[4%] rounded-b-lg bg-gray-900" : "rounded-[4%]"}`}>
       <div className={`${frameClass} relative rounded-[4%] overflow-hidden`}>
-        {imgError ? (
+        {imgError || !src ? (
           <div
-            className={`${frameClass} flex items-center justify-center rounded-[4%] border border-gray-600 bg-gray-800 p-4 text-center`}
+            // `frameClass` is width-only when upright — the <img> normally
+            // supplies the height, so without an aspect ratio this placeholder
+            // collapses to a squat strip. The loading branch above compensates
+            // the same way; this branch now carries the headline #6156 case
+            // (`!src`), so it needs it too.
+            className={`${frameClass} ${isRotated ? "" : "aspect-[5/7]"} flex items-center justify-center rounded-[4%] border border-gray-600 bg-gray-800 p-4 text-center`}
+            role="img"
+            aria-label={cardName}
           >
             <span className="text-sm font-medium text-gray-300">{cardName}</span>
           </div>
@@ -777,9 +888,12 @@ interface ParsedAbilitiesPanelProps {
   localizedTypeLine?: string | null;
   parseDetails: ParsedItem[] | null;
   maxHeight?: number;
+  /** In-game report context for the displayed face; absent in the deck builder
+   *  (no live game), where the report button is not shown. */
+  report?: CardReportContext;
 }
 
-function ParsedAbilitiesPanel({ name, cardTypes, keywords, localizedTypeLine, parseDetails, maxHeight }: ParsedAbilitiesPanelProps) {
+function ParsedAbilitiesPanel({ name, cardTypes, keywords, localizedTypeLine, parseDetails, maxHeight, report }: ParsedAbilitiesPanelProps) {
   const { t } = useTranslation("game");
   const items = parseDetails ?? [];
   const rulings = useCardRulings(name);
@@ -800,6 +914,11 @@ function ParsedAbilitiesPanel({ name, cardTypes, keywords, localizedTypeLine, pa
           <div className="text-[10px] text-gray-500 mt-0.5">{typeLine}</div>
         )}
         <SupportSummary items={items} />
+        {report && (
+          <div className="mt-1 flex justify-end">
+            <ReportCardButton key={report.oracleId || report.name} {...report} />
+          </div>
+        )}
       </div>
       <div className="px-2 py-2 space-y-0.5">
         {items.length === 0 && (
@@ -814,6 +933,14 @@ function ParsedAbilitiesPanel({ name, cardTypes, keywords, localizedTypeLine, pa
   );
 }
 
+/** A battlefield-activatable ability's cost summary for the preview panel.
+ * `loyalty` is set only for planeswalker Loyalty costs (rendered as a badge). */
+type ActivateLabel = {
+  rawLabel: string;
+  label: string;
+  loyalty: { amount: number; iconClasses: string | null; text: string } | null;
+};
+
 function CardInfoPanel({
   obj,
   altAvailable,
@@ -821,11 +948,13 @@ function CardInfoPanel({
 }: {
   obj: GameObject;
   altAvailable: boolean;
-  activateLabels: string[];
+  activateLabels: ActivateLabel[];
 }) {
   const { t } = useTranslation("game");
   const ptDisplay = computePTDisplay(obj);
-  const counters = Object.entries(obj.counters).filter(([type]) => type !== "loyalty");
+  const counters = Object.entries(obj.counters).flatMap(([type, count]) =>
+    type === "loyalty" || count == null ? [] : [[type, count] as const],
+  );
   const keywords = sortKeywords(obj.keywords);
   const colorsChanged =
     obj.color.length !== obj.base_color.length ||
@@ -911,14 +1040,60 @@ function CardInfoPanel({
 
       {activateLabels.length > 0 && (
         <div className="mt-1 text-cyan-300/90">
-          {activateLabels.map((label) => (
-            <RichLabel
-              key={label}
-              text={t("preview.activateCost", { cost: label })}
-              size="xs"
-              className="block"
-            />
-          ))}
+          {activateLabels.map((entry) =>
+            entry.loyalty ? (
+              <div key={entry.rawLabel} className="flex items-center gap-1">
+                <LoyaltyBadge amount={entry.loyalty.amount} kind="cost" />
+                <RichLabel
+                  text={t("preview.activateCost", { cost: entry.label })}
+                  size="xs"
+                />
+              </div>
+            ) : (
+              <RichLabel
+                key={entry.rawLabel}
+                text={t("preview.activateCost", { cost: entry.label })}
+                size="xs"
+                className="block"
+              />
+            ),
+          )}
+        </div>
+      )}
+
+      {/* CR 602.5: blocked activated abilities (display-only read-out from the
+          engine). One row per blocked ability; the ability's description labels
+          printed abilities, runtime-granted ones (index past the printed list)
+          show the reason alone. Each prohibiting source name(s) is shown only
+          when that object is still present in the state. */}
+      {(obj.blocked_abilities?.length ?? 0) > 0 && (
+        <div className="mt-1 space-y-0.5 text-amber-300/90">
+          {(obj.blocked_abilities ?? []).map((entry, i) => {
+            const abilityName =
+              entry.ability_index < obj.abilities.length
+                ? obj.abilities[entry.ability_index]?.description
+                : undefined;
+            const names = (entry.sources ?? [])
+              .map((id) => objects?.[String(id)]?.name)
+              .filter((n): n is string => !!n);
+            const reason = t(ABILITY_BLOCK_REASON_KEY[entry.type]);
+            return (
+              <div key={i} className="flex items-start gap-1">
+                <span aria-hidden>⊘</span>
+                <span>
+                  {abilityName && (
+                    <span className="text-gray-300">{abilityName}: </span>
+                  )}
+                  {reason}
+                  {names.length > 0 && (
+                    <span className="ml-1 text-amber-400/70">
+                      {t("preview.fromSource", { source: names.join(", ") })}
+                    </span>
+                  )}
+                </span>
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -958,9 +1133,11 @@ function CardInfoPanel({
       {counters.length > 0 && (
         <div className="mt-1 flex flex-wrap gap-x-3 text-gray-400">
           {counters.map(([type, count]) => (
-            <span key={type}>
-              {formatCounterType(type)}: {count}
-            </span>
+            <CounterTooltip key={type} type={type} count={count}>
+              <span>
+                {formatCounterType(type)}: {count}
+              </span>
+            </CounterTooltip>
           ))}
         </div>
       )}

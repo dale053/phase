@@ -42,7 +42,7 @@ use crate::analysis::resource::{
 };
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, Effect, ManaProduction,
-    QuantityExpr, TapStateChange, TargetFilter, TriggerDefinition, TypeFilter,
+    QuantityExpr, TapStateChange, TargetFilter, TriggerDefinition, TypeFilter, VoteSubject,
 };
 use crate::types::card::CardFace;
 use crate::types::counter::CounterMatch;
@@ -159,6 +159,10 @@ impl From<&ResourceAxis> for AxisKey {
             ResourceAxis::EtbTriggers => AxisKey::Etb,
             ResourceAxis::LtbTriggers => AxisKey::Ltb,
             ResourceAxis::SacTriggers => AxisKey::Sac,
+            // CR 704.5c: the per-victim poison axis projects onto the same aggregate
+            // AxisKey the static ability-graph path uses (`add_counter` → Poison/Player),
+            // preserving poison's prior key identity for graph analysis.
+            ResourceAxis::Poison(_) => AxisKey::Counter(CounterClass::Poison, ObjectClass::Player),
         }
     }
 }
@@ -652,7 +656,10 @@ fn effect_projection(effect: &Effect) -> Projection {
         // ----- DAMAGE family (CR 120.1 / CR 704.5a) -----
         Effect::DealDamage { amount, .. }
         | Effect::DamageAll { amount, .. }
-        | Effect::DamageEachPlayer { amount, .. } => {
+        | Effect::DamageEachPlayer { amount, .. }
+        // CR 120.1: filter-sourced fixed-amount damage — fixed magnitude seed
+        // (distinct from the unbounded own-power `EachDealsDamageEqualToPower`).
+        | Effect::EachSourceDealsDamage { amount, .. } => {
             let (a, mag) = count_seed(amount);
             b.add_damage(a, mag);
         }
@@ -864,6 +871,7 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::NoOp
         | Effect::Populate
         | Effect::Clash
+        | Effect::Behold { .. }
         | Effect::EndTheTurn
         | Effect::EndCombatPhase
         | Effect::Vote { .. }
@@ -897,6 +905,7 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::ExileTop { .. }
         | Effect::TargetOnly { .. }
         | Effect::Choose { .. }
+        | Effect::SwapChosenLabels { .. }
         | Effect::ChooseDamageSource { .. }
         | Effect::Suspect { .. }
         | Effect::Unsuspect { .. }
@@ -916,12 +925,14 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::ReduceNextSpellCost { .. }
         | Effect::GrantNextSpellAbility { .. }
         | Effect::AddPendingETBCounters { .. }
+        | Effect::AddPendingEntersModifications { .. }
         | Effect::CreateEmblem { .. }
         | Effect::PayCost { .. }
-        | Effect::ExileResolvingSpellInsteadOfGraveyard
+        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
         | Effect::PreventDamage { .. }
         | Effect::CreateDamageReplacement { .. }
         | Effect::CreateDrawReplacement { .. }
+        | Effect::CreatePlaneswalkReplacement { .. }
         | Effect::LoseTheGame { .. }
         | Effect::WinTheGame { .. }
         | Effect::RollDie { .. }
@@ -932,7 +943,11 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::VentureIntoDungeon
         | Effect::VentureInto { .. }
         | Effect::TakeTheInitiative
+        | Effect::ArrangePlanarDeckTop { .. }
         | Effect::Planeswalk
+        | Effect::ChaosEnsues
+        | Effect::RedistributeLifeTotals
+        | Effect::ReverseTurnOrder
         | Effect::OpenAttractions { .. }
         | Effect::RollToVisitAttractions
         | Effect::AssembleContraptions { .. }
@@ -946,9 +961,11 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::ProcessRadCounters
         | Effect::GrantCastingPermission { .. }
         | Effect::ChooseFromZone { .. }
-        | Effect::ForEachCategoryExile { .. }
+        | Effect::RememberCard { .. }
+        | Effect::ForEachCategory { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
+        | Effect::EachPlayerCopyChosen { .. }
         | Effect::Exploit { .. }
         | Effect::GivePlayerCounter { .. }
         | Effect::LoseAllPlayerCounters { .. }
@@ -971,6 +988,7 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::ManifestDread
         | Effect::Cloak { .. }
         | Effect::TurnFaceUp { .. }
+        | Effect::TurnFaceDown { .. }
         | Effect::GrantExtraLoyaltyActivations { .. }
         | Effect::SkipNextTurn { .. }
         | Effect::SkipNextStep { .. }
@@ -995,10 +1013,18 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::SetDayNight { .. }
         | Effect::GiveControl { .. }
         | Effect::RemoveFromCombat { .. }
+        | Effect::BecomeBlocked { .. }
         | Effect::ApplyPerpetual { .. }
         | Effect::Intensify { .. }
         | Effect::DraftFromSpellbook { .. }
         | Effect::ChooseOneOf { .. }
+        | Effect::OpponentGuess { .. }
+        | Effect::ChooseCounterAdjustment { .. }
+        // CR 608.2d + CR 122.1: interactive counter-kind choice + its consume
+        // add no static resource seed (the magnitude is one counter, gated on a
+        // runtime choice) — Unmodeled, like the other choice effects.
+        | Effect::ChooseCounterKind { .. }
+        | Effect::PutChosenCounter { .. }
         | Effect::Unimplemented { .. } => return Projection::Unmodeled,
     }
     b.finish()
@@ -1127,6 +1153,7 @@ fn trigger_axis(trig: &TriggerDefinition) -> Option<AxisKey> {
         | TriggerMode::NinjutsuActivated
         | TriggerMode::KeywordAbilityActivated(..)
         | TriggerMode::AbilityActivated
+        | TriggerMode::LoyaltyAbilityActivated
         | TriggerMode::Evolve
         | TriggerMode::Evolved
         | TriggerMode::Explored
@@ -1144,8 +1171,7 @@ fn trigger_axis(trig: &TriggerDefinition) -> Option<AxisKey> {
         | TriggerMode::DungeonCompleted
         | TriggerMode::RoomEntered
         | TriggerMode::PlanarDice
-        | TriggerMode::PlaneswalkedFrom
-        | TriggerMode::PlaneswalkedTo
+        | TriggerMode::Planeswalked { .. }
         | TriggerMode::ChaosEnsues
         | TriggerMode::RolledDie
         | TriggerMode::RolledDieOnce
@@ -1194,6 +1220,7 @@ fn trigger_axis(trig: &TriggerDefinition) -> Option<AxisKey> {
         | TriggerMode::Always
         | TriggerMode::EntersOrAttacks
         | TriggerMode::AttacksOrBlocks
+        | TriggerMode::BlocksOrBecomesBlocked
         | TriggerMode::StateCondition
         | TriggerMode::Airbend
         | TriggerMode::Earthbend
@@ -1215,7 +1242,7 @@ fn trigger_axis(trig: &TriggerDefinition) -> Option<AxisKey> {
 /// [`collect_effects_in_effect`] — the nested-effect payloads that the display
 /// walkers (`build_ability_item`) do *not* descend. Borrows the faces, so the
 /// returned references live as long as the input.
-fn collect_effects<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+pub(crate) fn collect_effects<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
     collect_effects_in_effect(&def.effect, out);
     if let Some(sub) = &def.sub_ability {
         collect_effects(sub, out);
@@ -1235,15 +1262,33 @@ fn collect_effects_in_effect<'a>(effect: &'a Effect, out: &mut Vec<&'a Effect>) 
     out.push(effect);
     match effect {
         Effect::Vote {
-            per_choice_effect, ..
+            per_choice_effect,
+            subject,
+            ..
         } => {
             for d in per_choice_effect {
                 collect_effects(d, out);
             }
+            // CR 701.38b: object-pool votes carry their sub-effect in
+            // `outcome_template` (empty `per_choice_effect`) — Council's
+            // Judgment, Prime Minister's Cabinet Room. Descend it too.
+            if let VoteSubject::Objects {
+                outcome_template, ..
+            } = subject
+            {
+                collect_effects(outcome_template, out);
+            }
         }
         Effect::SeparateIntoPiles {
-            chosen_pile_effect, ..
-        } => collect_effects(chosen_pile_effect, out),
+            chosen_pile_effect,
+            unchosen_pile_effect,
+            ..
+        } => {
+            collect_effects(chosen_pile_effect, out);
+            if let Some(unchosen) = unchosen_pile_effect {
+                collect_effects(unchosen, out);
+            }
+        }
         Effect::RevealFromHand {
             on_decline: Some(d),
             ..
@@ -1276,6 +1321,15 @@ fn collect_effects_in_effect<'a>(effect: &'a Effect, out: &mut Vec<&'a Effect>) 
             for d in branches {
                 collect_effects(d, out);
             }
+        }
+        // CR 614.1a: the heterogeneous substitute Effect installed by a draw /
+        // planeswalk replacement rides in `replacement_effect: Box<Effect>` (not an
+        // `AbilityDefinition` payload), so it is invisible to the sibling recursions
+        // above. Descend it too — otherwise a randomness effect nested inside a
+        // replacement install escapes every `collect_effects` consumer.
+        Effect::CreateDrawReplacement { replacement_effect }
+        | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
+            collect_effects_in_effect(replacement_effect, out);
         }
         _ => {}
     }
@@ -1498,11 +1552,16 @@ fn fold_cost(acc: &mut NodeAcc, cost: &AbilityCost) {
         | AbilityCost::PaySpeed { .. }
         | AbilityCost::ReturnToHand { .. }
         | AbilityCost::Unattach
+        | AbilityCost::UnattachFrom { .. }
         | AbilityCost::Mill { .. }
         | AbilityCost::Exert
         | AbilityCost::Reveal { .. }
         | AbilityCost::Behold { .. }
         | AbilityCost::PerCounter { .. }
+        // CR 118.9: a borrowed keyword cost is an alternative cost on a SEPARATE
+        // cast (the spell being cast), never an activation cost of this ability,
+        // so it carries no modeled axis for the loop detector.
+        | AbilityCost::KeywordCostOfCastSpell { .. }
         | AbilityCost::Unimplemented { .. } => {}
     }
 }
@@ -2100,6 +2159,7 @@ mod tests {
             amount,
             target: default_target_filter_any(),
             damage_source: None,
+            excess: None,
         }
     }
     fn set_tap(state: TapStateChange) -> Effect {
@@ -2685,7 +2745,9 @@ mod tests {
             enters_attacking: false,
             up_to: false,
             enter_with_counters: Vec::new(),
+            conditional_enter_with_counters: vec![],
             face_down_profile: None,
+            enters_modified_if: None,
         }
     }
     /// A `TriggerDefinition` with the zone-change disambiguator fields set.
@@ -2889,6 +2951,7 @@ mod tests {
                 after: crate::types::phase::Phase::PostCombatMain,
                 followed_by: Vec::new(),
                 count: fixed(1),
+                attacker_restriction: None,
             }),
             None,
         );
@@ -2903,6 +2966,7 @@ mod tests {
                 after: crate::types::phase::Phase::Upkeep,
                 followed_by: Vec::new(),
                 count: fixed(1),
+                attacker_restriction: None,
             }),
             Projection::Unmodeled
         ));
